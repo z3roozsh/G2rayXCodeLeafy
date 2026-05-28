@@ -66,14 +66,37 @@ xray_running() {
     [[ -n "$p" ]]
 }
 
+json_dns_ips() {
+    local url="$1" header="${2:-}"
+    if [[ -n "$header" ]]; then
+        (curl -sf -m 4 -H "$header" "$url" 2>/dev/null \
+            | grep -oE '"data":"[0-9]+(\.[0-9]+){3}"' \
+            | sed -E 's/^"data":"//;s/"$//') || true
+    else
+        (curl -sf -m 4 "$url" 2>/dev/null \
+            | grep -oE '"data":"[0-9]+(\.[0-9]+){3}"' \
+            | sed -E 's/^"data":"//;s/"$//') || true
+    fi
+}
+
+resolve_domain_ips() {
+    local domain="$1"
+    {
+        if [[ -n "${G2RAY_EXTRA_FALLBACK_IPS:-}" ]]; then
+            printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n'
+        fi
+        if command -v dig >/dev/null 2>&1; then
+            dig +short "$domain" A 2>/dev/null || true
+        fi
+        getent hosts "$domain" 2>/dev/null | awk '{print $1}' || true
+        json_dns_ips "https://dns.google/resolve?name=${domain}&type=A"
+        json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json"
+    } | awk '/^[0-9]+(\.[0-9]+){3}$/ && !seen[$0]++ {print}'
+}
+
 resolve_domain_ip() {
     local domain="$1" ip=""
-    ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
-    [[ -n "$ip" ]] && { printf '%s' "$ip"; return; }
-    ip=$(getent hosts "$domain" 2>/dev/null | awk 'NR==1{print $1}' || true)
-    [[ -n "$ip" ]] && { printf '%s' "$ip"; return; }
-    ip=$(curl -sf -m 4 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
-        | grep -oP '"data":"\K[0-9.]+' | head -1 || true)
+    ip=$(resolve_domain_ips "$domain" | head -1 || true)
     [[ -n "$ip" ]] && { printf '%s' "$ip"; return; }
     printf '%s' "$domain"
 }
@@ -457,11 +480,11 @@ JSONEOF
 }
 
 generate_link_for_address() {
-    local address="$1" uuid
+    local address="$1" label_suffix="${2:-}" uuid
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=1&allowInsecure=1&type=xhttp&host=%s&path=%%2F&mode=packet-up#G2rayXCodeLeafy|%s' \
-        "$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}"
+        "$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}${label_suffix}"
 }
 
 generate_domain_link() {
@@ -469,8 +492,19 @@ generate_domain_link() {
 }
 
 generate_ip_link() {
-    local address; address=$(resolve_domain_ip "$PORT_DOMAIN")
-    generate_link_for_address "$address"
+    local address; address=$(resolve_domain_ips "$PORT_DOMAIN" | head -1 || true)
+    [[ -n "$address" ]] || return 1
+    generate_link_for_address "$address" "-ip1"
+}
+
+generate_ip_links() {
+    local address index=1
+    while IFS= read -r address; do
+        [[ -n "$address" ]] || continue
+        generate_link_for_address "$address" "-ip${index}"
+        printf '\n'
+        index=$(( index + 1 ))
+    done < <(resolve_domain_ips "$PORT_DOMAIN")
 }
 
 generate_link() {
@@ -480,7 +514,8 @@ generate_link() {
 generate_links_for_display() {
     local uuid; uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
-    printf '%s\n%s\n' "$(generate_domain_link)" "$(generate_ip_link)"
+    printf '%s\n' "$(generate_domain_link)"
+    generate_ip_links
 }
 
 do_donate_config() {
@@ -638,9 +673,12 @@ while true; do
         1)
             check_port_visibility || continue
             _VLESS=$(generate_domain_link) || _VLESS=""
-            _VLESS_IP=$(generate_ip_link) || _VLESS_IP=""
+            _VLESS_IPS=$(generate_ip_links) || _VLESS_IPS=""
             [[ -z "$_VLESS" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
-            printf '%s\n%s\n' "$_VLESS" "$_VLESS_IP" > "$MOBILE_CONFIG_FILE"
+            {
+                printf '%s\n' "$_VLESS"
+                [[ -n "$_VLESS_IPS" ]] && printf '%s\n' "$_VLESS_IPS"
+            } > "$MOBILE_CONFIG_FILE"
             _VHASH=$(printf '%s' "$_VLESS" | md5sum | awk '{print $1}')
             _PFLAG="$DATA_DIR/.prompted_${_VHASH}"
             if [[ ! -f "$_PFLAG" ]]; then
@@ -662,9 +700,10 @@ while true; do
             fi
             echo -e "\n  ${GREEN}● Direct VLESS Link (try this first)${NC}"
             echo -e "  ${WHITE}${_VLESS}${NC}\n"
-            if [[ -n "$_VLESS_IP" && "$_VLESS_IP" != "$_VLESS" ]]; then
-                echo -e "  ${GREEN}● IP Fallback Link (try if your client rejects the first)${NC}"
-                echo -e "  ${WHITE}${_VLESS_IP}${NC}\n"
+            if [[ -n "$_VLESS_IPS" ]]; then
+                echo -e "  ${GREEN}● IP Fallback Links (try if DNS or one tunnel IP is blocked)${NC}"
+                printf '%s\n' "$_VLESS_IPS" | sed "s/^/  ${WHITE}/;s/$/${NC}/"
+                echo -e "  ${DIM}These still use ${PORT_DOMAIN} as SNI/Host for Codespaces routing.${NC}\n"
             fi
             _COUNTRY=$(curl -s --max-time 3 https://ipinfo.io/country </dev/null 2>/dev/null || echo "Unknown")
             if [[ "$_COUNTRY" != "DE" && "$_COUNTRY" != "NL" && "$_COUNTRY" != "Unknown" ]]; then

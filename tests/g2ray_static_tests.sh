@@ -120,15 +120,35 @@ test_xray_version_can_be_pinned() {
 test_generated_links_include_domain_and_ip_variants() {
     grep_fixed 'resolve_domain_ip()' "$SCRIPT" \
         || fail 'script does not provide a resolver for the Codespaces app domain'
+    grep_fixed 'resolve_domain_ips()' "$SCRIPT" \
+        || fail 'script does not provide a multi-IP resolver for the Codespaces app domain'
+    grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$SCRIPT" \
+        || fail 'script does not allow manually supplied fallback IPs'
+    grep_fixed 'dns.google/resolve' "$SCRIPT" \
+        || fail 'script does not query Google DNS-over-HTTPS for fallback IPs'
+    grep_fixed 'cloudflare-dns.com/dns-query' "$SCRIPT" \
+        || fail 'script does not query Cloudflare DNS-over-HTTPS for fallback IPs'
+    grep_fixed 'seen[$0]++' "$SCRIPT" \
+        || fail 'script does not deduplicate fallback IP candidates'
     grep_fixed 'generate_domain_link()' "$SCRIPT" \
         || fail 'script does not generate a domain-address link'
     grep_fixed 'generate_ip_link()' "$SCRIPT" \
         || fail 'script does not generate a resolved-IP fallback link'
+    grep_fixed 'generate_ip_links()' "$SCRIPT" \
+        || fail 'script does not generate multiple resolved-IP fallback links'
     grep_fixed '"$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN"' "$SCRIPT" \
         || fail 'IP fallback link must preserve PORT_DOMAIN as SNI and host'
     grep_fixed 'generate_link_for_address "$PORT_DOMAIN"' "$SCRIPT" \
         || fail 'domain link must use PORT_DOMAIN as address, SNI, and host'
-    pass 'generated links include domain and IP variants'
+    grep_fixed '_VLESS_IPS=$(generate_ip_links)' "$SCRIPT" \
+        || fail 'display/copy paths do not use multi-IP fallback generation'
+    if grep_fixed '"$_VLESS_IP"' "$SCRIPT"; then
+        fail 'display/copy paths still reference the old singular fallback variable'
+    fi
+    if grep_fixed 'address=$(resolve_domain_ip "$PORT_DOMAIN")' "$SCRIPT"; then
+        fail 'IP fallback still falls back to the domain when no IP resolves'
+    fi
+    pass 'generated links include domain and multiple IP variants'
 }
 
 test_wait_for_port_increment_is_set_e_safe
