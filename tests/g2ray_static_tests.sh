@@ -124,6 +124,10 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'script does not provide a multi-IP resolver for the Codespaces app domain'
     grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$SCRIPT" \
         || fail 'script does not allow manually supplied fallback IPs'
+    grep_fixed 'DEFAULT_FALLBACK_IPS=' "$SCRIPT" \
+        || fail 'script does not provide built-in fallback IPs for DNS-blocked networks'
+    grep_fixed '20.120.56.11' "$SCRIPT" \
+        || fail 'script does not include the historically working East US tunnel IP'
     grep_fixed 'dns.google/resolve' "$SCRIPT" \
         || fail 'script does not query Google DNS-over-HTTPS for fallback IPs'
     grep_fixed 'cloudflare-dns.com/dns-query' "$SCRIPT" \
@@ -142,6 +146,12 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'domain link must use PORT_DOMAIN as address, SNI, and host'
     grep_fixed '_VLESS_IPS=$(generate_ip_links)' "$SCRIPT" \
         || fail 'display/copy paths do not use multi-IP fallback generation'
+    grep_fixed '_VLESS_PRIMARY=$(first_nonempty_line "$_VLESS_IPS")' "$SCRIPT" \
+        || fail 'display path does not select an IP fallback as the primary link'
+    grep_fixed 'qrencode -m 2 -t ANSIUTF8 "$_VLESS_PRIMARY"' "$SCRIPT" \
+        || fail 'QR code does not encode the primary IP-first link'
+    grep_fixed 'Recommended VLESS Link' "$SCRIPT" \
+        || fail 'display does not label the primary recommended link clearly'
     if grep_fixed '"$_VLESS_IP"' "$SCRIPT"; then
         fail 'display/copy paths still reference the old singular fallback variable'
     fi

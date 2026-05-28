@@ -22,6 +22,7 @@ LOG_FILE="$LOG_DIR/g2ray.log"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT=443
+DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.120.56.11 20.85.77.48 20.207.70.99}"
 
 mkdir -p "$DATA_DIR" "$LOG_DIR"
 touch "$LOG_FILE" 2>/dev/null || true
@@ -117,6 +118,7 @@ resolve_domain_ips() {
         json_dns_ips "https://dns.google/resolve?name=${domain}&type=A"
         json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json"
         curl_remote_ip "$domain" || true
+        printf '%s\n' "$DEFAULT_FALLBACK_IPS" | tr ',; ' '\n'
     } | awk '/^[0-9]+(\.[0-9]+){3}$/ && !seen[$0]++ {print}')
     if [[ -n "$candidates" ]]; then
         joined=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//')
@@ -139,6 +141,10 @@ _atomic_write() {
     tmp=$(mktemp "${file}.XXXXXX")
     printf '%s\n' "$content" > "$tmp"
     mv -f "$tmp" "$file"
+}
+
+first_nonempty_line() {
+    awk 'NF {print; exit}' <<< "${1:-}"
 }
 
 draw_logo() {
@@ -702,9 +708,9 @@ force_reconnect() {
         [[ "$code" =~ ^[1-9][0-9]{2}$ ]] && { ok=true; break; }
         sleep 2
     done
-    log_event INFO "force_reconnect verify_external ok=${ok} code=${code:-none} domain=${PORT_DOMAIN}"
+    log_event INFO "force_reconnect verify_external reachable=${ok} code=${code:-none} domain=${PORT_DOMAIN}"
     [[ "$ok" == true ]] \
-        && echo -e "${GREEN}Live!${NC}\n" \
+        && echo -e "${GREEN}Reachable (HTTP ${code})${NC}\n" \
         || echo -e "${YELLOW}Pending / Delayed${NC}\n"
 
     [[ "$no_prompt" == "--no-prompt" ]] && { sleep 1; return; }
@@ -806,14 +812,18 @@ while true; do
     case $_choice in
         1)
             check_port_visibility || continue
-            _VLESS=$(generate_domain_link) || _VLESS=""
+            _VLESS_DOMAIN=$(generate_domain_link) || _VLESS_DOMAIN=""
             _VLESS_IPS=$(generate_ip_links) || _VLESS_IPS=""
-            [[ -z "$_VLESS" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
+            _VLESS_PRIMARY=$(first_nonempty_line "$_VLESS_IPS")
+            [[ -n "$_VLESS_PRIMARY" ]] || _VLESS_PRIMARY="$_VLESS_DOMAIN"
+            _VLESS_REMAINING_IPS=$(printf '%s\n' "$_VLESS_IPS" | grep -Fvx "$_VLESS_PRIMARY" || true)
+            [[ -z "$_VLESS_PRIMARY" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
             {
-                printf '%s\n' "$_VLESS"
-                [[ -n "$_VLESS_IPS" ]] && printf '%s\n' "$_VLESS_IPS"
+                printf '%s\n' "$_VLESS_PRIMARY"
+                [[ -n "$_VLESS_REMAINING_IPS" ]] && printf '%s\n' "$_VLESS_REMAINING_IPS"
+                [[ -n "$_VLESS_DOMAIN" && "$_VLESS_DOMAIN" != "$_VLESS_PRIMARY" ]] && printf '%s\n' "$_VLESS_DOMAIN"
             } > "$MOBILE_CONFIG_FILE"
-            _VHASH=$(printf '%s' "$_VLESS" | md5sum | awk '{print $1}')
+            _VHASH=$(printf '%s' "$_VLESS_PRIMARY" | md5sum | awk '{print $1}')
             _PFLAG="$DATA_DIR/.prompted_${_VHASH}"
             if [[ ! -f "$_PFLAG" ]]; then
                 refresh_screen
@@ -822,22 +832,26 @@ while true; do
                 echo -e "  ${DIM}(No impact on your speed, quota, or security)${NC}\n"
                 echo -ne "  ${GREEN}╰─❯${NC} Donate? (y/n): "
                 read -r _share
-                [[ "$_share" =~ ^[Yy]$ ]] && { send_to_vless_forwarder "$_VLESS"; sleep 1; }
+                [[ "$_share" =~ ^[Yy]$ ]] && { send_to_vless_forwarder "$_VLESS_PRIMARY"; sleep 1; }
                 touch "$_PFLAG"
             fi
             refresh_screen
-            echo -e "  ${RED}● Scan to Connect (Domain Link)${NC}"
+            echo -e "  ${RED}● Scan to Connect (Recommended Link)${NC}"
             if command -v qrencode >/dev/null 2>&1; then
-                qrencode -m 2 -t ANSIUTF8 "$_VLESS" | sed 's/^/  /'
+                qrencode -m 2 -t ANSIUTF8 "$_VLESS_PRIMARY" | sed 's/^/  /'
             else
                 echo -e "  ${DIM}(qrencode not installed — QR unavailable)${NC}"
             fi
-            echo -e "\n  ${RED}● Direct VLESS Link (try this first)${NC}"
-            echo -e "  ${WHITE}${_VLESS}${NC}\n"
-            if [[ -n "$_VLESS_IPS" ]]; then
-                echo -e "  ${RED}● IP Fallback Links (try if DNS or one tunnel IP is blocked)${NC}"
-                printf '%s\n' "$_VLESS_IPS" | sed "s/^/  ${WHITE}/;s/$/${NC}/"
+            echo -e "\n  ${RED}● Recommended VLESS Link (try this first)${NC}"
+            echo -e "  ${WHITE}${_VLESS_PRIMARY}${NC}\n"
+            if [[ -n "$_VLESS_REMAINING_IPS" ]]; then
+                echo -e "  ${RED}● Other IP Fallback Links${NC}"
+                printf '%s\n' "$_VLESS_REMAINING_IPS" | sed "s/^/  ${WHITE}/;s/$/${NC}/"
                 echo -e "  ${DIM}These still use ${PORT_DOMAIN} as SNI/Host for Codespaces routing.${NC}\n"
+            fi
+            if [[ -n "$_VLESS_DOMAIN" && "$_VLESS_DOMAIN" != "$_VLESS_PRIMARY" ]]; then
+                echo -e "  ${RED}● Domain Link (try only if your network allows app.github.dev)${NC}"
+                echo -e "  ${WHITE}${_VLESS_DOMAIN}${NC}\n"
             fi
             _COUNTRY=$(curl -s --max-time 3 https://ipinfo.io/country </dev/null 2>/dev/null || echo "Unknown")
             if [[ "$_COUNTRY" != "DE" && "$_COUNTRY" != "NL" && "$_COUNTRY" != "Unknown" ]]; then
