@@ -151,6 +151,40 @@ test_generated_links_include_domain_and_ip_variants() {
     pass 'generated links include domain and multiple IP variants'
 }
 
+test_terminal_branding_is_customized_red() {
+    grep_fixed 'echo -e "${RED}${B}"' "$SCRIPT" \
+        || fail 'logo banner is not rendered in red'
+    grep_fixed 'Made by CodeLeafy' "$SCRIPT" \
+        || fail 'logo banner no longer credits CodeLeafy'
+    grep_fixed 'Customized' "$SCRIPT" \
+        || fail 'logo banner does not show customized branding'
+    pass 'terminal branding is red and customized'
+}
+
+test_runtime_diagnostics_logging() {
+    grep_fixed 'LOG_FILE=' "$SCRIPT" \
+        || fail 'script does not define an application log file'
+    grep_fixed 'log_event()' "$SCRIPT" \
+        || fail 'script does not define structured runtime logging'
+    grep_fixed 'fingerprint_secret()' "$SCRIPT" \
+        || fail 'script does not define a helper for secret-safe fingerprints'
+    grep_fixed 'fingerprint_secret "$uuid"' "$SCRIPT" \
+        || fail 'config generation does not log a secret-safe UUID fingerprint'
+    grep_fixed 'log_event INFO "xray launched' "$SCRIPT" \
+        || fail 'start_xray does not log successful launches'
+    grep_fixed 'log_event INFO "force_reconnect begin' "$SCRIPT" \
+        || fail 'force reconnect does not log start of reconnect flow'
+    grep_fixed 'log_event INFO "resolver domain=' "$SCRIPT" \
+        || fail 'resolver does not log resolved fallback IP candidates'
+    grep_fixed 'show_diagnostics()' "$SCRIPT" \
+        || fail 'script does not provide a diagnostics view'
+    grep_fixed '14) Diagnostics' "$SCRIPT" \
+        || fail 'menu does not expose the diagnostics view'
+    grep_fixed '14) show_diagnostics' "$SCRIPT" \
+        || fail 'case statement does not route to diagnostics view'
+    pass 'runtime diagnostics logging is present'
+}
+
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
@@ -161,3 +195,5 @@ test_exit_trap_preserves_failures
 test_generated_files_are_ignored
 test_xray_version_can_be_pinned
 test_generated_links_include_domain_and_ip_variants
+test_terminal_branding_is_customized_red
+test_runtime_diagnostics_logging

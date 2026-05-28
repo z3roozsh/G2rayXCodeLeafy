@@ -18,15 +18,34 @@ SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
 TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
 SESSION_START_FILE="$DATA_DIR/session_start.txt"
 LOG_DIR="$BASE_DIR/logs"
+LOG_FILE="$LOG_DIR/g2ray.log"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT=443
 
 mkdir -p "$DATA_DIR" "$LOG_DIR"
+touch "$LOG_FILE" 2>/dev/null || true
 [[ -f "$SAVED_BYTES_FILE"   ]] || printf '{"down":0,"up":0}\n' > "$SAVED_BYTES_FILE"
 [[ -f "$SESSION_BYTES_FILE" ]] || printf '{"down":0,"up":0}\n' > "$SESSION_BYTES_FILE"
 [[ -f "$TOTAL_UPTIME_FILE"  ]] || printf '0\n'                 > "$TOTAL_UPTIME_FILE"
 [[ -f "$SESSION_START_FILE" ]] || date +%s                     > "$SESSION_START_FILE"
+
+log_event() {
+    local level="$1"; shift || true
+    local ts msg
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    msg="$*"
+    printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+fingerprint_secret() {
+    local value="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$value" | sha256sum | awk '{print substr($1,1,12)}'
+    else
+        printf '%s' "$value" | md5sum | awk '{print substr($1,1,12)}'
+    fi
+}
 
 _detect_codespace_name() {
     [[ -n "${CODESPACE_NAME:-}" ]] && { printf '%s' "$CODESPACE_NAME"; return; }
@@ -80,8 +99,8 @@ json_dns_ips() {
 }
 
 resolve_domain_ips() {
-    local domain="$1"
-    {
+    local domain="$1" candidates joined
+    candidates=$({
         if [[ -n "${G2RAY_EXTRA_FALLBACK_IPS:-}" ]]; then
             printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n'
         fi
@@ -91,7 +110,14 @@ resolve_domain_ips() {
         getent hosts "$domain" 2>/dev/null | awk '{print $1}' || true
         json_dns_ips "https://dns.google/resolve?name=${domain}&type=A"
         json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json"
-    } | awk '/^[0-9]+(\.[0-9]+){3}$/ && !seen[$0]++ {print}'
+    } | awk '/^[0-9]+(\.[0-9]+){3}$/ && !seen[$0]++ {print}')
+    if [[ -n "$candidates" ]]; then
+        joined=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//')
+        log_event INFO "resolver domain=${domain} ips=${joined}"
+    else
+        log_event WARN "resolver domain=${domain} no-ip-candidates"
+    fi
+    printf '%s\n' "$candidates"
 }
 
 resolve_domain_ip() {
@@ -109,14 +135,14 @@ _atomic_write() {
 }
 
 draw_logo() {
-    echo -e "${GREEN}${B}"
+    echo -e "${RED}${B}"
     echo -e "    ██████╗ ██████╗ ██████╗  █████╗ ██╗   ██╗"
     echo -e "   ██╔════╝ ╚════██╗██╔══██╗██╔══██╗╚██╗ ██╔╝"
     echo -e "   ██║  ███╗█████╔╝██████╔╝███████║ ╚████╔╝ "
     echo -e "   ██║   ██║██╔═══╝ ██╔══██╗██╔══██║  ╚██╔╝  "
     echo -e "   ╚██████╔╝███████╗██║  ██║██║  ██║   ██║   "
     echo -e "    ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ${NC}"
-    echo -e "       ${WHITE}${B}v1.4.3${NC} ${DIM}•${NC} ${WHITE}Made by CodeLeafy${NC}\n"
+    echo -e "       ${WHITE}${B}v1.4.3${NC} ${DIM}•${NC} ${WHITE}Made by CodeLeafy${NC} ${DIM}•${NC} ${WHITE}Customized${NC}\n"
 }
 
 refresh_screen() {
@@ -282,11 +308,15 @@ stop_xray() {
         p=$(pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" | head -1 || true)
     fi
     if xray_pid_matches "$p" && sudo kill -0 "$p" 2>/dev/null; then
+        log_event INFO "stop_xray pid=${p}"
         sudo kill "$p" >/dev/null 2>&1 || true
         sleep 0.5
         if sudo kill -0 "$p" 2>/dev/null; then
             sudo kill -9 "$p" >/dev/null 2>&1 || true
+            log_event WARN "stop_xray forced_kill pid=${p}"
         fi
+    else
+        log_event INFO "stop_xray no-owned-process"
     fi
     rm -f "$XRAY_PID_FILE" 2>/dev/null || true
     sleep 0.5
@@ -294,20 +324,24 @@ stop_xray() {
 
 start_xray() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_event WARN "start_xray missing_config path=${CONFIG_FILE}"
         echo -e "  ${RED}✖ No config found. Generate one first (Option 2).${NC}"
         return 1
     fi
     local launch_cmd pid
+    log_event INFO "start_xray requested port=${XRAY_PORT} config=${CONFIG_FILE}"
     launch_cmd=$(printf 'nohup %q run -c %q </dev/null >%q 2>&1 & printf "%%s\n" "$!"' \
         "$XRAY_BIN" "$CONFIG_FILE" "$LOG_DIR/xray.log")
     stop_xray
     reset_session_bytes_baseline
     pid=$(sudo bash -c "$launch_cmd" 2>/dev/null || true)
     if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        log_event ERROR "start_xray launch_failed"
         echo -e "  ${RED}✖ Failed to start Xray.${NC}"
         return 1
     fi
     printf '%s\n' "$pid" > "$XRAY_PID_FILE"
+    log_event INFO "xray launched pid=${pid} port=${XRAY_PORT}"
 }
 
 wait_for_port() {
@@ -315,7 +349,12 @@ wait_for_port() {
     echo -ne "  ${GREEN}⠋${NC} ${DIM}Initializing engine...${NC} "
     while ! is_port_open && (( i < 15 )); do sleep 1; i=$((i + 1)); done
     echo ""
-    is_port_open
+    if is_port_open; then
+        log_event INFO "wait_for_port open port=${XRAY_PORT} seconds=${i}"
+        return 0
+    fi
+    log_event ERROR "wait_for_port timeout port=${XRAY_PORT} seconds=${i}"
+    return 1
 }
 
 _background_tasks() {
@@ -333,6 +372,7 @@ _background_tasks() {
         [[ -f "$CONFIG_FILE" ]] || continue
         ensure_codespace_port_public >/dev/null 2>&1 || true
         if ! xray_running; then
+            log_event WARN "background detected_xray_stopped restarting=true"
             start_xray >/dev/null 2>&1 || true
             sleep 3
             ensure_codespace_port_public >/dev/null 2>&1 || true
@@ -350,6 +390,7 @@ start_background_tasks() {
     fi
     _background_tasks </dev/null >/dev/null 2>&1 &
     printf '%s\n' $! > "$BG_TASKS_PID"
+    log_event INFO "background supervisor_started pid=$!"
     disown 2>/dev/null || true
 }
 
@@ -406,6 +447,7 @@ show_resource_stats() {
 
 check_port_visibility() {
     if ! is_port_open; then
+        log_event WARN "check_port_visibility engine_not_running port=${XRAY_PORT}"
         refresh_screen
         echo -e "  ${RED}✖ Engine is not running!${NC}"
         echo -e "  ${DIM}Start the engine first (Option 3).${NC}\n"
@@ -413,6 +455,7 @@ check_port_visibility() {
         return 1
     fi
     if ! ensure_codespace_port_public; then
+        log_event WARN "check_port_visibility port_public_failed port=${XRAY_PORT}"
         refresh_screen
         echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public.${NC}"
         echo -e "  ${DIM}Open the PORTS tab and set port ${XRAY_PORT} visibility to Public.${NC}\n"
@@ -424,6 +467,8 @@ check_port_visibility() {
 generate_config() {
     uuidgen > "$UUID_FILE"
     local uuid; uuid=$(cat "$UUID_FILE")
+    local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
+    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN}"
     cat > "$CONFIG_FILE" << JSONEOF
 {
   "log": { "loglevel": "warning", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
@@ -472,11 +517,18 @@ generate_config() {
 }
 JSONEOF
     if start_xray && wait_for_port >/dev/null 2>&1; then
+        log_event INFO "generate_config engine_started port=${XRAY_PORT}"
         echo -e "  ${GREEN}✔ Engine started on port ${XRAY_PORT}.${NC}"
     else
+        log_event WARN "generate_config engine_maybe_not_bound port=${XRAY_PORT}"
         echo -e "  ${YELLOW}⚠ Engine may not have bound to port ${XRAY_PORT}.${NC}"
     fi
-    ensure_codespace_port_public || echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public. Check the PORTS tab.${NC}"
+    if ensure_codespace_port_public; then
+        log_event INFO "generate_config port_public port=${XRAY_PORT}"
+    else
+        log_event WARN "generate_config port_public_failed port=${XRAY_PORT}"
+        echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public. Check the PORTS tab.${NC}"
+    fi
 }
 
 generate_link_for_address() {
@@ -538,30 +590,94 @@ do_donate_config() {
     sleep 2
 }
 
+show_diagnostics() {
+    refresh_screen
+    log_event INFO "diagnostics opened"
+    echo -e "\n  ${RED}● Diagnostics${NC}\n"
+    echo -e "  Identity : ${WHITE}${CODESPACE_NAME}${NC}"
+    echo -e "  Domain   : ${WHITE}${PORT_DOMAIN}${NC}"
+    echo -e "  Port     : ${WHITE}${XRAY_PORT}${NC}"
+    if command -v git >/dev/null 2>&1; then
+        echo -e "  Git      : ${DIM}$(git -C "$BASE_DIR" log --oneline -1 2>/dev/null || echo unknown)${NC}"
+    fi
+    if xray_running; then
+        local xpid; xpid=$(cat "$XRAY_PID_FILE" 2>/dev/null || pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" | head -1 || true)
+        echo -e "  Engine   : ${GREEN}Running${NC} ${DIM}(PID ${xpid:-unknown})${NC}"
+    else
+        echo -e "  Engine   : ${RED}Stopped${NC}"
+    fi
+    is_port_open \
+        && echo -e "  Listener : ${GREEN}Port ${XRAY_PORT} open${NC}" \
+        || echo -e "  Listener : ${RED}Port ${XRAY_PORT} closed${NC}"
+
+    echo -e "\n  ${WHITE}${B}Codespaces Ports${NC}"
+    if command -v gh >/dev/null 2>&1; then
+        GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
+            gh codespace ports -c "$CODESPACE_NAME" 2>/dev/null | sed 's/^/  /' \
+            || echo -e "  ${YELLOW}Could not query gh codespace ports.${NC}"
+    else
+        echo -e "  ${DIM}gh CLI unavailable.${NC}"
+    fi
+
+    echo -e "\n  ${WHITE}${B}Resolved Fallback IPs${NC}"
+    local ips; ips=$(resolve_domain_ips "$PORT_DOMAIN" || true)
+    if [[ -n "$ips" ]]; then
+        printf '%s\n' "$ips" | sed 's/^/  /'
+    else
+        echo -e "  ${YELLOW}No IP candidates resolved from this environment.${NC}"
+    fi
+
+    echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
+    if [[ -s "$LOG_FILE" ]]; then
+        tail -n 18 "$LOG_FILE" | sed 's/^/  /'
+    else
+        echo -e "  ${DIM}No G2ray app events yet.${NC}"
+    fi
+
+    echo -e "\n  ${WHITE}${B}Recent Xray Errors${NC}"
+    if [[ -s "$LOG_DIR/xray-error.log" ]]; then
+        tail -n 10 "$LOG_DIR/xray-error.log" | sed 's/^/  /'
+    else
+        echo -e "  ${DIM}No Xray errors logged.${NC}"
+    fi
+    echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+}
+
 force_reconnect() {
     local no_prompt="${1:-}"
+    log_event INFO "force_reconnect begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}⠋${NC} ${WHITE}Running Clean Hard Restart & Reconnect Sequence...${NC}\n"
 
     echo -ne "  ${DIM}├─${NC} Detect Identity   : "
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
     PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    log_event INFO "force_reconnect identity codespace=${CODESPACE_NAME} domain=${PORT_DOMAIN}"
     [[ "$CODESPACE_NAME" == "unknown-codespace" ]] \
         && echo -e "${RED}Failed${NC}" \
         || echo -e "${GREEN}${CODESPACE_NAME}${NC}"
 
     echo -ne "  ${DIM}├─${NC} Force Kill Engine : "
     stop_xray >/dev/null 2>&1
+    log_event INFO "force_reconnect stopped_previous_engine"
     echo -e "${GREEN}Done${NC}"
 
     echo -ne "  ${DIM}├─${NC} Start Engine      : "
-    start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1 \
-        && echo -e "${GREEN}OK${NC}" \
-        || echo -e "${RED}Failed${NC}"
+    if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
+        log_event INFO "force_reconnect start_engine ok port=${XRAY_PORT}"
+        echo -e "${GREEN}OK${NC}"
+    else
+        log_event ERROR "force_reconnect start_engine failed port=${XRAY_PORT}"
+        echo -e "${RED}Failed${NC}"
+    fi
 
     echo -ne "  ${DIM}├─${NC} Expose Tunnel     : "
-    ensure_codespace_port_public >/dev/null 2>&1 \
-        && echo -e "${GREEN}Done${NC}" \
-        || echo -e "${YELLOW}Needs PORTS tab${NC}"
+    if ensure_codespace_port_public >/dev/null 2>&1; then
+        log_event INFO "force_reconnect expose_tunnel ok port=${XRAY_PORT}"
+        echo -e "${GREEN}Done${NC}"
+    else
+        log_event WARN "force_reconnect expose_tunnel failed port=${XRAY_PORT}"
+        echo -e "${YELLOW}Needs PORTS tab${NC}"
+    fi
 
     echo -ne "  ${DIM}╰─${NC} Verify External   : "
     local ok=false code
@@ -570,6 +686,7 @@ force_reconnect() {
         [[ "$code" =~ ^[1-9][0-9]{2}$ ]] && { ok=true; break; }
         sleep 2
     done
+    log_event INFO "force_reconnect verify_external ok=${ok} code=${code:-none} domain=${PORT_DOMAIN}"
     [[ "$ok" == true ]] \
         && echo -e "${GREEN}Live!${NC}\n" \
         || echo -e "${YELLOW}Pending / Delayed${NC}\n"
@@ -607,9 +724,9 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     refresh_screen
     echo -e "  ${GREEN}● Welcome to G2ray${NC}"
     echo -e "  ${WHITE}No configuration found. First run setup.${NC}\n"
-    echo -e "  ${GREEN}1)${NC} Generate Config & Start"
+    echo -e "  ${RED}1)${NC} Generate Config & Start"
     echo -e "  ${DIM}2)${NC} Exit\n"
-    echo -ne "  ${GREEN}╰─❯${NC} "
+    echo -ne "  ${RED}╰─❯${NC} "
     read -r setup
     if [[ "$setup" == "1" ]]; then
         generate_config
@@ -642,18 +759,19 @@ while true; do
     echo -e "  ${WHITE}${B}Engine Status  :${NC} $(echo -e "$_STATUS")"
     echo -e "  ${WHITE}${B}Anti-Sleep Mode:${NC} $(echo -e "$_KA")\n"
     echo -e "  ${WHITE}${B}● CORE CONTROLS${NC}"
-    echo -e "   ${GREEN}1)${NC} View Config & QR Code       ${GREEN}4)${NC} Stop Engine"
-    echo -e "   ${GREEN}2)${NC} Generate New Config         ${GREEN}5)${NC} Restart Engine"
-    echo -e "   ${GREEN}3)${NC} Start Engine                ${GREEN}6)${NC} Force Reconnect"
+    echo -e "   ${RED}1)${NC} View Config & QR Code       ${RED}4)${NC} Stop Engine"
+    echo -e "   ${RED}2)${NC} Generate New Config         ${RED}5)${NC} Restart Engine"
+    echo -e "   ${RED}3)${NC} Start Engine                ${RED}6)${NC} Force Reconnect"
     echo ""
     echo -e "  ${WHITE}${B}● SYSTEM CONFIGURATION${NC}"
-    echo -e "   ${GREEN}7)${NC} Toggle Anti-Sleep Mode"
-    echo -e "   ${GREEN}8)${NC} Donate Config"
+    echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode"
+    echo -e "   ${RED}8)${NC} Donate Config"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
-    echo -e "   ${GREEN}9)${NC} Data Usage                 ${GREEN}12)${NC} Server Location"
-    echo -e "  ${GREEN}10)${NC} Resource Stats             ${GREEN}13)${NC} View Engine Logs"
-    echo -e "  ${GREEN}11)${NC} Quota & Uptime"
+    echo -e "   ${RED}9)${NC} Data Usage                 ${RED}12)${NC} Server Location"
+    echo -e "  ${RED}10)${NC} Resource Stats             ${RED}13)${NC} View Engine Logs"
+    echo -e "  ${RED}14) Diagnostics${NC}"
+    echo -e "  ${RED}11)${NC} Quota & Uptime"
     echo ""
     echo -e "   ${RED}0)${NC} Exit Panel"
     echo -e "  ${DIM}───────────────────────────────────────────────────────────${NC}"
@@ -666,7 +784,7 @@ while true; do
         fi
     fi
 
-    echo -ne "  ${GREEN}╰─❯${NC} "
+    echo -ne "  ${RED}╰─❯${NC} "
     read -r _choice
 
     case $_choice in
@@ -692,16 +810,16 @@ while true; do
                 touch "$_PFLAG"
             fi
             refresh_screen
-            echo -e "  ${GREEN}● Scan to Connect (Domain Link)${NC}"
+            echo -e "  ${RED}● Scan to Connect (Domain Link)${NC}"
             if command -v qrencode >/dev/null 2>&1; then
                 qrencode -m 2 -t ANSIUTF8 "$_VLESS" | sed 's/^/  /'
             else
                 echo -e "  ${DIM}(qrencode not installed — QR unavailable)${NC}"
             fi
-            echo -e "\n  ${GREEN}● Direct VLESS Link (try this first)${NC}"
+            echo -e "\n  ${RED}● Direct VLESS Link (try this first)${NC}"
             echo -e "  ${WHITE}${_VLESS}${NC}\n"
             if [[ -n "$_VLESS_IPS" ]]; then
-                echo -e "  ${GREEN}● IP Fallback Links (try if DNS or one tunnel IP is blocked)${NC}"
+                echo -e "  ${RED}● IP Fallback Links (try if DNS or one tunnel IP is blocked)${NC}"
                 printf '%s\n' "$_VLESS_IPS" | sed "s/^/  ${WHITE}/;s/$/${NC}/"
                 echo -e "  ${DIM}These still use ${PORT_DOMAIN} as SNI/Host for Codespaces routing.${NC}\n"
             fi
@@ -805,6 +923,7 @@ while true; do
             echo -e "\n  ${DIM}(Log level: warning — empty log means no errors)${NC}\n"
             echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
             ;;
+        14) show_diagnostics ;;
         0) echo -e "\n  ${GREEN}Exiting G2ray Panel...${NC}"; exit 0 ;;
         *) echo -e "  ${RED}✖ Invalid option.${NC}"; sleep 1 ;;
     esac
