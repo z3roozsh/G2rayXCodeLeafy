@@ -66,6 +66,18 @@ xray_running() {
     [[ -n "$p" ]]
 }
 
+resolve_domain_ip() {
+    local domain="$1" ip=""
+    ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+    [[ -n "$ip" ]] && { printf '%s' "$ip"; return; }
+    ip=$(getent hosts "$domain" 2>/dev/null | awk 'NR==1{print $1}' || true)
+    [[ -n "$ip" ]] && { printf '%s' "$ip"; return; }
+    ip=$(curl -sf -m 4 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
+        | grep -oP '"data":"\K[0-9.]+' | head -1 || true)
+    [[ -n "$ip" ]] && { printf '%s' "$ip"; return; }
+    printf '%s' "$domain"
+}
+
 _atomic_write() {
     local file="$1" content="$2" tmp
     tmp=$(mktemp "${file}.XXXXXX")
@@ -431,8 +443,9 @@ JSONEOF
 generate_link() {
     local uuid; uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
+    local address; address=$(resolve_domain_ip "$PORT_DOMAIN")
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=1&allowInsecure=1&type=xhttp&host=%s&path=%%2F&mode=packet-up#G2rayXCodeLeafy|%s' \
-        "$uuid" "$PORT_DOMAIN" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}"
+        "$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}"
 }
 
 do_donate_config() {

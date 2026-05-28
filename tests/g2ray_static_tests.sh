@@ -84,13 +84,14 @@ test_xray_version_can_be_pinned() {
     pass 'Dockerfile supports pinned Xray version'
 }
 
-test_generated_link_uses_codespace_domain_address() {
-    if grep_fixed 'host=$(resolve_domain_ip "$PORT_DOMAIN")' "$SCRIPT"; then
-        fail 'generate_link still resolves the Codespaces domain to a stale-prone IP address'
-    fi
-    grep_fixed '"$uuid" "$PORT_DOMAIN" "$XRAY_PORT"' "$SCRIPT" \
-        || fail 'generate_link does not use PORT_DOMAIN as the VLESS address'
-    pass 'generated links use the Codespaces domain as the address'
+test_generated_link_uses_resolved_address_with_domain_sni() {
+    grep_fixed 'resolve_domain_ip()' "$SCRIPT" \
+        || fail 'script does not provide a resolver for the Codespaces app domain'
+    grep_fixed 'address=$(resolve_domain_ip "$PORT_DOMAIN")' "$SCRIPT" \
+        || fail 'generate_link does not resolve the Codespaces domain for the VLESS address'
+    grep_fixed '"$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN"' "$SCRIPT" \
+        || fail 'generate_link must use resolved address while preserving PORT_DOMAIN as SNI and host'
+    pass 'generated links use resolved address with Codespaces domain SNI/host'
 }
 
 test_wait_for_port_increment_is_set_e_safe
@@ -99,4 +100,4 @@ test_background_tasks_require_config
 test_self_update_is_opt_in
 test_generated_files_are_ignored
 test_xray_version_can_be_pinned
-test_generated_link_uses_codespace_domain_address
+test_generated_link_uses_resolved_address_with_domain_sni
