@@ -110,7 +110,7 @@ test_exit_trap_preserves_failures() {
 
 test_generated_files_are_ignored() {
     [[ -f "$GITIGNORE" ]] || fail '.gitignore is missing'
-    for pattern in '/data/' '/logs/' '/configs-to-copy-for-mobile.txt'; do
+    for pattern in '/data/' '/logs/' '/configs-to-copy-for-mobile.txt' '/configs-subscription-base64.txt'; do
         grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing $pattern"
     done
     pass 'generated runtime files are ignored'
@@ -165,6 +165,16 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'display does not render each config as a separate copy-safe entry'
     grep_fixed 'render_config_qr()' "$SCRIPT" \
         || fail 'display does not render a QR code for each config entry'
+    grep_fixed 'G2RAY_QR_MODE' "$SCRIPT" \
+        || fail 'QR display mode is not configurable'
+    grep_fixed 'local show_qr="${4:-false}"' "$SCRIPT" \
+        || fail 'config entry renderer cannot hide non-primary QR codes'
+    grep_fixed '[[ "$show_qr" == true ]]' "$SCRIPT" \
+        || fail 'config entry renderer does not conditionally show QR codes'
+    grep_fixed '_QR_MODE="${G2RAY_QR_MODE:-recommended}"' "$SCRIPT" \
+        || fail 'config display does not default to recommended-only QR mode'
+    grep_fixed '[[ "$_QR_MODE" == "all" || ( "$_QR_MODE" != "none" && $_INDEX -eq 1 ) ]]' "$SCRIPT" \
+        || fail 'config display does not limit default QR rendering to the first recommended config'
     grep_fixed 'qrencode -m 0 -t UTF8 "$link"' "$SCRIPT" \
         || fail 'QR renderer does not use compact terminal QR output'
     grep_fixed 'printf '\''%s\n'\'' "$link"' "$SCRIPT" \
@@ -234,6 +244,28 @@ test_runtime_diagnostics_logging() {
         || fail 'health probe does not log engine/listener/public endpoint state'
     grep_fixed 'health_probe >/dev/null 2>&1' "$SCRIPT" \
         || fail 'background supervisor does not run periodic health probes'
+    grep_fixed 'refresh_config_exports()' "$SCRIPT" \
+        || fail 'script does not define a config export refresher'
+    grep_fixed 'SUBSCRIPTION_FILE=' "$SCRIPT" \
+        || fail 'script does not define a base64 subscription export file'
+    grep_fixed 'generate_ordered_links()' "$SCRIPT" \
+        || fail 'script does not generate a stable ordered failover config list'
+    grep_fixed 'base64 | tr -d' "$SCRIPT" \
+        || fail 'script does not generate a single-line base64 subscription export'
+    grep_fixed 'refresh_config_exports >/dev/null 2>&1' "$SCRIPT" \
+        || fail 'background supervisor does not refresh exported fallback configs'
+    grep_fixed 'self_heal_once()' "$SCRIPT" \
+        || fail 'script does not define a self-healing watchdog pass'
+    grep_fixed 'self_heal_once >/dev/null 2>&1' "$SCRIPT" \
+        || fail 'background supervisor does not run the self-healing watchdog'
+    grep_fixed 'reason=listener_closed' "$SCRIPT" \
+        || fail 'watchdog does not restart when the listener is closed'
+    grep_fixed 'reason=xray_stopped' "$SCRIPT" \
+        || fail 'watchdog does not restart when Xray is stopped'
+    grep_fixed 'edge_unreachable' "$SCRIPT" \
+        || fail 'watchdog does not detect an unreachable Codespaces edge'
+    grep_fixed 'force_reconnect --no-prompt' "$SCRIPT" \
+        || fail 'watchdog does not force reconnect when the Codespaces edge is unreachable'
     grep_fixed 'show_diagnostics()' "$SCRIPT" \
         || fail 'script does not provide a diagnostics view'
     grep_fixed '14) Diagnostics' "$SCRIPT" \

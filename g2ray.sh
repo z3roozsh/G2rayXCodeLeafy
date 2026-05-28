@@ -20,6 +20,7 @@ SESSION_START_FILE="$DATA_DIR/session_start.txt"
 LOG_DIR="$BASE_DIR/logs"
 LOG_FILE="$LOG_DIR/g2ray.log"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
+SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT=443
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
@@ -169,9 +170,14 @@ render_config_qr() {
 
 render_config_entry() {
     local index="$1" label="$2" link="$3"
+    local show_qr="${4:-false}"
     echo -e "  ${RED}[${index}]${NC} ${WHITE}${B}${label}${NC}"
-    echo -e "  ${DIM}QR:${NC}"
-    render_config_qr "$link"
+    if [[ "$show_qr" == true ]]; then
+        echo -e "  ${DIM}QR:${NC}"
+        render_config_qr "$link"
+    else
+        echo -e "  ${DIM}QR hidden in default view. Set G2RAY_QR_MODE=all to show every QR.${NC}"
+    fi
     echo -e "  ${DIM}Copy-ready link:${NC}"
     printf '%s\n' "$link"
     echo ""
@@ -421,9 +427,42 @@ health_probe() {
     log_event INFO "health engine=${engine} listener=${listener} external_code=${code:-0} domain=${PORT_DOMAIN}"
 }
 
+self_heal_once() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local reason="" code
+
+    if ! ensure_codespace_port_public >/dev/null 2>&1; then
+        log_event WARN "self_heal port_public_failed port=${XRAY_PORT}"
+    fi
+
+    if ! xray_running; then
+        reason=xray_stopped
+    elif ! is_port_open; then
+        reason=listener_closed
+    fi
+
+    if [[ -n "$reason" ]]; then
+        log_event WARN "self_heal restart reason=${reason}"
+        if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
+            log_event INFO "self_heal restart_ok reason=${reason}"
+            ensure_codespace_port_public >/dev/null 2>&1 || true
+        else
+            log_event ERROR "self_heal restart_failed reason=${reason}"
+            return 1
+        fi
+    fi
+
+    code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://${PORT_DOMAIN}" 2>/dev/null || echo "0")
+    if [[ "$code" == "000" || "$code" == "0" ]]; then
+        log_event WARN "self_heal edge_unreachable code=${code:-0} action=force_reconnect"
+        force_reconnect --no-prompt >/dev/null 2>&1 \
+            || log_event ERROR "self_heal force_reconnect_failed code=${code:-0}"
+    fi
+}
+
 _background_tasks() {
     set +e
-    local tick=0 health_tick=0
+    local tick=0 health_tick=0 export_tick=0
     while true; do
         sleep 60
         if [[ "$PORT_DOMAIN" == unknown-codespace* ]]; then
@@ -434,16 +473,11 @@ _background_tasks() {
             fi
         fi
         [[ -f "$CONFIG_FILE" ]] || continue
-        ensure_codespace_port_public >/dev/null 2>&1 || true
-        if ! xray_running; then
-            log_event WARN "background detected_xray_stopped restarting=true"
-            start_xray >/dev/null 2>&1 || true
-            sleep 3
-            ensure_codespace_port_public >/dev/null 2>&1 || true
-        fi
+        self_heal_once >/dev/null 2>&1 || true
         save_xray_stats    >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         (( ++health_tick >= 5 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
+        (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
         (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
     done
 }
@@ -622,6 +656,31 @@ generate_ip_links() {
         printf '\n'
         index=$(( index + 1 ))
     done < <(resolve_domain_ips "$PORT_DOMAIN")
+}
+
+generate_ordered_links() {
+    local domain_link ip_links
+    ip_links=$(generate_ip_links || true)
+    printf '%s\n' "$ip_links" | awk 'NF'
+    domain_link=$(generate_domain_link || true)
+    if [[ -n "$domain_link" ]] && ! printf '%s\n' "$ip_links" | grep -Fxq "$domain_link"; then
+        printf '%s\n' "$domain_link"
+    fi
+}
+
+refresh_config_exports() {
+    [[ -f "$UUID_FILE" ]] || return 0
+    local links encoded count hash
+    links=$(generate_ordered_links | awk 'NF' || true)
+    [[ -n "$links" ]] || return 1
+    _atomic_write "$MOBILE_CONFIG_FILE" "$links"
+    if command -v base64 >/dev/null 2>&1; then
+        encoded=$(printf '%s\n' "$links" | base64 | tr -d '\n')
+        _atomic_write "$SUBSCRIPTION_FILE" "$encoded"
+    fi
+    count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
+    hash=$(fingerprint_secret "$links")
+    log_event INFO "config_exports refreshed count=${count} hash=${hash}"
 }
 
 generate_link() {
@@ -882,6 +941,7 @@ while true; do
             _VLESS_PRIMARY="${_CONFIG_LINKS[0]:-}"
             [[ -z "$_VLESS_PRIMARY" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
             printf '%s\n' "${_CONFIG_LINKS[@]}" > "$MOBILE_CONFIG_FILE"
+            refresh_config_exports >/dev/null 2>&1 || true
             _VHASH=$(printf '%s' "$_VLESS_PRIMARY" | md5sum | awk '{print $1}')
             _PFLAG="$DATA_DIR/.prompted_${_VHASH}"
             if [[ ! -f "$_PFLAG" ]]; then
@@ -897,10 +957,14 @@ while true; do
             refresh_screen
             echo -e "  ${RED}● Configs & Compact QR Codes${NC}"
             echo -e "  ${DIM}Raw links are printed without color codes and saved to:${NC}"
+            echo -e "  ${DIM}Base64 subscription export:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1
+            _QR_MODE="${G2RAY_QR_MODE:-recommended}"
             for _LINK in "${_CONFIG_LINKS[@]}"; do
-                render_config_entry "$_INDEX" "${_CONFIG_LABELS[$((_INDEX - 1))]}" "$_LINK"
+                _SHOW_QR=false
+                [[ "$_QR_MODE" == "all" || ( "$_QR_MODE" != "none" && $_INDEX -eq 1 ) ]] && _SHOW_QR=true
+                render_config_entry "$_INDEX" "${_CONFIG_LABELS[$((_INDEX - 1))]}" "$_LINK" "$_SHOW_QR"
                 _INDEX=$((_INDEX + 1))
             done
             echo -e "  ${DIM}IP links keep ${PORT_DOMAIN} as SNI/Host for Codespaces routing.${NC}\n"
