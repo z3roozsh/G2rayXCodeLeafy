@@ -86,15 +86,24 @@ xray_running() {
     [[ -n "$p" ]]
 }
 
+owned_xray_pids() {
+    local p
+    p=$(cat "$XRAY_PID_FILE" 2>/dev/null || true)
+    if xray_pid_matches "$p"; then
+        printf '%s\n' "$p"
+    fi
+    pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" 2>/dev/null || true
+}
+
 json_dns_ips() {
     local url="$1" header="${2:-}"
     if [[ -n "$header" ]]; then
         (curl -sf -m 4 -H "$header" "$url" 2>/dev/null \
-            | grep -oE '"data":"[0-9]+(\.[0-9]+){3}"' \
+            | grep -oE '"data":"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' \
             | sed -E 's/^"data":"//;s/"$//') || true
     else
         (curl -sf -m 4 "$url" 2>/dev/null \
-            | grep -oE '"data":"[0-9]+(\.[0-9]+){3}"' \
+            | grep -oE '"data":"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' \
             | sed -E 's/^"data":"//;s/"$//') || true
     fi
 }
@@ -102,7 +111,7 @@ json_dns_ips() {
 curl_remote_ip() {
     local domain="$1" ip
     ip=$(curl -sk -m 5 -o /dev/null -w '%{remote_ip}' "https://${domain}/" 2>/dev/null || true)
-    [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && printf '%s\n' "$ip"
+    [[ "$ip" =~ ^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$ ]] && printf '%s\n' "$ip"
 }
 
 resolve_domain_ips() {
@@ -119,7 +128,7 @@ resolve_domain_ips() {
         json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json"
         curl_remote_ip "$domain" || true
         printf '%s\n' "$DEFAULT_FALLBACK_IPS" | tr ',; ' '\n'
-    } | awk '/^[0-9]+(\.[0-9]+){3}$/ && !seen[$0]++ {print}')
+    } | awk '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/ && !seen[$0]++ {print}')
     if [[ -n "$candidates" ]]; then
         joined=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//')
         log_event INFO "resolver domain=${domain} ips=${joined}"
@@ -315,21 +324,30 @@ save_session_uptime() {
 
 stop_xray() {
     save_xray_stats 2>/dev/null || true
-    local p
-    p=$(cat "$XRAY_PID_FILE" 2>/dev/null || true)
-    if ! xray_pid_matches "$p"; then
-        p=$(pgrep -f "$XRAY_BIN run -c $CONFIG_FILE" | head -1 || true)
-    fi
-    if xray_pid_matches "$p" && sudo kill -0 "$p" 2>/dev/null; then
-        log_event INFO "stop_xray pid=${p}"
-        sudo kill "$p" >/dev/null 2>&1 || true
-        sleep 0.5
-        if sudo kill -0 "$p" 2>/dev/null; then
-            sudo kill -9 "$p" >/dev/null 2>&1 || true
-            log_event WARN "stop_xray forced_kill pid=${p}"
-        fi
+    local p owned_pids=()
+    mapfile -t owned_pids < <(owned_xray_pids | awk 'NF && !seen[$0]++ {print}')
+    if ((${#owned_pids[@]})); then
+        for p in "${owned_pids[@]}"; do
+            if xray_pid_matches "$p" && sudo kill -0 "$p" 2>/dev/null; then
+                log_event INFO "stop_xray pid=${p}"
+                sudo kill "$p" >/dev/null 2>&1 || true
+                sleep 0.5
+                if sudo kill -0 "$p" 2>/dev/null; then
+                    sudo kill -9 "$p" >/dev/null 2>&1 || true
+                    log_event WARN "stop_xray forced_kill pid=${p}"
+                fi
+            fi
+        done
     else
         log_event INFO "stop_xray no-owned-process"
+    fi
+    if ((${#owned_pids[@]})); then
+        for p in "${owned_pids[@]}"; do
+            if xray_pid_matches "$p" && sudo kill -0 "$p" 2>/dev/null; then
+                log_event ERROR "stop_xray still_alive pid=${p}"
+                return 1
+            fi
+        done
     fi
     rm -f "$XRAY_PID_FILE" 2>/dev/null || true
     sleep 0.5
@@ -345,7 +363,11 @@ start_xray() {
     log_event INFO "start_xray requested port=${XRAY_PORT} config=${CONFIG_FILE}"
     launch_cmd=$(printf 'nohup %q run -c %q </dev/null >%q 2>&1 & printf "%%s\n" "$!"' \
         "$XRAY_BIN" "$CONFIG_FILE" "$LOG_DIR/xray.log")
-    stop_xray
+    if ! stop_xray; then
+        log_event ERROR "start_xray stop_previous_failed"
+        echo -e "  ${RED}✖ Could not stop previous Xray process.${NC}"
+        return 1
+    fi
     reset_session_bytes_baseline
     pid=$(sudo bash -c "$launch_cmd" 2>/dev/null || true)
     if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
@@ -705,13 +727,13 @@ force_reconnect() {
     local ok=false code
     for _i in 1 2 3 4; do
         code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://${PORT_DOMAIN}" 2>/dev/null || echo "0")
-        [[ "$code" =~ ^[1-9][0-9]{2}$ ]] && { ok=true; break; }
+        [[ "$code" =~ ^2[0-9]{2}$ ]] && { ok=true; break; }
         sleep 2
     done
-    log_event INFO "force_reconnect verify_external reachable=${ok} code=${code:-none} domain=${PORT_DOMAIN}"
+    log_event INFO "force_reconnect verify_external usable=${ok} code=${code:-none} domain=${PORT_DOMAIN}"
     [[ "$ok" == true ]] \
-        && echo -e "${GREEN}Reachable (HTTP ${code})${NC}\n" \
-        || echo -e "${YELLOW}Pending / Delayed${NC}\n"
+        && echo -e "${GREEN}Usable (HTTP ${code})${NC}\n" \
+        || echo -e "${YELLOW}Bad response / delayed (HTTP ${code:-0})${NC}\n"
 
     [[ "$no_prompt" == "--no-prompt" ]] && { sleep 1; return; }
     echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r

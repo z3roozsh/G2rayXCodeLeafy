@@ -42,6 +42,14 @@ test_process_management_uses_pid_file() {
         || fail 'script does not validate that a PID belongs to this Xray config'
     grep_fixed 'xray_pid_matches "$p"' "$SCRIPT" \
         || fail 'stop/status paths do not validate PID ownership before trusting the PID file'
+    grep_fixed 'owned_xray_pids()' "$SCRIPT" \
+        || fail 'script does not enumerate all owned Xray processes'
+    grep_fixed 'mapfile -t owned_pids' "$SCRIPT" \
+        || fail 'stop_xray does not collect every owned Xray PID before stopping'
+    grep_fixed 'for p in "${owned_pids[@]}"' "$SCRIPT" \
+        || fail 'stop_xray does not stop every owned Xray PID'
+    grep_fixed 'if ! stop_xray; then' "$SCRIPT" \
+        || fail 'start_xray does not abort when the old owned listener cannot be stopped'
     grep_fixed '> "$XRAY_PID_FILE"' "$SCRIPT" \
         || fail 'start_xray does not store the launched Xray PID'
     if grep_fixed 'pkill -x "xray"' "$SCRIPT" || grep_fixed 'pkill -9 -x "xray"' "$SCRIPT"; then
@@ -134,6 +142,11 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'script does not query Cloudflare DNS-over-HTTPS for fallback IPs'
     grep_fixed 'seen[$0]++' "$SCRIPT" \
         || fail 'script does not deduplicate fallback IP candidates'
+    if grep_fixed '(\.[0-9]+){3}' "$SCRIPT"; then
+        fail 'script still uses interval IPv4 regexes that can drop fallback IPs on non-GNU tools'
+    fi
+    grep_fixed '^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' "$SCRIPT" \
+        || fail 'script does not use a portable IPv4 filter for fallback IP candidates'
     grep_fixed 'generate_domain_link()' "$SCRIPT" \
         || fail 'script does not generate a domain-address link'
     grep_fixed 'generate_ip_link()' "$SCRIPT" \
@@ -184,6 +197,13 @@ test_runtime_diagnostics_logging() {
         || fail 'start_xray does not log successful launches'
     grep_fixed 'log_event INFO "force_reconnect begin' "$SCRIPT" \
         || fail 'force reconnect does not log start of reconnect flow'
+    grep_fixed '[[ "$code" =~ ^2[0-9]{2}$ ]]' "$SCRIPT" \
+        || fail 'external reconnect verification treats non-2xx statuses as healthy'
+    grep_fixed 'verify_external usable=' "$SCRIPT" \
+        || fail 'external reconnect verification does not log whether the endpoint is usable'
+    if grep_fixed 'verify_external reachable=' "$SCRIPT"; then
+        fail 'external reconnect verification still labels HTTP 404 as reachable'
+    fi
     grep_fixed 'log_event INFO "resolver domain=' "$SCRIPT" \
         || fail 'resolver does not log resolved fallback IP candidates'
     grep_fixed 'curl_remote_ip()' "$SCRIPT" \
