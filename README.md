@@ -161,6 +161,8 @@ If you want a phone/browser/curl-accessible manual wake button, this repo includ
 
 The panel can guide this from **Option 15: Recovery / Waker Setup**. It detects the current Codespace name, generates a wake secret, reminds you to set Default idle timeout to 240 minutes, and saves only non-sensitive metadata such as the Worker URL and wake-secret fingerprint.
 
+After the Worker starts the Codespace, it briefly probes the `app.github.dev` XHTTP route. If the response says `route_ready: true`, your existing VLESS configs should work again. If it says `route_ready: false` with HTTP `404`, GitHub has started the Codespace but the port route is still settling; wait 1-2 minutes and retry, or open the panel and use option `6) Force Reconnect`.
+
 Do not paste the GitHub token into G2ray. Create the token in GitHub, save it privately, and enter it directly in Cloudflare as the `GITHUB_TOKEN` secret. The wake secret is shown once by the panel; save it privately and enter it directly in Cloudflare as the `WAKE_SECRET` secret.
 
 Classic token path:
@@ -174,6 +176,7 @@ Classic token path:
 Cloudflare dashboard binding types:
 
 - `CODESPACE_NAME`: **Plaintext** variable.
+- `CODESPACE_PORT`: **Plaintext** variable only if you changed `XRAY_PORT`; omit it for the default `443`.
 - `GITHUB_TOKEN`: **Secret** variable.
 - `WAKE_SECRET`: **Secret** variable.
 

@@ -567,6 +567,14 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not redact GitHub error response details'
     grep_fixed 'idle_timeout_minutes:' "$WORKER_SCRIPT" \
         || fail 'Worker success response does not retain useful redacted status fields'
+    grep_fixed 'waitForXhttpRoute(name, codespacePort(env))' "$WORKER_SCRIPT" \
+        || fail 'Worker does not wait for the Codespaces XHTTP route after start'
+    grep_fixed 'method: "OPTIONS"' "$WORKER_SCRIPT" \
+        || fail 'Worker route readiness probe does not use the XHTTP OPTIONS probe'
+    grep_fixed 'route_ready:' "$WORKER_SCRIPT" \
+        || fail 'Worker response does not report route readiness'
+    grep_fixed 'ROUTE_WAIT_MS' "$WORKER_SCRIPT" \
+        || fail 'Worker route readiness wait is not bounded'
     grep_fixed 'wake_secret' "$WORKER_SCRIPT" \
         || fail 'Worker browser form cannot submit the wake secret'
     grep_fixed 'wrangler secret put GITHUB_TOKEN' "$WORKER_README" \
@@ -622,6 +630,10 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'wizard does not clarify GitHub token and wake secret binding types'
     grep_fixed 'Worker wake URL (https optional, /wake optional)' "$SCRIPT" \
         || fail 'wizard does not clarify acceptable Worker URL formats'
+    grep_fixed 'CODESPACE_PORT' "$SCRIPT" \
+        || fail 'wizard does not mention the optional custom port Worker binding'
+    grep_fixed 'route_ready: false' "$SCRIPT" \
+        || fail 'recovery guide does not explain route settling after wake'
     grep_fixed 'The wake secret is shown once' "$SCRIPT" \
         || fail 'wizard does not warn that the raw wake secret is not persisted'
     grep_fixed '^https://([A-Za-z0-9][A-Za-z0-9.-]*[.][A-Za-z0-9.-]+)' "$SCRIPT" \
@@ -697,12 +709,22 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README does not clarify CODESPACE_NAME as a plaintext Cloudflare variable'
     grep_fixed 'GITHUB_TOKEN`: **Secret** variable' "$README" \
         || fail 'README does not clarify GITHUB_TOKEN as a Cloudflare secret'
+    grep_fixed 'CODESPACE_PORT`: **Plaintext** variable only if you changed `XRAY_PORT`' "$README" \
+        || fail 'README does not document the optional CODESPACE_PORT Worker binding'
+    grep_fixed 'route_ready: true' "$README" \
+        || fail 'README does not explain successful Worker route readiness'
+    grep_fixed 'route_ready: false' "$README" \
+        || fail 'README does not explain Worker route settling failures'
     grep_fixed 'with or without `https://`, and with or without `/wake`' "$README" \
         || fail 'README does not clarify accepted Worker URL formats'
     grep_fixed 'CODESPACE_NAME` as a **Plaintext** variable' "$WORKER_README" \
         || fail 'Worker README does not clarify CODESPACE_NAME dashboard binding type'
+    grep_fixed 'CODESPACE_PORT` as a **Plaintext** variable only if you changed' "$WORKER_README" \
+        || fail 'Worker README does not document the optional CODESPACE_PORT binding'
     grep_fixed 'GITHUB_TOKEN` and `WAKE_SECRET` as **Secret** variables' "$WORKER_README" \
         || fail 'Worker README does not clarify Worker secret binding types'
+    grep_fixed 'route_ready: false` with HTTP `404`' "$WORKER_README" \
+        || fail 'Worker README does not explain the route-settling response'
     grep_fixed 'VS Code Desktop' "$README" \
         || fail 'README does not mention VS Code Desktop fallback for slow browser Codespaces'
     pass 'docs cover panel waker setup'

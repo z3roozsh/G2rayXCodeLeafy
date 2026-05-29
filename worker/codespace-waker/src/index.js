@@ -1,4 +1,7 @@
 const GITHUB_API_VERSION = "2022-11-28";
+const DEFAULT_CODESPACE_PORT = 443;
+const ROUTE_WAIT_MS = 35000;
+const ROUTE_POLL_INTERVAL_MS = 3000;
 
 export default {
   async fetch(request, env) {
@@ -40,11 +43,11 @@ export default {
       return json({ ok: false, error: "missing_github_token" }, 500);
     }
 
-    return startCodespace(codespaceName, env.GITHUB_TOKEN);
+    return startCodespace(codespaceName, env.GITHUB_TOKEN, env);
   }
 };
 
-async function startCodespace(name, token) {
+async function startCodespace(name, token, env) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
   const res = await fetch(endpoint, {
     method: "POST",
@@ -86,15 +89,32 @@ async function startCodespace(name, token) {
     }, 404);
   }
 
+  const accepted = res.ok || res.status === 202 || res.status === 304 || res.status === 409;
+  if (!accepted) {
+    return json({
+      ok: false,
+      status: res.status,
+      codespace: name,
+      reason: "github_start_request_failed",
+      detail: githubErrorDetail(body)
+    }, 502);
+  }
+
+  const routeProbe = await waitForXhttpRoute(name, codespacePort(env));
+
   return json({
-    ok: res.ok || res.status === 202 || res.status === 304 || res.status === 409,
+    ok: true,
     status: res.status,
     codespace: name,
     state: body && typeof body === "object" ? body.state || null : null,
     last_used_at: body && typeof body === "object" ? body.last_used_at || null : null,
     idle_timeout_minutes: body && typeof body === "object" ? body.idle_timeout_minutes || null : null,
-    message: "Codespace start request accepted. Wait for the Codespace and app route to become ready."
-  }, res.ok || res.status === 202 || res.status === 304 || res.status === 409 ? 200 : 502);
+    route_ready: routeProbe.usable,
+    route_probe: routeProbe,
+    message: routeProbe.usable
+      ? "Codespace start request accepted and the XHTTP route is usable."
+      : "Codespace start request accepted, but the XHTTP route is still settling. Wait and try again; if it stays 404, open the panel and use option 6."
+  }, 200);
 }
 
 function bearerSecret(request) {
@@ -128,6 +148,65 @@ function githubErrorDetail(body) {
   };
 }
 
+function codespacePort(env) {
+  const value = Number.parseInt(String(env.CODESPACE_PORT || DEFAULT_CODESPACE_PORT), 10);
+  return Number.isInteger(value) && value > 0 && value <= 65535 ? value : DEFAULT_CODESPACE_PORT;
+}
+
+async function waitForXhttpRoute(name, port) {
+  const url = `https://${name}-${port}.app.github.dev/`;
+  const startedAt = Date.now();
+  const deadline = startedAt + ROUTE_WAIT_MS;
+  let attempts = 0;
+  let last = {
+    url,
+    usable: false,
+    http_status: 0,
+    latency_ms: null,
+    attempts,
+    waited_ms: 0,
+    error: "not_checked"
+  };
+
+  while (Date.now() <= deadline) {
+    attempts += 1;
+    const probeStartedAt = Date.now();
+    try {
+      const res = await fetch(url, { method: "OPTIONS", redirect: "manual" });
+      const latencyMs = Date.now() - probeStartedAt;
+      last = {
+        url,
+        usable: res.status === 200,
+        http_status: res.status,
+        latency_ms: latencyMs,
+        attempts,
+        waited_ms: Date.now() - startedAt,
+        error: null
+      };
+      if (last.usable) return last;
+    } catch (error) {
+      last = {
+        url,
+        usable: false,
+        http_status: 0,
+        latency_ms: Date.now() - probeStartedAt,
+        attempts,
+        waited_ms: Date.now() - startedAt,
+        error: error && error.message ? String(error.message).slice(0, 160) : "probe_failed"
+      };
+    }
+
+    if (Date.now() + ROUTE_POLL_INTERVAL_MS > deadline) break;
+    await sleep(ROUTE_POLL_INTERVAL_MS);
+  }
+
+  return last;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -152,6 +231,7 @@ function renderForm() {
 </style>
 <h1>G2ray Codespace Waker</h1>
 <p>This privately starts the configured GitHub Codespace. It cannot bypass GitHub quota, billing, deletion, or account restrictions.</p>
+<p>After GitHub accepts the start request, this page also waits briefly for the <code>app.github.dev</code> XHTTP route to become usable. If the result says <code>route_ready: false</code> with HTTP 404, wait and try again, or open the panel and use option 6.</p>
 <form method="post" action="/wake">
   <label>
     Wake secret

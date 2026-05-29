@@ -4,6 +4,8 @@ This Cloudflare Worker gives you a private manual `/wake` endpoint that starts o
 
 It does not keep the Codespace alive forever and it cannot bypass quota, billing, deletion, or account restrictions.
 
+After GitHub accepts the start request, the Worker briefly probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the VLESS configs should be usable. If it says `route_ready: false` with HTTP `404`, the Codespace has started but GitHub's port route is still settling; wait and retry, or open the panel and use option `6) Force Reconnect`.
+
 ## 1. Create a GitHub Token
 
 Recommended path:
@@ -54,6 +56,8 @@ CODESPACE_NAME = "animated-spork-wvr97qjxqjqwcg6xq"
 ```
 
 If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as a **Plaintext** variable.
+
+Optional: add `CODESPACE_PORT` as a **Plaintext** variable only if you changed the panel's `XRAY_PORT`. Leave it unset for the default port `443`.
 
 ## 3. Add Secrets
 
@@ -112,6 +116,8 @@ Opening the Worker URL in a browser and entering the wake secret in the form is 
 ## Expected Responses
 
 - `200` with `ok: true`: GitHub accepted or handled the start request.
+- `route_ready: true`: the XHTTP route was reachable during the Worker wait window.
+- `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
 - `401`: Wrong wake secret.
 - `402`: GitHub quota or billing blocked the start. Wait for quota reset or adjust GitHub billing settings.
 - `403`: GitHub token is rejected or missing the right scope.
