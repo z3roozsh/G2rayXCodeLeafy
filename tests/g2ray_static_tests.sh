@@ -149,6 +149,12 @@ test_shell_files_are_lf_normalized() {
     pass 'shell files are LF-normalized for Linux Bash'
 }
 
+test_panel_script_is_executable() {
+    git -C "$ROOT_DIR" ls-files --stage -- g2ray.sh | grep -q '^100755 ' \
+        || fail 'g2ray.sh is not tracked as executable, so ./g2ray.sh fails after git pull in Linux Codespaces'
+    pass 'panel script is tracked executable'
+}
+
 test_xray_version_can_be_pinned() {
     grep_fixed 'ARG XRAY_VERSION=' "$DOCKERFILE" \
         || fail 'Dockerfile does not expose XRAY_VERSION for reproducible builds'
@@ -616,6 +622,7 @@ test_self_update_is_opt_in
 test_exit_trap_preserves_failures
 test_generated_files_are_ignored
 test_shell_files_are_lf_normalized
+test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
 test_generated_links_include_domain_and_ip_variants
