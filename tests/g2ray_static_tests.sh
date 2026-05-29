@@ -888,6 +888,14 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
     grep_fixed 'configs-to-copy-for-mobile.txt' "$README" \
         || fail 'README does not document the mobile copy-link fallback for QR scan failures'
+    grep_fixed 'Choose Your Codespace Region Before Creating It' "$README" \
+        || fail 'README does not tell users to choose a region before creating a Codespace'
+    grep_fixed 'You cannot move an existing Codespace to another region' "$README" \
+        || fail 'README does not explain that region changes require a new Codespace'
+    grep_fixed 'gh codespace create -R OWNER/REPO -l WestEurope --idle-timeout 240m' "$README" \
+        || fail 'README does not include a CLI example for region selection'
+    grep_fixed '12) Server Location' "$README" \
+        || fail 'README does not tell users to verify the observed exit location'
     grep_fixed 'Community Donated Configs (SUB)</summary>' "$README" \
         || fail 'README community subscription summary is not wrapped in a details block'
     if grep_fixed 'without impacting your own speed or exposing personal data' "$README"; then

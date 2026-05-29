@@ -76,13 +76,24 @@ Donate your generated config directly from the CLI to share access with the comm
 1. **Fork the Repository**  
    → Click **Fork** at the top-right of this page
 
-2. **Create a Codespace**  
+2. **Choose Your Codespace Region Before Creating It**
+   → GitHub profile picture → **Settings** → **Codespaces** → **Region** → choose **Set manually** and pick the region you want. This decides the likely exit IP/country for new configs. You cannot move an existing Codespace to another region; create a new Codespace after changing this setting.
+
+   Common GitHub CLI region names include `WestEurope`, `EastUs`, `WestUs2`, and `SouthEastAsia`. For example:
+
+   ```bash
+   gh codespace create -R OWNER/REPO -l WestEurope --idle-timeout 240m
+   ```
+
+   After setup, use option `12) Server Location` in the panel to confirm the observed exit IP/country.
+
+3. **Create a Codespace**
    → Open your fork → Click **Code** → **Codespaces** tab → **Create codespace on main**
 
-3. **Wait for Environment**  
+4. **Wait for Environment**
    → Allow 2-3 minutes for the container to build
 
-4. **Launch Panel**  
+5. **Launch Panel**
    → The G2ray CLI panel auto-starts in the terminal!
 
 If browser Codespaces stays on a loading screen for a long time, open the same Codespace in **VS Code Desktop** from the GitHub Codespaces page. The panel runs the same way there and is often faster on slow browser sessions.
@@ -244,7 +255,7 @@ Not by itself while GitHub is blocking or stopping the Codespace, because no cod
 No. GitHub's 15 GB-month included allowance is Codespaces storage. The panel's RX/TX traffic counter measures tunnel traffic for your visibility, but it is not the same as the GitHub storage quota.
 
 **Why are my speeds slow?**
-For optimal routing, always try to ensure your GitHub Codespace region is set to `Europe West` in your GitHub account settings, as this places the server in NL/DE.
+Codespace region affects the likely exit IP/country and latency. Set the desired region before creating the Codespace, then confirm the real observed exit IP with option `12) Server Location`. GitHub/Azure region labels are not a perfect country guarantee, and changing the setting later does not move an existing Codespace.
 
 </details>
 
