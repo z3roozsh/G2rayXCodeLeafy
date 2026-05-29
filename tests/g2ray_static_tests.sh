@@ -364,7 +364,7 @@ test_runtime_diagnostics_logging() {
         || fail 'watchdog does not force reconnect when the Codespaces edge is unreachable'
     grep_fixed 'show_diagnostics()' "$SCRIPT" \
         || fail 'script does not provide a diagnostics view'
-    grep_fixed '14) Diagnostics' "$SCRIPT" \
+    grep_fixed '14)${NC} Diagnostics' "$SCRIPT" \
         || fail 'menu does not expose the diagnostics view'
     grep_fixed '14) show_diagnostics' "$SCRIPT" \
         || fail 'case statement does not route to diagnostics view'
@@ -590,7 +590,7 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'panel cannot clear saved waker metadata'
     grep_fixed 'show_recovery_waker()' "$SCRIPT" \
         || fail 'panel does not expose a recovery/waker menu screen'
-    grep_fixed '15) Recovery / Waker Setup' "$SCRIPT" \
+    grep_fixed '15)${NC} Recovery / Waker Setup' "$SCRIPT" \
         || fail 'main menu does not expose recovery/waker setup'
     grep_fixed '15) show_recovery_waker' "$SCRIPT" \
         || fail 'case statement does not route to the recovery/waker setup screen'

@@ -1873,7 +1873,6 @@ while true; do
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
     echo -e "   ${RED}9)${NC} Data Usage                 ${RED}12)${NC} Server Location"
     echo -e "  ${RED}10)${NC} Resource Stats             ${RED}13)${NC} View Engine Logs"
-    # Menu labels: 14) Diagnostics, 15) Recovery / Waker Setup
     echo -e "  ${RED}14)${NC} Diagnostics                ${RED}15)${NC} Recovery / Waker Setup"
     echo -e "  ${RED}11)${NC} Quota & Uptime"
     echo ""
