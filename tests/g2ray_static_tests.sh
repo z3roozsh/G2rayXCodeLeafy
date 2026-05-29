@@ -73,8 +73,14 @@ test_background_tasks_uses_owned_pid_file() {
         || fail 'background supervisor does not persist an ownership token'
     grep_fixed 'G2RAY_BG_TASK_TOKEN=' "$SCRIPT" \
         || fail 'background supervisor process is not tagged with an ownership token'
+    grep_fixed 'export G2RAY_BG_TASK_TOKEN="$token"' "$SCRIPT" \
+        || fail 'background supervisor ownership token is not exported into the child environment'
     grep_fixed '/proc/$p/environ' "$SCRIPT" \
         || fail 'background supervisor ownership is not verified against the live process environment'
+    grep_fixed 'background_supervisor_recent_heartbeat()' "$SCRIPT" \
+        || fail 'background supervisor diagnostics cannot recognize a fresh heartbeat'
+    grep_fixed 'running="heartbeat"' "$SCRIPT" \
+        || fail 'background supervisor diagnostics cannot distinguish a live heartbeat from a dead supervisor'
     if grep_fixed 'grep -Fq "g2ray.sh"' "$SCRIPT"; then
         fail 'background supervisor ownership still matches any process whose args contain g2ray.sh'
     fi
@@ -217,7 +223,7 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'script does not generate a resolved-IP fallback link'
     grep_fixed 'generate_ip_links()' "$SCRIPT" \
         || fail 'script does not generate multiple resolved-IP fallback links'
-    grep_fixed '"$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN"' "$SCRIPT" \
+    grep_fixed '"$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN"' "$SCRIPT" \
         || fail 'IP fallback link must preserve PORT_DOMAIN as SNI and host'
     grep_fixed 'generate_link_for_address "$PORT_DOMAIN"' "$SCRIPT" \
         || fail 'domain link must use PORT_DOMAIN as address, SNI, and host'
@@ -413,6 +419,12 @@ test_self_heal_uses_reconnect_backoff() {
 test_diagnostics_show_latency_and_supervisor_state() {
     grep_fixed 'xhttp_probe_metrics()' "$SCRIPT" \
         || fail 'diagnostics cannot measure XHTTP probe latency'
+    grep_fixed 'CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"' "$SCRIPT" \
+        || fail 'script does not define the external Codespaces HTTPS edge port separately from the internal Xray port'
+    grep_fixed 'url="https://${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}${path}"' "$SCRIPT" \
+        || fail 'external XHTTP probes do not include the Codespaces edge port in the URL, so fallback IP probes can test the wrong route'
+    grep_fixed '--resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}"' "$SCRIPT" \
+        || fail 'fallback XHTTP probes do not bind --resolve to the same edge port used by the URL'
     grep_fixed 'xhttp_probe_ms=' "$SCRIPT" \
         || fail 'health/reconnect logs do not include XHTTP probe latency'
     grep_fixed 'BG_TASKS_HEARTBEAT_FILE=' "$SCRIPT" \
@@ -426,6 +438,43 @@ test_diagnostics_show_latency_and_supervisor_state() {
     grep_fixed 'ms' "$SCRIPT" \
         || fail 'diagnostics do not display latency in milliseconds'
     pass 'diagnostics show probe latency and supervisor state'
+}
+
+test_runtime_ready_rejects_started_but_unusable_route() {
+    awk '
+        /ensure_runtime_ready\(\)/ { in_fn=1 }
+        in_fn && /started_route_unusable/ { saw_started_unusable=1 }
+        saw_started_unusable && /started_route_ready/ { saw_ready=1 }
+        saw_started_unusable && /started_route_still_unusable/ { saw_still_bad=1 }
+        saw_started_unusable && /return 1/ { saw_failure=1 }
+        in_fn && /^}/ { exit }
+        END { exit (saw_started_unusable && saw_ready && saw_still_bad && saw_failure) ? 0 : 1 }
+    ' "$SCRIPT" \
+        || fail 'ensure_runtime_ready can still return success after a newly-started engine has an unusable XHTTP route'
+    pass 'runtime readiness rejects newly-started unusable XHTTP routes'
+}
+
+test_runtime_files_are_private_and_tempfiles_are_unique() {
+    grep_fixed 'umask 077' "$SCRIPT" \
+        || fail 'runtime files are not created with a private umask'
+    grep_fixed 'chmod 600 "$UUID_FILE" "$CONFIG_FILE"' "$SCRIPT" \
+        || fail 'generated UUID/config files are not explicitly chmod 600'
+    if grep_fixed 'local tmp="/tmp/g2ray_remote.sh"' "$SCRIPT"; then
+        fail 'self-update still uses a predictable /tmp path'
+    fi
+    if grep_fixed '> /tmp/g2ray_msg_tmp.txt' "$SCRIPT"; then
+        fail 'remote message fetch still uses a predictable /tmp path'
+    fi
+    if grep_fixed '> /tmp/gas_resp.txt' "$SCRIPT"; then
+        fail 'donation response still uses a predictable /tmp path'
+    fi
+    grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_remote.XXXXXX"' "$SCRIPT" \
+        || fail 'self-update does not stage downloads through mktemp'
+    grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_msg.XXXXXX"' "$SCRIPT" \
+        || fail 'remote message fetch does not stage through mktemp'
+    grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_donate.XXXXXX"' "$SCRIPT" \
+        || fail 'donation response does not stage through mktemp'
+    pass 'runtime files are private and tempfiles are unique'
 }
 
 test_fallback_link_count_is_capped() {
@@ -577,6 +626,8 @@ test_runtime_control_paths_are_hardened
 test_startup_does_not_reconnect_healthy_runtime
 test_self_heal_uses_reconnect_backoff
 test_diagnostics_show_latency_and_supervisor_state
+test_runtime_ready_rejects_started_but_unusable_route
+test_runtime_files_are_private_and_tempfiles_are_unique
 test_fallback_link_count_is_capped
 test_ci_runs_static_regressions
 test_docs_and_public_configs_are_consistent

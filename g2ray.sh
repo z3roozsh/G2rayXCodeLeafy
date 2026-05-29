@@ -16,6 +16,7 @@ BG_TASKS_VERSION_FILE="$DATA_DIR/bg_tasks.version"
 BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
 BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
 BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+REMOTE_MESSAGE_FILE="$DATA_DIR/message.txt"
 ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
 EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
@@ -30,17 +31,21 @@ MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
+CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 
+umask 077
 mkdir -p "$DATA_DIR" "$LOG_DIR"
+chmod 700 "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
 [[ -f "$SAVED_BYTES_FILE"   ]] || printf '{"down":0,"up":0}\n' > "$SAVED_BYTES_FILE"
 [[ -f "$SESSION_BYTES_FILE" ]] || printf '{"down":0,"up":0}\n' > "$SESSION_BYTES_FILE"
 [[ -f "$TOTAL_UPTIME_FILE"  ]] || printf '0\n'                 > "$TOTAL_UPTIME_FILE"
 [[ -f "$SESSION_START_FILE" ]] || date +%s                     > "$SESSION_START_FILE"
+chmod 600 "$LOG_FILE" "$SAVED_BYTES_FILE" "$SESSION_BYTES_FILE" "$TOTAL_UPTIME_FILE" "$SESSION_START_FILE" 2>/dev/null || true
 
 log_event() {
     local level="$1"; shift || true
@@ -145,12 +150,12 @@ xhttp_probe_metrics() {
     [[ "$path" == /* ]] || path="/${path}"
     case "$target" in
         local) url="http://127.0.0.1:${XRAY_PORT}${path}" ;;
-        *)     url="https://${PORT_DOMAIN}${path}" ;;
+        *)     url="https://${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}${path}" ;;
     esac
     if [[ "$target" == "local" || -z "$address" ]]; then
         raw=$(curl -sk -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null || echo "0 0")
     else
-        raw=$(curl -sk -m 5 --resolve "${PORT_DOMAIN}:${XRAY_PORT}:${address}" \
+        raw=$(curl -sk -m 5 --resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}" \
             -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null || echo "0 0")
     fi
     code=${raw%% *}
@@ -298,7 +303,12 @@ refresh_screen() {
 check_for_updates() {
     [[ "${G2RAY_AUTO_UPDATE:-0}" == "1" ]] || return 0
     clear; draw_logo
-    local tmp="/tmp/g2ray_remote.sh" staged
+    local tmp="" staged=""
+    tmp=$(mktemp "${TMPDIR:-/tmp}/g2ray_remote.XXXXXX") || {
+        printf "\r  %b✖%b %bUpdate check failed (no temp file).    %b\n" "$RED" "$NC" "$DIM" "$NC"
+        sleep 1
+        return 0
+    }
     curl -s -m 8 -L "https://raw.githubusercontent.com/Code-Leafy/G2rayXCodeLeafy/main/g2ray.sh" -o "$tmp" &
     local pid=$! frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏") i=0
     while kill -0 "$pid" 2>/dev/null; do
@@ -309,7 +319,12 @@ check_for_updates() {
     if [[ -f "$tmp" ]] && grep -q "G2ray Panel" "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
         if ! cmp -s "$0" "$tmp"; then
             printf "\r  %b✔%b %bUpdate found! Installing...              %b\n" "$GREEN" "$NC" "$WHITE" "$NC"
-            staged=$(mktemp "${0}.XXXXXX")
+            staged=$(mktemp "${TMPDIR:-/tmp}/g2ray_update.XXXXXX") || {
+                printf "  %b✖%b %bUpdate staging failed.%b\n" "$RED" "$NC" "$DIM" "$NC"
+                rm -f "$tmp" 2>/dev/null || true
+                sleep 1
+                return 0
+            }
             cp "$tmp" "$staged"
             chmod +x "$staged"
             mv -f "$staged" "$0"
@@ -321,14 +336,20 @@ check_for_updates() {
     else
         printf "\r  %b✖%b %bUpdate check failed (network or 404).     %b\n" "$RED" "$NC" "$DIM" "$NC"
     fi
-    rm -f "$tmp" 2>/dev/null || true
+    rm -f "$tmp" "$staged" 2>/dev/null || true
     sleep 1
 }
 
 fetch_remote_message() {
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/g2ray_msg.XXXXXX") || return 0
     curl -s -m 4 "https://raw.githubusercontent.com/Code-Leafy/G2rayXCodeLeafy/main/assets/message.txt" \
-        > /tmp/g2ray_msg_tmp.txt 2>/dev/null || true
-    [[ -f /tmp/g2ray_msg_tmp.txt ]] && mv -f /tmp/g2ray_msg_tmp.txt /tmp/g2ray_message.txt 2>/dev/null || true
+        > "$tmp" 2>/dev/null || true
+    if [[ -s "$tmp" ]]; then
+        mv -f "$tmp" "$REMOTE_MESSAGE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
 }
 
 enable_anti_sleep() {
@@ -344,28 +365,36 @@ while true; do
 done
 EOF
     chmod +x "$DATA_DIR/keepalive.sh"
-    tmux new-session -d -s g2ray_keepalive "bash $DATA_DIR/keepalive.sh" 2>/dev/null || true
+    local keepalive_cmd; keepalive_cmd=$(printf 'bash %q' "$DATA_DIR/keepalive.sh")
+    tmux new-session -d -s g2ray_keepalive "$keepalive_cmd" 2>/dev/null || true
 }
 
 send_to_vless_forwarder() {
-    local link="$1"
+    local link="$1" resp
     local url="https://script.google.com/macros/s/AKfycbwtsJZhhaBjPILq0wY3saytWmWtQFD6aXXwmHnX_i_BX5OCMLiVrXPutCxM-ejPafVGsg/exec"
     if ! command -v jq >/dev/null 2>&1; then
         echo -e "  ${RED}✖ jq unavailable — cannot donate config.${NC}"
         return 1
     fi
     local payload; payload=$(jq -n --arg m "$link" '{message:$m}')
+    resp=$(mktemp "${TMPDIR:-/tmp}/g2ray_donate.XXXXXX") || {
+        echo -e "  ${RED}✖ Could not prepare donation response file.${NC}"
+        return 1
+    }
     echo -e "  ${YELLOW}Sending config to developer network...${NC}"
     if curl -sf -L --max-time 15 -H "Content-Type: application/json" \
-            -d "$payload" "$url" </dev/null > /tmp/gas_resp.txt 2>&1; then
-        if grep -q "Appended to GitHub" /tmp/gas_resp.txt; then
+            -d "$payload" "$url" </dev/null > "$resp" 2>&1; then
+        if grep -q "Appended to GitHub" "$resp"; then
+            rm -f "$resp" 2>/dev/null || true
             echo -e "  ${GREEN}✔ Config donated successfully! Thank you.${NC}"
             return 0
         else
+            rm -f "$resp" 2>/dev/null || true
             echo -e "  ${RED}✖ Donation endpoint rejected.${NC}"
             return 1
         fi
     else
+        rm -f "$resp" 2>/dev/null || true
         echo -e "  ${RED}✖ Could not reach donation endpoint.${NC}"
         return 1
     fi
@@ -715,8 +744,8 @@ start_background_tasks() {
     fi
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-        if bg_tasks_running "$p" || legacy_bg_tasks_running "$p"; then
-            if bg_tasks_running "$p" && background_supervisor_version_matches; then
+        if bg_tasks_running "$p" || legacy_bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
+            if ( bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" ) && background_supervisor_version_matches; then
                 release_bg_tasks_lock
                 return 0
             fi
@@ -726,8 +755,10 @@ start_background_tasks() {
     fi
     token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
     printf '%s\n' "$token" > "$BG_TASKS_TOKEN_FILE"
-    G2RAY_BG_TASK_TOKEN="$token" _background_tasks </dev/null >/dev/null 2>&1 &
+    export G2RAY_BG_TASK_TOKEN="$token"
+    _background_tasks </dev/null >/dev/null 2>&1 &
     bg_pid=$!
+    unset G2RAY_BG_TASK_TOKEN
     printf '%s\n' "$bg_pid" > "$BG_TASKS_PID"
     background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
     log_event INFO "background supervisor_started pid=${bg_pid}"
@@ -755,10 +786,10 @@ background_supervisor_version_matches() {
 stop_background_tasks() {
     local p
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-    if bg_tasks_running "$p" || legacy_bg_tasks_running "$p"; then
+    if bg_tasks_running "$p" || legacy_bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
         kill "$p" >/dev/null 2>&1 || true
         sleep 1
-        (bg_tasks_running "$p" || legacy_bg_tasks_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
+        (bg_tasks_running "$p" || legacy_bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
     fi
     rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true
 }
@@ -785,6 +816,21 @@ bg_tasks_running() {
     return 1
 }
 
+background_supervisor_recent_heartbeat() {
+    local hb now max_age="${1:-180}"
+    hb=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
+    [[ "$hb" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s)
+    (( now >= hb && now - hb <= max_age ))
+}
+
+background_supervisor_heartbeat_running() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    background_supervisor_recent_heartbeat
+}
+
 background_supervisor_status() {
     local p running="false" token_state="missing" version_state="missing" heartbeat_age="unknown" hb now expected current
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
@@ -792,6 +838,8 @@ background_supervisor_status() {
         running="true"
     elif legacy_bg_tasks_running "$p"; then
         running="legacy"
+    elif background_supervisor_heartbeat_running "$p"; then
+        running="heartbeat"
     fi
     [[ -s "$BG_TASKS_TOKEN_FILE" ]] && token_state="present"
     expected=$(cat "$BG_TASKS_VERSION_FILE" 2>/dev/null || true)
@@ -931,6 +979,7 @@ generate_config() {
   }
 }
 JSONEOF
+    chmod 600 "$UUID_FILE" "$CONFIG_FILE" 2>/dev/null || true
     if start_xray && wait_for_port >/dev/null 2>&1; then
         log_event INFO "generate_config engine_started port=${XRAY_PORT}"
         echo -e "  ${GREEN}✔ Engine started on port ${XRAY_PORT}.${NC}"
@@ -951,7 +1000,7 @@ generate_link_for_address() {
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=1&allowInsecure=1&type=xhttp&host=%s&path=%%2F&mode=packet-up#G2rayXCodeLeafy|%s' \
-        "$uuid" "$address" "$XRAY_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}${label_suffix}"
+        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "${GITHUB_USER:-User}${label_suffix}"
 }
 
 generate_domain_link() {
@@ -1249,8 +1298,15 @@ ensure_runtime_ready() {
             repair_codespace_port_route >/dev/null 2>&1 || true
             read -r xcode xms < <(xhttp_probe_metrics external)
         fi
-        log_event INFO "runtime_ready reason=${reason} engine=started xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
-        return 0
+        if xhttp_status_usable "$xcode"; then
+            reset_route_bad_count
+            reset_edge_bad_count
+            log_event INFO "runtime_ready reason=${reason} started_route_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+            log_event INFO "runtime_ready reason=${reason} engine=started xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+            return 0
+        fi
+        log_event WARN "runtime_ready reason=${reason} started_route_still_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=observe"
+        return 1
     fi
 
     log_event ERROR "runtime_ready reason=${reason} start_failed port=${XRAY_PORT}"
@@ -1334,8 +1390,8 @@ while true; do
     echo -e "   ${RED}0)${NC} Exit Panel"
     echo -e "  ${DIM}───────────────────────────────────────────────────────────${NC}"
 
-    if [[ -s "/tmp/g2ray_message.txt" ]]; then
-        local_msg=$(sed 's/\r//g' /tmp/g2ray_message.txt 2>/dev/null)
+    if [[ -s "$REMOTE_MESSAGE_FILE" ]]; then
+        local_msg=$(sed 's/\r//g' "$REMOTE_MESSAGE_FILE" 2>/dev/null)
         if [[ "$local_msg" != *"404"* && -n "$(printf '%s' "$local_msg" | tr -d ' \n\t')" ]]; then
             echo -e "  ${YELLOW}📢 Dev Note: ${WHITE}${local_msg}${NC}"
             echo -e "  ${DIM}───────────────────────────────────────────────────────────${NC}"
