@@ -33,6 +33,7 @@ TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
 SESSION_START_FILE="$DATA_DIR/session_start.txt"
 LOG_DIR="$BASE_DIR/logs"
 LOG_FILE="$LOG_DIR/g2ray.log"
+QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 XRAY_BIN="/usr/local/bin/xray"
@@ -46,8 +47,8 @@ LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 
 umask 077
-mkdir -p "$DATA_DIR" "$LOG_DIR"
-chmod 700 "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
+mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
+chmod 700 "$DATA_DIR" "$LOG_DIR" "$QR_DIR" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
 [[ -f "$SAVED_BYTES_FILE"   ]] || printf '{"down":0,"up":0}\n' > "$SAVED_BYTES_FILE"
 [[ -f "$SESSION_BYTES_FILE" ]] || printf '{"down":0,"up":0}\n' > "$SESSION_BYTES_FILE"
@@ -604,10 +605,26 @@ maybe_prompt_waker_setup() {
     [[ "$answer" =~ ^[Yy]$ ]] && setup_cloudflare_waker
 }
 
+write_config_qr_png() {
+    local index="$1" link="$2"
+    local png_file="$QR_DIR/config-${index}.png"
+    command -v qrencode >/dev/null 2>&1 || return 1
+    mkdir -p "$QR_DIR" 2>/dev/null || return 1
+    qrencode -m 4 -s 8 -t PNG -o "$png_file" "$link" 2>/dev/null || return 1
+    chmod 600 "$png_file" 2>/dev/null || true
+    printf '%s' "$png_file"
+}
+
 render_config_qr() {
-    local link="$1"
+    local index="$1" link="$2"
+    local png_file=""
     if command -v qrencode >/dev/null 2>&1; then
-        qrencode -m 1 -t UTF8 "$link" | while IFS= read -r line; do
+        if png_file=$(write_config_qr_png "$index" "$link"); then
+            echo -e "  ${DIM}High-res QR PNG:${NC} ${WHITE}${png_file}${NC}"
+            echo -e "  ${DIM}Open this PNG if your phone cannot scan the terminal preview.${NC}"
+        fi
+        echo -e "  ${DIM}Terminal QR preview:${NC}"
+        qrencode -m 2 -t UTF8 "$link" | while IFS= read -r line; do
             printf '  %s\n' "$line"
         done
     else
@@ -621,7 +638,7 @@ render_config_entry() {
     echo -e "  ${RED}[${index}]${NC} ${WHITE}${B}${label}${NC}"
     if [[ "$show_qr" == true ]]; then
         echo -e "  ${DIM}QR:${NC}"
-        render_config_qr "$link"
+        render_config_qr "$index" "$link"
     else
         echo -e "  ${DIM}QR hidden in default view. Set G2RAY_QR_MODE=all to show every QR.${NC}"
     fi
@@ -1958,7 +1975,7 @@ while true; do
                 fi
             fi
             refresh_screen
-            echo -e "  ${RED}● Configs & Compact QR Codes${NC}"
+            echo -e "  ${RED}● Configs & QR Codes${NC}"
             echo -e "  ${DIM}Raw links are printed without color codes and saved to:${NC}"
             echo -e "  ${DIM}Base64 subscription export:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
@@ -1971,7 +1988,8 @@ while true; do
                 _INDEX=$((_INDEX + 1))
             done
             echo -e "  ${DIM}IP links keep ${PORT_DOMAIN} as SNI/Host for Codespaces routing.${NC}\n"
-            echo -e "  ${DIM}If phone QR scanning fails, import the copy-ready link or${NC}"
+            echo -e "  ${DIM}QR PNG files are saved under ${QR_DIR}.${NC}"
+            echo -e "  ${DIM}If phone QR scanning fails, open the PNG, import the copy-ready link, or${NC}"
             echo -e "  ${DIM}${MOBILE_CONFIG_FILE} instead. Terminal zoom/theme can make QR scanning unreliable.${NC}\n"
             _COUNTRY=$(curl -s --max-time 3 https://ipinfo.io/country </dev/null 2>/dev/null || echo "Unknown")
             if [[ "$_COUNTRY" != "DE" && "$_COUNTRY" != "NL" && "$_COUNTRY" != "Unknown" ]]; then

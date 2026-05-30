@@ -256,8 +256,18 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'config display does not default to recommended-only QR mode'
     grep_fixed '[[ "$_QR_MODE" == "all" || ( "$_QR_MODE" != "none" && $_INDEX -eq 1 ) ]]' "$SCRIPT" \
         || fail 'config display does not limit default QR rendering to the first recommended config'
-    grep_fixed 'qrencode -m 1 -t UTF8 "$link"' "$SCRIPT" \
-        || fail 'QR renderer does not include a compact quiet-zone margin for phone scanners'
+    grep_fixed 'QR_DIR="$DATA_DIR/qr"' "$SCRIPT" \
+        || fail 'script does not define a private QR export directory'
+    grep_fixed 'write_config_qr_png()' "$SCRIPT" \
+        || fail 'script does not export high-resolution QR PNG files'
+    grep_fixed 'qrencode -m 4 -s 8 -t PNG -o "$png_file" "$link"' "$SCRIPT" \
+        || fail 'QR PNG export does not use a scan-friendly quiet zone and scale'
+    grep_fixed 'qrencode -m 2 -t UTF8 "$link"' "$SCRIPT" \
+        || fail 'terminal QR renderer does not use a less cramped quiet-zone margin'
+    grep_fixed 'High-res QR PNG' "$SCRIPT" \
+        || fail 'config view does not show where the scan-friendly QR PNG was saved'
+    grep_fixed 'QR PNG files are saved under' "$SCRIPT" \
+        || fail 'config view does not summarize the QR PNG export location'
     grep_fixed 'Terminal zoom/theme can make QR scanning unreliable' "$SCRIPT" \
         || fail 'config view does not explain the copy-link fallback when QR scanning fails'
     grep_fixed 'printf '\''%s\n'\'' "$link"' "$SCRIPT" \
@@ -930,6 +940,8 @@ test_docs_and_public_configs_are_consistent() {
     fi
     grep_fixed 'G2RAY_QR_MODE' "$README" \
         || fail 'README does not document G2RAY_QR_MODE'
+    grep_fixed 'high-resolution QR PNG files under `data/qr/`' "$README" \
+        || fail 'README does not document the scan-friendly QR PNG export'
     grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
         || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
     grep_fixed 'configs-to-copy-for-mobile.txt' "$README" \
