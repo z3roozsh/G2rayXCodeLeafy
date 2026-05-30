@@ -660,7 +660,7 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker status timeout/network errors are not returned as structured JSON'
     grep_fixed 'routeSettlingFailureText(data, route, routeReady)' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard can still report no failure while the route is settling'
-    grep_fixed 'if (data.ok && data.route_ready === false) return 202;' "$WORKER_SCRIPT" \
+    grep_fixed 'data.start_accepted && data.route_ready === false && isRouteSettlingStatus(data.route_probe)' "$WORKER_SCRIPT" \
         || fail 'Worker HTTP status does not distinguish accepted-but-route-settling responses'
     grep_fixed 'WAKER_KV' "$WORKER_README" \
         || fail 'Worker README does not document optional KV history'
@@ -671,6 +671,34 @@ test_worker_dashboard_and_history_features() {
     grep_fixed 'Health dashboard' "$README" \
         || fail 'root README does not mention the private Worker health dashboard'
     pass 'Worker dashboard, history, and alert features are documented'
+}
+
+test_worker_wake_edge_cases_are_hardened() {
+    grep_fixed 'isTransientGithubStatusFailure(last)' "$WORKER_SCRIPT" \
+        || fail 'Worker wake flow does not retry transient GitHub status failures'
+    grep_fixed 'if (!last.ok && isTransientGithubStatusFailure(last)) {' "$WORKER_SCRIPT" \
+        || fail 'Worker status wait does not continue after transient status failures'
+    grep_fixed 'function isRouteSettlingStatus(routeProbe)' "$WORKER_SCRIPT" \
+        || fail 'Worker has no narrow route-settling classifier for 202 responses'
+    grep_fixed 'id="stop"' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard has no stop-polling control'
+    grep_fixed 'function stopPolling()' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard cannot stop background health polling'
+    grep_fixed 'document.getElementById("stop").addEventListener("click", stopPolling)' "$WORKER_SCRIPT" \
+        || fail 'Worker stop-polling button is not wired to stopPolling'
+    grep_fixed 'function scheduleHealthPoll()' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not centralize health polling through a managed timer'
+    grep_fixed 'pollTimer = setTimeout(checkHealth, 5000)' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard polling is not tracked through pollTimer'
+    grep_fixed 'clearTimeout(pollTimer)' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not clear pending poll timers'
+    grep_fixed 'historyKey(codespace)' "$WORKER_SCRIPT" \
+        || fail 'Worker KV history is not namespaced by Codespace'
+    grep_fixed 'readHistory(env, context.codespaceName)' "$WORKER_SCRIPT" \
+        || fail 'Worker history API does not read the current Codespace namespace'
+    grep_fixed '`401`: Wrong wake secret, or GitHub rejected the stored token' "$WORKER_README" \
+        || fail 'Worker README does not distinguish wake-secret 401 from GitHub-token 401'
+    pass 'Worker wake edge cases are hardened'
 }
 
 test_route_candidate_monitor_is_bounded() {
@@ -692,6 +720,36 @@ test_route_candidate_monitor_is_bounded() {
         fail 'route candidate monitor appears to scan broad address ranges'
     fi
     pass 'route candidate monitor is bounded and diagnostics-visible'
+}
+
+test_route_export_and_reconnect_edges_are_hardened() {
+    if grep_fixed 'fallback_route_filter no-usable-probes action=export-candidates' "$SCRIPT"; then
+        fail 'fallback exports still emit candidates after all route probes failed'
+    fi
+    grep_fixed 'fallback_route_filter no-usable-probes action=domain-only' "$SCRIPT" \
+        || fail 'fallback exports do not fall back to the domain link only when IP probes fail'
+    awk '
+        /generate_config\(\)/ { in_fn=1 }
+        in_fn && index($0, "refresh_config_exports >/dev/null 2>&1 || true") { saw=1 }
+        in_fn && /^generate_link_for_address\(\)/ { exit }
+        END { exit saw ? 0 : 1 }
+    ' "$SCRIPT" \
+        || fail 'new config generation does not refresh exported config files'
+    grep_fixed 'FORCE_RECONNECT_ROUTE_WAIT_SEC' "$SCRIPT" \
+        || fail 'force reconnect has no dedicated route-settling wait budget'
+    grep_fixed 'wait_for_xhttp_route_ready "force_reconnect" "$FORCE_RECONNECT_ROUTE_WAIT_SEC"' "$SCRIPT" \
+        || fail 'force reconnect does not reuse the route-settling wait loop'
+    grep_fixed 'local no_prompt="${1:-}" failed=0 expose_failed=false hard_failed=false' "$SCRIPT" \
+        || fail 'force reconnect does not track expose-tunnel failure separately'
+    grep_fixed '[[ "$expose_failed" == true && "$hard_failed" != true ]] && failed=0' "$SCRIPT" \
+        || fail 'force reconnect does not treat a usable route as success after a flaky port visibility command'
+    grep_fixed 'DIAGNOSTIC_MAX_FALLBACK_PROBES' "$SCRIPT" \
+        || fail 'diagnostics fallback probes are not capped'
+    grep_fixed 'if (( probed >= max_probe )); then' "$SCRIPT" \
+        || fail 'diagnostics fallback probes do not enforce the configured cap'
+    grep_fixed 'additional candidates skipped' "$SCRIPT" \
+        || fail 'diagnostics does not disclose when fallback probes are capped'
+    pass 'route export and reconnect edges are hardened'
 }
 
 test_panel_guides_cloudflare_waker_setup() {
@@ -1111,7 +1169,9 @@ test_diagnostics_show_resume_gap_state
 test_local_reopen_helper_is_documented
 test_cloudflare_worker_waker_is_safe_to_publish
 test_worker_dashboard_and_history_features
+test_worker_wake_edge_cases_are_hardened
 test_route_candidate_monitor_is_bounded
+test_route_export_and_reconnect_edges_are_hardened
 test_panel_guides_cloudflare_waker_setup
 test_diagnostics_show_external_waker_state
 test_docs_cover_panel_waker_setup

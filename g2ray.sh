@@ -43,9 +43,11 @@ CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
 ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-8}"
+DIAGNOSTIC_MAX_FALLBACK_PROBES="${G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES:-12}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
+FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 
@@ -1520,6 +1522,7 @@ JSONEOF
         log_event WARN "generate_config port_public_failed port=${XRAY_PORT}"
         echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public. Check the PORTS tab.${NC}"
     fi
+    refresh_config_exports >/dev/null 2>&1 || true
 }
 
 generate_link_for_address() {
@@ -1605,8 +1608,7 @@ usable_fallback_ips() {
         (( count >= max_links )) && return 0
     done <<< "$candidates"
     if [[ "${usable:-false}" != true ]]; then
-        log_event WARN "fallback_route_filter no-usable-probes action=export-candidates"
-        printf '%s\n' "$candidates" | awk 'NF' | head -n "$max_links"
+        log_event WARN "fallback_route_filter no-usable-probes action=domain-only"
     fi
 }
 
@@ -1767,13 +1769,19 @@ show_diagnostics() {
 
     echo -e "\n  ${WHITE}${B}Fallback Route Probes${NC}"
     if [[ -n "$ips" ]]; then
-        local ip ip_probe ip_ms ip_usable
+        local ip ip_probe ip_ms ip_usable probed=0 max_probe="$DIAGNOSTIC_MAX_FALLBACK_PROBES"
+        [[ "$max_probe" =~ ^[0-9]+$ && "$max_probe" -gt 0 ]] || max_probe=12
         while IFS= read -r ip; do
             [[ -n "$ip" ]] || continue
+            if (( probed >= max_probe )); then
+                echo -e "  ${DIM}...additional candidates skipped; set G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES to raise this cap.${NC}"
+                break
+            fi
             read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
             ip_usable=false
             xhttp_status_usable "$ip_probe" && ip_usable=true
             printf '  %-15s HTTP %-3s %4sms usable=%s\n' "$ip" "${ip_probe:-0}" "${ip_ms:-0}" "$ip_usable"
+            probed=$((probed + 1))
         done <<< "$ips"
     else
         echo -e "  ${DIM}No fallback IPs to probe.${NC}"
@@ -1799,7 +1807,7 @@ show_diagnostics() {
 }
 
 force_reconnect() {
-    local no_prompt="${1:-}" failed=0
+    local no_prompt="${1:-}" failed=0 expose_failed=false hard_failed=false
     log_event INFO "force_reconnect begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}⠋${NC} ${WHITE}Running Clean Hard Restart & Reconnect Sequence...${NC}\n"
 
@@ -1817,6 +1825,7 @@ force_reconnect() {
         echo -e "${GREEN}Done${NC}"
     else
         failed=1
+        hard_failed=true
         log_event ERROR "force_reconnect stop_engine failed"
         echo -e "${RED}Failed${NC}"
     fi
@@ -1827,6 +1836,7 @@ force_reconnect() {
         echo -e "${GREEN}OK${NC}"
     else
         failed=1
+        hard_failed=true
         log_event ERROR "force_reconnect start_engine failed port=${XRAY_PORT}"
         echo -e "${RED}Failed${NC}"
     fi
@@ -1836,6 +1846,7 @@ force_reconnect() {
         log_event INFO "force_reconnect expose_tunnel ok port=${XRAY_PORT}"
         echo -e "${GREEN}Done${NC}"
     else
+        expose_failed=true
         failed=1
         log_event WARN "force_reconnect expose_tunnel failed port=${XRAY_PORT}"
         echo -e "${YELLOW}Needs PORTS tab${NC}"
@@ -1856,12 +1867,18 @@ force_reconnect() {
     if [[ "$edge_reachable" == true && "$xhttp_route_usable" != true ]]; then
         repair_codespace_port_route >/dev/null 2>&1 || true
         sleep 3
-        read -r xcode xms < <(xhttp_probe_metrics external)
-        xhttp_status_usable "$xcode" && xhttp_route_usable=true
+        if wait_for_xhttp_route_ready "force_reconnect" "$FORCE_RECONNECT_ROUTE_WAIT_SEC" >/dev/null 2>&1; then
+            read -r xcode xms < <(xhttp_probe_metrics external)
+            xhttp_route_usable=true
+        else
+            read -r xcode xms < <(xhttp_probe_metrics external)
+            xhttp_status_usable "$xcode" && xhttp_route_usable=true
+        fi
     fi
     log_event INFO "force_reconnect verify_external edge_reachable=${edge_reachable} code=${code:-none} xhttp_probe=${xcode:-none} xhttp_probe_ms=${xms:-0} xhttp_route_usable=${xhttp_route_usable} domain=${PORT_DOMAIN}"
     [[ "$edge_reachable" == true && "$xhttp_route_usable" == true ]] || failed=1
     if [[ "$xhttp_route_usable" == true ]]; then
+        [[ "$expose_failed" == true && "$hard_failed" != true ]] && failed=0
         reset_route_bad_count
         echo -e "${GREEN}XHTTP route usable (HTTP ${xcode})${NC}\n"
     elif [[ "$edge_reachable" == true ]]; then

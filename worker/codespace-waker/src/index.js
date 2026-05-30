@@ -6,7 +6,7 @@ const ROUTE_WAIT_MS = 35000;
 const ROUTE_POLL_INTERVAL_MS = 3000;
 const FETCH_TIMEOUT_MS = 10000;
 const ROUTE_FETCH_TIMEOUT_MS = 7000;
-const HISTORY_KEY = "history";
+const HISTORY_KEY_PREFIX = "history:";
 const HISTORY_LIMIT = 50;
 
 export default {
@@ -94,7 +94,7 @@ async function handleHistory(request, env) {
   const context = await requireAuthorizedContext(request, env);
   if (!context.ok) return json(context.body, context.status);
 
-  const history = await readHistory(env);
+  const history = await readHistory(env, context.codespaceName);
   return json({
     ok: true,
     codespace: context.codespaceName,
@@ -240,6 +240,11 @@ async function waitForCodespaceAvailable(name, token) {
     last = await getCodespaceStatus(name, token);
     last.attempts = attempts;
     last.waited_ms = Date.now() - startedAt;
+    if (!last.ok && isTransientGithubStatusFailure(last)) {
+      if (Date.now() + GITHUB_STATE_POLL_INTERVAL_MS > deadline) break;
+      await sleep(GITHUB_STATE_POLL_INTERVAL_MS);
+      continue;
+    }
     if (!last.ok) return last;
     if (isCodespaceAvailable(last)) return last;
     if (Date.now() + GITHUB_STATE_POLL_INTERVAL_MS > deadline) break;
@@ -323,10 +328,20 @@ function githubHeaders(token) {
 }
 
 function responseStatusFor(data) {
-  if (data.ok && data.route_ready === false) return 202;
+  if (data.ok && data.start_accepted && data.route_ready === false && isRouteSettlingStatus(data.route_probe)) return 202;
   if (data.ok) return 200;
   if ([401, 402, 403, 404].includes(data.status)) return data.status;
   return 502;
+}
+
+function isTransientGithubStatusFailure(last) {
+  const status = Number(last && last.status || 0);
+  return status === 0 || status >= 500;
+}
+
+function isRouteSettlingStatus(routeProbe) {
+  const status = Number(routeProbe && routeProbe.http_status || 0);
+  return status === 0 || status === 404;
 }
 
 function isCodespaceAvailable(status) {
@@ -377,25 +392,30 @@ async function recordHistory(env, event) {
   if (!env.WAKER_KV) return false;
 
   try {
-    const existing = await readHistory(env);
+    const existing = await readHistory(env, event.codespace);
     const next = [event, ...existing].slice(0, HISTORY_LIMIT);
-    await env.WAKER_KV.put(HISTORY_KEY, JSON.stringify(next));
+    await env.WAKER_KV.put(historyKey(event.codespace), JSON.stringify(next));
     return true;
   } catch {
     return false;
   }
 }
 
-async function readHistory(env) {
+async function readHistory(env, codespace) {
   if (!env.WAKER_KV) return [];
 
   try {
-    const text = await env.WAKER_KV.get(HISTORY_KEY);
+    const text = await env.WAKER_KV.get(historyKey(codespace));
     const parsed = text ? JSON.parse(text) : [];
     return Array.isArray(parsed) ? parsed.slice(0, HISTORY_LIMIT) : [];
   } catch {
     return [];
   }
+}
+
+function historyKey(codespace) {
+  const suffix = String(codespace || "unknown").trim() || "unknown";
+  return HISTORY_KEY_PREFIX + encodeURIComponent(suffix);
 }
 
 async function sendNotifications(env, event) {
@@ -736,7 +756,7 @@ function renderDashboard() {
 <body>
 <main>
   <h1>G2ray Codespace Waker</h1>
-  <p>Private mobile wake UI for one GitHub Codespace. It starts the Codespace, checks the app.github.dev XHTTP route, and shows whether configs should be usable.</p>
+  <p>Mobile wake UI for one GitHub Codespace. Actions require your wake secret; the page starts the Codespace, checks the app.github.dev XHTTP route, and shows whether configs should be usable.</p>
 
   <section class="card">
     <h2>Start</h2>
@@ -747,6 +767,7 @@ function renderDashboard() {
       <button id="health" type="button">Check Health</button>
       <button id="history" type="button">Load History</button>
       <button id="copy" type="button">Copy Status</button>
+      <button id="stop" type="button">Stop Polling</button>
     </div>
   </section>
 
@@ -790,11 +811,13 @@ const historyList = document.getElementById("historyList");
 const historyNote = document.getElementById("historyNote");
 let lastStatusText = "";
 let polling = false;
+let pollTimer = null;
 
 document.getElementById("start").addEventListener("click", startWake);
 document.getElementById("health").addEventListener("click", checkHealth);
 document.getElementById("history").addEventListener("click", loadHistory);
 document.getElementById("copy").addEventListener("click", copyStatus);
+document.getElementById("stop").addEventListener("click", stopPolling);
 
 function wakeSecret() {
   return secretInput.value.trim();
@@ -843,7 +866,7 @@ async function startWake() {
     setProgress(steps, data.ok ? 4 : 1);
     renderResult(data);
     if (shouldPollRoute(data)) {
-      setTimeout(checkHealth, 5000);
+      scheduleHealthPoll();
     }
   } catch (error) {
     renderError(error);
@@ -860,7 +883,7 @@ async function checkHealth() {
     setProgress(["Authenticating wake secret", "Checking GitHub state", "Probing XHTTP route", "Showing result"], 3);
     renderResult(data);
     if (polling && shouldPollRoute(data)) {
-      setTimeout(checkHealth, 5000);
+      scheduleHealthPoll();
     }
   } catch (error) {
     renderError(error);
@@ -894,6 +917,19 @@ function shouldPollRoute(data) {
   return Boolean(data && data.ok && data.route_ready !== true && data.route_probe);
 }
 
+function scheduleHealthPoll() {
+  if (!polling) return;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(checkHealth, 5000);
+}
+
+function stopPolling() {
+  polling = false;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  setProgress(["Polling stopped manually"], 0);
+}
+
 function renderResult(data) {
   const route = data.route_probe || {};
   const routeReady = data.route_ready === true;
@@ -917,7 +953,11 @@ function renderResult(data) {
     "next_action=" + (data.next_action || ""),
     "message=" + (data.message || data.error || "")
   ].join("\\n");
-  if (routeReady) polling = false;
+  if (routeReady) {
+    polling = false;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+  }
 }
 
 function routeSettlingFailureText(data, route, routeReady) {

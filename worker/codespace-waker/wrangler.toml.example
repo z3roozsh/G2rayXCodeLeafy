@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2026-05-29"
 
 [vars]
-# Example: animated-spork-wvr97qjxqjqwcg6xq
+# Example: your-codespace-slug
 CODESPACE_NAME = "YOUR_CODESPACE_NAME"
 
 # Optional when the panel uses a non-default XRAY_PORT.

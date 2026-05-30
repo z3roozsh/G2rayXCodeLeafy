@@ -6,7 +6,7 @@ This Cloudflare Worker gives you a private manual `/wake` endpoint that starts o
 
 It does not keep the Codespace alive forever and it cannot bypass quota, billing, deletion, or account restrictions.
 
-The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, and auto-refresh while the route is still settling.
+The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, a stop-polling button, and auto-refresh while the route is still settling.
 
 After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
@@ -55,10 +55,10 @@ Edit `wrangler.toml` and set:
 CODESPACE_NAME = "your-codespace-name"
 ```
 
-Example:
+Example placeholder:
 
 ```toml
-CODESPACE_NAME = "animated-spork-wvr97qjxqjqwcg6xq"
+CODESPACE_NAME = "your-codespace-slug"
 ```
 
 If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as a **Plaintext** variable.
@@ -135,7 +135,7 @@ Opening the Worker URL in a browser and entering the wake secret in the form is 
 - `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
 - `route_ready: false` with HTTP `0`: DNS, TLS, or the app route did not answer before the Worker timeout.
 - `next_action`: the fastest manual recovery step to try next.
-- `401`: Wrong wake secret.
+- `401`: Wrong wake secret, or GitHub rejected the stored token. Check the JSON `error`, `reason`, or `token_warning` field to tell which side rejected the request.
 - `402`: GitHub quota or billing blocked the start. Wait for quota reset or adjust GitHub billing settings.
 - `403`: GitHub token is rejected, expired, or missing the right scope.
 - `404`: Codespace name is wrong or the token cannot access it.
