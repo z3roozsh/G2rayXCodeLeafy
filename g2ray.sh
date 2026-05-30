@@ -25,6 +25,7 @@ REMOTE_MESSAGE_FILE="$DATA_DIR/message.txt"
 ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
 EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
+ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
 QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
 XRAY_PID_FILE="$DATA_DIR/xray.pid"
 SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
@@ -41,6 +42,7 @@ XRAY_PORT="${XRAY_PORT:-443}"
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
+ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-8}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
@@ -1110,11 +1112,12 @@ self_heal_once() {
 
 _background_tasks() {
     set +e
-    local tick=0 health_tick=0 export_tick=0
+    local tick=0 health_tick=0 export_tick=0 route_tick=0
     write_background_supervisor_heartbeat
     if [[ -f "$CONFIG_FILE" ]]; then
         self_heal_once >/dev/null 2>&1 || true
         refresh_config_exports >/dev/null 2>&1 || true
+        refresh_route_candidate_health >/dev/null 2>&1 || true
         health_probe >/dev/null 2>&1 || true
     fi
     while true; do
@@ -1139,6 +1142,7 @@ _background_tasks() {
         save_session_uptime >/dev/null 2>&1 || true
         (( ++health_tick >= 5 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
         (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+        (( ++route_tick >= 5 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
         (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
     done
 }
@@ -1530,6 +1534,60 @@ generate_domain_link() {
     generate_link_for_address "$PORT_DOMAIN"
 }
 
+route_monitor_max_candidates() {
+    local max="$ROUTE_MONITOR_MAX_CANDIDATES"
+    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=8
+    (( max > 12 )) && max=12
+    printf '%s' "$max"
+}
+
+record_route_candidate_health() {
+    local ip="$1" code="$2" ms="$3" usable=false checked
+    checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+    xhttp_status_usable "$code" && usable=true
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$checked" "$ip" "${code:-0}" "${ms:-0}" "$usable" >> "${route_health_tmp:-$ROUTE_HEALTH_FILE}"
+}
+
+refresh_route_candidate_health() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local candidates ip ip_probe ip_ms count=0 max route_health_tmp
+    max=$(route_monitor_max_candidates)
+    candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
+    [[ -n "$candidates" ]] || return 0
+    route_health_tmp=$(mktemp "$DATA_DIR/route_health.XXXXXX") || return 1
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
+        record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"
+        count=$((count + 1))
+        (( count >= max )) && break
+    done <<< "$candidates"
+    mv "$route_health_tmp" "$ROUTE_HEALTH_FILE"
+    chmod 600 "$ROUTE_HEALTH_FILE" 2>/dev/null || true
+    log_event INFO "route_candidate_monitor refreshed count=${count} max=${max}"
+}
+
+route_candidate_health_summary() {
+    if [[ ! -s "$ROUTE_HEALTH_FILE" ]]; then
+        printf 'Last refresh : none recorded\n'
+        printf 'Candidates   : no cached candidate route probes yet\n'
+        return 0
+    fi
+
+    local last
+    last=$(awk -F '\t' 'END{print $1}' "$ROUTE_HEALTH_FILE" 2>/dev/null)
+    printf 'Last refresh : %s\n' "${last:-unknown}"
+    printf 'Candidates   : best usable routes first\n'
+    awk -F '\t' '
+        NF >= 5 {
+            rank = ($5 == "true") ? 0 : 1
+            latency = ($4 ~ /^[0-9]+$/) ? $4 : 99999999
+            printf "%d\t%08d\t%-15s HTTP %-3s %4sms usable=%s\n", rank, latency, $2, $3, $4, $5
+        }
+    ' "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n | cut -f3-
+}
+
 usable_fallback_ips() {
     local ip ip_probe ip_ms count=0 max_links="$MAX_FALLBACK_LINKS" candidates usable
     [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
@@ -1720,6 +1778,9 @@ show_diagnostics() {
     else
         echo -e "  ${DIM}No fallback IPs to probe.${NC}"
     fi
+
+    echo -e "\n  ${WHITE}${B}Best Route Candidates${NC}"
+    route_candidate_health_summary | sed 's/^/  /'
 
     echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
     if [[ -s "$LOG_FILE" ]]; then

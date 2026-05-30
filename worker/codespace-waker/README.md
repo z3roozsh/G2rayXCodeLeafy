@@ -10,6 +10,8 @@ The browser page is a small mobile-friendly health dashboard. It has a large **S
 
 After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
+When the start request is accepted but the route is still settling, the API returns HTTP `202` with `ok: true` and `route_ready: false`. The browser page keeps polling health until the route becomes ready or you stop checking.
+
 ## 1. Create a GitHub Token
 
 Recommended path:

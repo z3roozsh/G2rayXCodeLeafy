@@ -4,6 +4,8 @@ const GITHUB_STATE_WAIT_MS = 120000;
 const GITHUB_STATE_POLL_INTERVAL_MS = 5000;
 const ROUTE_WAIT_MS = 35000;
 const ROUTE_POLL_INTERVAL_MS = 3000;
+const FETCH_TIMEOUT_MS = 10000;
+const ROUTE_FETCH_TIMEOUT_MS = 7000;
 const HISTORY_KEY = "history";
 const HISTORY_LIMIT = 50;
 
@@ -126,10 +128,22 @@ async function requireAuthorizedContext(request, env) {
 
 async function startCodespaceData(name, token, env) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: githubHeaders(token)
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(endpoint, {
+      method: "POST",
+      headers: githubHeaders(token)
+    }, FETCH_TIMEOUT_MS);
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      codespace: name,
+      reason: "github_start_request_unreachable",
+      error: shortError(error),
+      message: "GitHub start API did not answer before the timeout."
+    };
+  }
 
   const text = await res.text();
   const body = parseBody(text);
@@ -242,10 +256,22 @@ async function waitForCodespaceAvailable(name, token) {
 
 async function getCodespaceStatus(codespaceName, token) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(codespaceName)}`;
-  const res = await fetch(endpoint, {
-    method: "GET",
-    headers: githubHeaders(token)
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(endpoint, {
+      method: "GET",
+      headers: githubHeaders(token)
+    }, FETCH_TIMEOUT_MS);
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      codespace: codespaceName,
+      reason: "github_status_request_unreachable",
+      error: shortError(error),
+      message: "GitHub status API did not answer before the timeout."
+    };
+  }
 
   const body = parseBody(await res.text());
 
@@ -297,6 +323,7 @@ function githubHeaders(token) {
 }
 
 function responseStatusFor(data) {
+  if (data.ok && data.route_ready === false) return 202;
   if (data.ok) return 200;
   if ([401, 402, 403, 404].includes(data.status)) return data.status;
   return 502;
@@ -379,11 +406,11 @@ async function sendNotifications(env, event) {
 
   if (env.DISCORD_WEBHOOK_URL) {
     tasks.push(
-      fetch(env.DISCORD_WEBHOOK_URL, {
+      fetchWithTimeout(env.DISCORD_WEBHOOK_URL, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ content: text })
-      }).then((res) => res.ok ? null : `discord_http_${res.status}`)
+      }, FETCH_TIMEOUT_MS).then((res) => res.ok ? null : `discord_http_${res.status}`)
         .catch((error) => `discord_${shortError(error)}`)
     );
   }
@@ -391,7 +418,7 @@ async function sendNotifications(env, event) {
   if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
     const endpoint = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
     tasks.push(
-      fetch(endpoint, {
+      fetchWithTimeout(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -399,7 +426,7 @@ async function sendNotifications(env, event) {
           text,
           disable_web_page_preview: true
         })
-      }).then((res) => res.ok ? null : `telegram_http_${res.status}`)
+      }, FETCH_TIMEOUT_MS).then((res) => res.ok ? null : `telegram_http_${res.status}`)
         .catch((error) => `telegram_${shortError(error)}`)
     );
   }
@@ -520,7 +547,7 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now())
   const url = routeUrl(name, port);
   const probeStartedAt = Date.now();
   try {
-    const res = await fetch(url, { method: "OPTIONS", redirect: "manual" });
+    const res = await fetchWithTimeout(url, { method: "OPTIONS", redirect: "manual" }, ROUTE_FETCH_TIMEOUT_MS);
     return {
       url,
       usable: isRouteStatusUsable(res.status),
@@ -540,6 +567,19 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now())
       waited_ms: Date.now() - startedAt,
       error: shortError(error)
     };
+  }
+}
+
+async function fetchWithTimeout(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -857,16 +897,13 @@ function shouldPollRoute(data) {
 function renderResult(data) {
   const route = data.route_probe || {};
   const routeReady = data.route_ready === true;
-  const tokenRejected = data.token_warning || data.reason === "github_token_rejected_or_missing_scope";
   document.getElementById("githubState").textContent = data.state || (data.ok ? "Available" : "Problem");
   document.getElementById("routeState").textContent = routeReady ? "Route ready" : route.http_status ? "HTTP " + route.http_status : "Not reachable";
   document.getElementById("routeState").className = routeReady ? "good" : route.http_status === 404 ? "warn" : "bad";
   document.getElementById("latency").textContent = route.latency_ms == null ? "Unknown" : route.latency_ms + "ms";
   document.getElementById("idleTimeout").textContent = data.idle_timeout_minutes ? data.idle_timeout_minutes + " minutes" : "Unknown";
   document.getElementById("lastUsed").textContent = data.last_used_at || "Unknown";
-  document.getElementById("lastFailure").textContent = tokenRejected
-    ? "GitHub token rejected or expired"
-    : data.ok ? "None seen" : (data.reason || data.error || "Unknown failure");
+  document.getElementById("lastFailure").textContent = routeSettlingFailureText(data, route, routeReady);
   document.getElementById("nextAction").textContent = data.next_action || "No action suggested";
   resultEl.textContent = JSON.stringify(data, null, 2);
   lastStatusText = [
@@ -881,6 +918,17 @@ function renderResult(data) {
     "message=" + (data.message || data.error || "")
   ].join("\\n");
   if (routeReady) polling = false;
+}
+
+function routeSettlingFailureText(data, route, routeReady) {
+  const tokenRejected = data.token_warning || data.reason === "github_token_rejected_or_missing_scope";
+  if (tokenRejected) return "GitHub token rejected or expired";
+  if (data.ok && !routeReady && data.route_probe) {
+    return route.http_status
+      ? "Route not ready (HTTP " + route.http_status + ")"
+      : "Route not reachable yet";
+  }
+  return data.ok ? "None seen" : (data.reason || data.error || "Unknown failure");
 }
 
 function renderHistory(data) {

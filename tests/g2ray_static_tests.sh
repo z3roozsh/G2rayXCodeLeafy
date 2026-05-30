@@ -652,6 +652,16 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker dashboard does not provide a copy-status action'
     grep_fixed 'setTimeout(checkHealth' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard does not auto-refresh while the route is settling'
+    grep_fixed 'fetchWithTimeout(' "$WORKER_SCRIPT" \
+        || fail 'Worker GitHub/route fetches are not individually time-bounded'
+    grep_fixed 'github_start_request_unreachable' "$WORKER_SCRIPT" \
+        || fail 'Worker start timeout/network errors are not returned as structured JSON'
+    grep_fixed 'github_status_request_unreachable' "$WORKER_SCRIPT" \
+        || fail 'Worker status timeout/network errors are not returned as structured JSON'
+    grep_fixed 'routeSettlingFailureText(data, route, routeReady)' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard can still report no failure while the route is settling'
+    grep_fixed 'if (data.ok && data.route_ready === false) return 202;' "$WORKER_SCRIPT" \
+        || fail 'Worker HTTP status does not distinguish accepted-but-route-settling responses'
     grep_fixed 'WAKER_KV' "$WORKER_README" \
         || fail 'Worker README does not document optional KV history'
     grep_fixed 'DISCORD_WEBHOOK_URL' "$WORKER_README" \
@@ -661,6 +671,27 @@ test_worker_dashboard_and_history_features() {
     grep_fixed 'Health dashboard' "$README" \
         || fail 'root README does not mention the private Worker health dashboard'
     pass 'Worker dashboard, history, and alert features are documented'
+}
+
+test_route_candidate_monitor_is_bounded() {
+    grep_fixed 'ROUTE_HEALTH_FILE=' "$SCRIPT" \
+        || fail 'route candidate monitor has no bounded health cache file'
+    grep_fixed 'ROUTE_MONITOR_MAX_CANDIDATES=' "$SCRIPT" \
+        || fail 'route candidate monitor does not cap candidate probes'
+    grep_fixed 'refresh_route_candidate_health()' "$SCRIPT" \
+        || fail 'route candidate monitor cannot refresh candidate health'
+    grep_fixed 'route_candidate_health_summary()' "$SCRIPT" \
+        || fail 'diagnostics cannot summarize route candidate health'
+    grep_fixed 'record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"' "$SCRIPT" \
+        || fail 'route candidate monitor does not persist per-candidate probe results'
+    grep_fixed 'refresh_route_candidate_health >/dev/null 2>&1 || true' "$SCRIPT" \
+        || fail 'background supervisor does not refresh route candidate health'
+    grep_fixed 'route_candidate_health_summary | sed' "$SCRIPT" \
+        || fail 'diagnostics do not display route candidate health'
+    if grep_regex 'for[[:space:]]+.*in[[:space:]]+.*(/8|/16|/24|seq[[:space:]]+1[[:space:]]+254)' "$SCRIPT"; then
+        fail 'route candidate monitor appears to scan broad address ranges'
+    fi
+    pass 'route candidate monitor is bounded and diagnostics-visible'
 }
 
 test_panel_guides_cloudflare_waker_setup() {
@@ -1080,6 +1111,7 @@ test_diagnostics_show_resume_gap_state
 test_local_reopen_helper_is_documented
 test_cloudflare_worker_waker_is_safe_to_publish
 test_worker_dashboard_and_history_features
+test_route_candidate_monitor_is_bounded
 test_panel_guides_cloudflare_waker_setup
 test_diagnostics_show_external_waker_state
 test_docs_cover_panel_waker_setup
