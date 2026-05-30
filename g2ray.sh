@@ -43,6 +43,7 @@ DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
+ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 
@@ -781,9 +782,17 @@ xray_listener_ready() {
 }
 
 ensure_codespace_port_public() {
-    command -v gh >/dev/null 2>&1 || return 1
-    run_gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" \
-        </dev/null >/dev/null 2>&1
+    command -v gh >/dev/null 2>&1 || {
+        log_event WARN "port_public gh_missing port=${XRAY_PORT}"
+        return 1
+    }
+    local output
+    if output=$(run_gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" </dev/null 2>&1); then
+        return 0
+    fi
+    output=$(printf '%s' "$output" | tr '\r\n' '  ' | cut -c1-180)
+    log_event WARN "port_public failed port=${XRAY_PORT} detail=${output:-unknown}"
+    return 1
 }
 
 repair_codespace_port_route() {
@@ -797,6 +806,29 @@ repair_codespace_port_route() {
         return 0
     fi
     log_event ERROR "route_repair public_failed port=${XRAY_PORT}"
+    return 1
+}
+
+wait_for_xhttp_route_ready() {
+    local reason="${1:-startup}" max_wait="${2:-$ROUTE_WAIT_SEC}" start now elapsed xcode=0 xms=0 attempt=0
+    [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=120
+    start=$(date +%s 2>/dev/null || printf '0')
+    while true; do
+        read -r xcode xms < <(xhttp_probe_metrics external)
+        now=$(date +%s 2>/dev/null || printf '0')
+        elapsed=$(( now - start ))
+        if xhttp_status_usable "$xcode"; then
+            log_event INFO "runtime_ready reason=${reason} route_wait_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${elapsed}"
+            return 0
+        fi
+        (( elapsed >= max_wait )) && break
+        if (( attempt == 0 || attempt % 5 == 0 )); then
+            ensure_codespace_port_public >/dev/null 2>&1 || true
+        fi
+        attempt=$(( attempt + 1 ))
+        sleep 3
+    done
+    log_event WARN "runtime_ready reason=${reason} route_wait_timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} wait_sec=${max_wait}"
     return 1
 }
 
@@ -1080,6 +1112,11 @@ _background_tasks() {
     set +e
     local tick=0 health_tick=0 export_tick=0
     write_background_supervisor_heartbeat
+    if [[ -f "$CONFIG_FILE" ]]; then
+        self_heal_once >/dev/null 2>&1 || true
+        refresh_config_exports >/dev/null 2>&1 || true
+        health_probe >/dev/null 2>&1 || true
+    fi
     while true; do
         sleep 60
         if ! background_supervisor_token_current; then
@@ -1798,12 +1835,12 @@ ensure_runtime_ready() {
 
         log_event WARN "runtime_ready reason=${reason} route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
         repair_codespace_port_route >/dev/null 2>&1 || true
-        read -r xcode xms < <(xhttp_probe_metrics external)
-        if xhttp_status_usable "$xcode"; then
+        if wait_for_xhttp_route_ready "$reason"; then
             reset_route_bad_count
-            log_event INFO "runtime_ready reason=${reason} route_repaired xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+            log_event INFO "runtime_ready reason=${reason} route_repaired"
             return 0
         fi
+        read -r xcode xms < <(xhttp_probe_metrics external)
         log_event WARN "runtime_ready reason=${reason} route_still_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=observe"
         return 1
     fi
@@ -1816,6 +1853,7 @@ ensure_runtime_ready() {
         if ! xhttp_status_usable "$xcode"; then
             log_event WARN "runtime_ready reason=${reason} started_route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
             repair_codespace_port_route >/dev/null 2>&1 || true
+            wait_for_xhttp_route_ready "$reason" >/dev/null 2>&1 || true
             read -r xcode xms < <(xhttp_probe_metrics external)
         fi
         if xhttp_status_usable "$xcode"; then

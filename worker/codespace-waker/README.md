@@ -8,7 +8,7 @@ It does not keep the Codespace alive forever and it cannot bypass quota, billing
 
 The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, and auto-refresh while the route is still settling.
 
-After GitHub accepts the start request, the Worker briefly probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the VLESS configs should be usable. If it says `route_ready: false` with HTTP `404`, the Codespace has started but GitHub's port route is still settling; wait and retry, or open the panel and use option `6) Force Reconnect`.
+After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
 ## 1. Create a GitHub Token
 
@@ -129,8 +129,10 @@ Opening the Worker URL in a browser and entering the wake secret in the form is 
 ## Expected Responses
 
 - `200` with `ok: true`: GitHub accepted or handled the start request.
-- `route_ready: true`: the XHTTP route was reachable during the Worker wait window.
+- `route_ready: true`: the XHTTP route returned HTTP `200` or `400` during the Worker wait window, matching the panel's route-readiness classifier.
 - `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
+- `route_ready: false` with HTTP `0`: DNS, TLS, or the app route did not answer before the Worker timeout.
+- `next_action`: the fastest manual recovery step to try next.
 - `401`: Wrong wake secret.
 - `402`: GitHub quota or billing blocked the start. Wait for quota reset or adjust GitHub billing settings.
 - `403`: GitHub token is rejected, expired, or missing the right scope.

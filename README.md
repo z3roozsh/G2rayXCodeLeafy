@@ -115,6 +115,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported IP fallback links. Default: `3`.
 - `G2RAY_EDGE_RECONNECT_THRESHOLD` **(Optional)** — Number of consecutive unreachable edge checks before self-heal may run a full reconnect. Default: `3`.
 - `G2RAY_RECONNECT_COOLDOWN_SEC` **(Optional)** — Minimum seconds between automatic full reconnects. Default: `300`.
+- `G2RAY_ROUTE_WAIT_SEC` **(Optional)** — Maximum seconds startup waits for the `app.github.dev` XHTTP route after a Codespace resume. Default: `120`.
 - `G2RAY_GH_TIMEOUT_SEC` **(Optional)** — Maximum seconds for GitHub CLI control-plane calls. Default: `10`.
 - `G2RAY_LOG_MAX_BYTES` **(Optional)** — Maximum bytes per runtime log before rotation. Default: `1048576`.
 - `G2RAY_LOG_ROTATE_KEEP` **(Optional)** — Number of rotated log files to keep. Default: `3`.
@@ -169,6 +170,22 @@ gh auth refresh -h github.com -s codespace
 ```
 
 The helper uses GitHub's Codespaces start API, waits until the Codespace is available, and opens it in VS Code. If GitHub returns `HTTP 402`, the Codespace is quota or billing blocked and must wait for quota reset or a billing setting change.
+
+Linux recovery after Worker wake:
+
+```bash
+CS="YOUR_CODESPACE_NAME"
+REPO="OWNER/REPO"
+APP="https://${CS}-443.app.github.dev/"
+
+gh auth refresh -h github.com -s codespace
+gh codespace view -c "$CS" --json name,state,lastUsedAt,idleTimeoutMinutes --jq '{name,state,lastUsedAt,idleTimeoutMinutes}'
+gh codespace ports -c "$CS"
+gh codespace ports visibility 443:public -c "$CS"
+curl -sS -o /dev/null -w "route=%{http_code} time=%{time_total}s\n" -X OPTIONS "$APP"
+```
+
+If the route prints `000` or DNS errors after GitHub says the Codespace is active, open the Codespace once and run panel option `14) Diagnostics`. If XHTTP is `404` or unusable, use option `6) Force Reconnect`.
 
 ### Cloudflare Worker Waker
 

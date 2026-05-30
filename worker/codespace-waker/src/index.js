@@ -1,5 +1,7 @@
 const GITHUB_API_VERSION = "2022-11-28";
 const DEFAULT_CODESPACE_PORT = 443;
+const GITHUB_STATE_WAIT_MS = 120000;
+const GITHUB_STATE_POLL_INTERVAL_MS = 5000;
 const ROUTE_WAIT_MS = 35000;
 const ROUTE_POLL_INTERVAL_MS = 3000;
 const HISTORY_KEY = "history";
@@ -68,6 +70,7 @@ async function handleHealth(request, env) {
     ...status,
     route_ready: routeProbe.usable,
     route_probe: routeProbe,
+    next_action: nextActionForWake(status, routeProbe),
     message: healthMessage(status, routeProbe)
   };
   const event = eventFromResult("health", codespaceName, data);
@@ -177,20 +180,63 @@ async function startCodespaceData(name, token, env) {
     };
   }
 
+  const readyState = await waitForCodespaceAvailable(name, token);
+  if (!readyState.ok) return readyState;
+
   const routeProbe = await waitForXhttpRoute(name, codespacePort(env));
 
   return {
     ok: true,
     status: res.status,
+    start_accepted: true,
     codespace: name,
-    state: body && typeof body === "object" ? body.state || null : null,
-    last_used_at: body && typeof body === "object" ? body.last_used_at || null : null,
-    idle_timeout_minutes: body && typeof body === "object" ? body.idle_timeout_minutes || null : null,
+    state: readyState.state || (body && typeof body === "object" ? body.state || null : null),
+    pending_operation: readyState.pending_operation,
+    last_used_at: readyState.last_used_at || (body && typeof body === "object" ? body.last_used_at || null : null),
+    idle_timeout_minutes: readyState.idle_timeout_minutes || (body && typeof body === "object" ? body.idle_timeout_minutes || null : null),
+    github_wait_ms: readyState.waited_ms,
+    github_wait_attempts: readyState.attempts,
     route_ready: routeProbe.usable,
     route_probe: routeProbe,
+    next_action: nextActionForWake(readyState, routeProbe),
     message: routeProbe.usable
       ? "Codespace start request accepted and the XHTTP route is usable."
       : "Codespace start request accepted, but the XHTTP route is still settling. Wait and try again; if it stays 404, open the panel and use option 6."
+  };
+}
+
+async function waitForCodespaceAvailable(name, token) {
+  const startedAt = Date.now();
+  const deadline = startedAt + GITHUB_STATE_WAIT_MS;
+  let attempts = 0;
+  let last = {
+    ok: false,
+    status: 0,
+    codespace: name,
+    state: null,
+    pending_operation: null,
+    attempts,
+    waited_ms: 0,
+    reason: "not_checked",
+    message: "Codespace state has not been checked yet."
+  };
+
+  while (Date.now() <= deadline) {
+    attempts += 1;
+    last = await getCodespaceStatus(name, token);
+    last.attempts = attempts;
+    last.waited_ms = Date.now() - startedAt;
+    if (!last.ok) return last;
+    if (isCodespaceAvailable(last)) return last;
+    if (Date.now() + GITHUB_STATE_POLL_INTERVAL_MS > deadline) break;
+    await sleep(GITHUB_STATE_POLL_INTERVAL_MS);
+  }
+
+  return {
+    ...last,
+    ok: false,
+    reason: "codespace_state_not_ready",
+    message: "GitHub accepted the start request, but the Codespace did not become Available before the wait timeout."
   };
 }
 
@@ -254,6 +300,20 @@ function responseStatusFor(data) {
   if (data.ok) return 200;
   if ([401, 402, 403, 404].includes(data.status)) return data.status;
   return 502;
+}
+
+function isCodespaceAvailable(status) {
+  const state = String(status && status.state || "").toLowerCase();
+  return Boolean(status && status.ok && (state === "available" || state === "running") && status.pending_operation !== true);
+}
+
+function nextActionForWake(status, routeProbe) {
+  if (!status.ok) return "Open GitHub Codespaces or rotate the GitHub token, then try the Worker again.";
+  if (!isCodespaceAvailable(status)) return "Wait for GitHub to finish starting the Codespace, then press Check Health.";
+  if (routeProbe.usable) return "Try the same VLESS config again.";
+  if (routeProbe.http_status === 404) return "Open the panel, check option 14 Diagnostics, then use option 6 Force Reconnect if the route stays 404.";
+  if (routeProbe.http_status === 0) return "The app.github.dev route did not resolve or answer. Open the Codespace once, then check port 443 visibility and panel diagnostics.";
+  return "Check panel option 14 Diagnostics; if XHTTP is not usable, use option 6 Force Reconnect.";
 }
 
 function healthMessage(status, routeProbe) {
@@ -463,7 +523,7 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now())
     const res = await fetch(url, { method: "OPTIONS", redirect: "manual" });
     return {
       url,
-      usable: res.status === 200,
+      usable: isRouteStatusUsable(res.status),
       http_status: res.status,
       latency_ms: Date.now() - probeStartedAt,
       attempts,
@@ -485,6 +545,10 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now())
 
 function routeUrl(name, port) {
   return `https://${name}-${port}.app.github.dev/`;
+}
+
+function isRouteStatusUsable(status) {
+  return status === 200 || status === 400;
 }
 
 function sleep(ms) {
@@ -655,6 +719,7 @@ function renderDashboard() {
       <div class="metric"><span>Idle timeout</span><strong id="idleTimeout">Not checked</strong></div>
       <div class="metric"><span>Last used</span><strong id="lastUsed">Not checked</strong></div>
       <div class="metric"><span>Last failure</span><strong id="lastFailure">None seen</strong></div>
+      <div class="metric"><span>Next action</span><strong id="nextAction">Not checked</strong></div>
     </div>
   </section>
 
@@ -802,6 +867,7 @@ function renderResult(data) {
   document.getElementById("lastFailure").textContent = tokenRejected
     ? "GitHub token rejected or expired"
     : data.ok ? "None seen" : (data.reason || data.error || "Unknown failure");
+  document.getElementById("nextAction").textContent = data.next_action || "No action suggested";
   resultEl.textContent = JSON.stringify(data, null, 2);
   lastStatusText = [
     "G2ray Codespace Waker",
@@ -811,6 +877,7 @@ function renderResult(data) {
     "route_ready=" + routeReady,
     "route_http_status=" + (route.http_status || "unknown"),
     "latency_ms=" + (route.latency_ms == null ? "unknown" : route.latency_ms),
+    "next_action=" + (data.next_action || ""),
     "message=" + (data.message || data.error || "")
   ].join("\\n");
   if (routeReady) polling = false;

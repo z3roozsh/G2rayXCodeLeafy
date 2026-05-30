@@ -421,6 +421,12 @@ test_startup_does_not_reconnect_healthy_runtime() {
     if grep_fixed 'force_reconnect --no-prompt || true' "$SCRIPT"; then
         fail 'interactive attach still force-reconnects existing configs'
     fi
+    grep_fixed 'wait_for_xhttp_route_ready()' "$SCRIPT" \
+        || fail 'startup path does not wait for app.github.dev route readiness after resume'
+    grep_fixed 'G2RAY_ROUTE_WAIT_SEC' "$SCRIPT" \
+        || fail 'startup route wait is not configurable'
+    grep_fixed 'runtime_ready reason=${reason} route_wait_timeout' "$SCRIPT" \
+        || fail 'startup route wait timeout is not logged for troubleshooting'
     pass 'startup paths do not reconnect a healthy runtime'
 }
 
@@ -632,6 +638,16 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker does not support Telegram chat routing'
     grep_fixed 'GitHub token rejected or expired' "$WORKER_SCRIPT" \
         || fail 'Worker UI/API does not warn clearly about rejected or expired GitHub tokens'
+    grep_fixed 'GITHUB_STATE_WAIT_MS' "$WORKER_SCRIPT" \
+        || fail 'Worker wake flow does not wait for GitHub Codespace state readiness'
+    grep_fixed 'waitForCodespaceAvailable(name, token)' "$WORKER_SCRIPT" \
+        || fail 'Worker wake flow probes route before waiting for Codespace availability'
+    grep_fixed 'isRouteStatusUsable(res.status)' "$WORKER_SCRIPT" \
+        || fail 'Worker route readiness does not share the panel status classifier'
+    grep_fixed 'return status === 200 || status === 400;' "$WORKER_SCRIPT" \
+        || fail 'Worker route readiness does not treat HTTP 400 as usable like the panel'
+    grep_fixed 'next_action' "$WORKER_SCRIPT" \
+        || fail 'Worker API does not return a concrete next action when route is not ready'
     grep_fixed 'copyStatus' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard does not provide a copy-status action'
     grep_fixed 'setTimeout(checkHealth' "$WORKER_SCRIPT" \
@@ -944,6 +960,8 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not document the scan-friendly QR PNG export'
     grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
         || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
+    grep_fixed 'G2RAY_ROUTE_WAIT_SEC' "$README" \
+        || fail 'README does not document startup route wait'
     grep_fixed 'configs-to-copy-for-mobile.txt' "$README" \
         || fail 'README does not document the mobile copy-link fallback for QR scan failures'
     grep_fixed 'Choose Your Codespace Region Before Creating It' "$README" \
@@ -952,6 +970,12 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not explain that region changes require a new Codespace'
     grep_fixed 'gh codespace create -R OWNER/REPO -l WestEurope --idle-timeout 240m' "$README" \
         || fail 'README does not include a CLI example for region selection'
+    grep_fixed 'Linux recovery after Worker wake' "$README" \
+        || fail 'README does not include Linux recovery troubleshooting after Worker wake'
+    grep_fixed 'gh codespace ports visibility 443:public -c "$CS"' "$README" \
+        || fail 'README Linux recovery flow does not include public port repair'
+    grep_fixed 'curl -sS -o /dev/null -w "route=%{http_code} time=%{time_total}s\n" -X OPTIONS "$APP"' "$README" \
+        || fail 'README Linux recovery flow does not include an external route probe'
     grep_fixed '12) Server Location' "$README" \
         || fail 'README does not tell users to verify the observed exit location'
     grep_fixed 'Community Donated Configs (SUB)</summary>' "$README" \
