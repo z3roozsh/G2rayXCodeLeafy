@@ -1508,10 +1508,8 @@ start_background_tasks() {
     fi
     token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
     printf '%s\n' "$token" > "$BG_TASKS_TOKEN_FILE"
-    export G2RAY_BG_TASK_TOKEN="$token"
-    _background_tasks </dev/null >/dev/null 2>&1 &
+    G2RAY_BG_TASK_TOKEN="$token" nohup bash "$BASE_DIR/g2ray.sh" --background-supervisor </dev/null >/dev/null 2>&1 &
     bg_pid=$!
-    unset G2RAY_BG_TASK_TOKEN
     printf '%s\n' "$bg_pid" > "$BG_TASKS_PID"
     background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
     log_event INFO "background supervisor_started pid=${bg_pid}"
@@ -2740,6 +2738,11 @@ fi
 if [[ "${1:-}" == "--recover-now" || "${1:-}" == "recover" ]]; then
     recover_now --no-prompt
     exit $?
+fi
+
+if [[ "${1:-}" == "--background-supervisor" ]]; then
+    _background_tasks
+    exit 0
 fi
 
 if [[ "${1:-}" == "--silent-start" ]]; then

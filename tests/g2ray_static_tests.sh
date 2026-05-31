@@ -83,8 +83,13 @@ test_background_tasks_uses_owned_pid_file() {
         || fail 'background supervisor does not persist an ownership token'
     grep_fixed 'G2RAY_BG_TASK_TOKEN=' "$SCRIPT" \
         || fail 'background supervisor process is not tagged with an ownership token'
-    grep_fixed 'export G2RAY_BG_TASK_TOKEN="$token"' "$SCRIPT" \
-        || fail 'background supervisor ownership token is not exported into the child environment'
+    grep_fixed 'G2RAY_BG_TASK_TOKEN="$token" nohup bash "$BASE_DIR/g2ray.sh" --background-supervisor' "$SCRIPT" \
+        || fail 'background supervisor is not launched as a detached script mode with its ownership token'
+    grep_fixed 'if [[ "${1:-}" == "--background-supervisor" ]]; then' "$SCRIPT" \
+        || fail 'script has no dedicated background supervisor entrypoint'
+    if grep_fixed '_background_tasks </dev/null >/dev/null 2>&1 &' "$SCRIPT"; then
+        fail 'background supervisor still runs as an in-process child of postStart/postAttach'
+    fi
     grep_fixed '/proc/$p/environ' "$SCRIPT" \
         || fail 'background supervisor ownership is not verified against the live process environment'
     grep_fixed 'background_supervisor_recent_heartbeat()' "$SCRIPT" \
