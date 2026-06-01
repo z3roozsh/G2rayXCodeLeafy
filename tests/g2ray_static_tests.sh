@@ -707,6 +707,10 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker dashboard does not compute history summary metrics'
     grep_fixed 'History request failed:' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard hides unauthorized or failed history requests'
+    grep_fixed 'Quota Survival' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not expose quota survival status'
+    grep_fixed 'quotaBlocked' "$WORKER_SCRIPT" \
+        || fail 'Worker dashboard does not show quota-block status'
     grep_fixed 'securityHeaders(' "$WORKER_SCRIPT" \
         || fail 'Worker responses do not share hardened security headers'
     grep_fixed 'ctx.waitUntil' "$WORKER_SCRIPT" \
@@ -720,6 +724,36 @@ test_worker_dashboard_and_history_features() {
     grep_fixed 'Health dashboard' "$README" \
         || fail 'root README does not mention the private Worker health dashboard'
     pass 'Worker dashboard, history, and alert features are documented'
+}
+
+test_quota_survival_layer_is_present() {
+    grep_fixed 'quota_blocked:' "$WORKER_SCRIPT" \
+        || fail 'Worker responses do not include quota_blocked'
+    grep_fixed 'quota_reset_estimate_utc' "$WORKER_SCRIPT" \
+        || fail 'Worker responses do not include a monthly reset estimate'
+    grep_fixed 'retention_expires_at' "$WORKER_SCRIPT" \
+        || fail 'Worker does not expose Codespaces retention expiration'
+    grep_fixed 'retention_risk' "$WORKER_SCRIPT" \
+        || fail 'Worker does not classify retention risk'
+    grep_fixed 'survival_next_action' "$WORKER_SCRIPT" \
+        || fail 'Worker does not provide quota-survival next actions'
+    grep_fixed 'QUOTA_INCIDENT_KEY_PREFIX' "$WORKER_SCRIPT" \
+        || fail 'Worker does not persist quota incident history'
+    grep_fixed 'QUOTA_SURVIVAL_CRON_ENABLED' "$WORKER_SCRIPT" \
+        || fail 'Worker scheduled quota checks are not explicitly opt-in'
+    grep_fixed 'quotaSurvivalCronEnabled(env)' "$WORKER_SCRIPT" \
+        || fail 'Worker scheduled handler is not gated behind opt-in config'
+    grep_fixed 'Keep codespace' "$SCRIPT" \
+        || fail 'panel does not guide users to Keep codespace before quota exhaustion'
+    grep_fixed 'same configs can survive until reset' "$SCRIPT" \
+        || fail 'quota panel does not explain same-Codespace survival'
+    grep_fixed 'Keep codespace' "$README" \
+        || fail 'README does not tell users to preserve the Codespace with Keep codespace'
+    grep_fixed 'same VLESS configs survive into the next monthly reset only if the same Codespace name/domain survives' "$README" \
+        || fail 'README does not explain same-domain survival through quota reset'
+    grep_fixed 'QUOTA_SURVIVAL_CRON_ENABLED' "$WORKER_README" \
+        || fail 'Worker README does not document optional quota-survival Cron'
+    pass 'quota survival layer is present and documented'
 }
 
 test_worker_wake_edge_cases_are_hardened() {
@@ -1413,6 +1447,7 @@ test_diagnostics_show_resume_gap_state
 test_local_reopen_helper_is_documented
 test_cloudflare_worker_waker_is_safe_to_publish
 test_worker_dashboard_and_history_features
+test_quota_survival_layer_is_present
 test_worker_wake_edge_cases_are_hardened
 test_worker_rate_limits_and_classifies_github_errors
 test_route_candidate_monitor_is_bounded

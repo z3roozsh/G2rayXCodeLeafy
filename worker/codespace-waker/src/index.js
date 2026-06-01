@@ -8,10 +8,14 @@ const ROUTE_READY_STABLE_PROBES = 2;
 const FETCH_TIMEOUT_MS = 10000;
 const ROUTE_FETCH_TIMEOUT_MS = 7000;
 const HISTORY_KEY_PREFIX = "history:";
+const QUOTA_INCIDENT_KEY_PREFIX = "quota-incident:";
 const HISTORY_LIMIT = 50;
 const FAILED_AUTH_KEY_PREFIX = "failed-auth:";
 const FAILED_AUTH_WINDOW_SECONDS = 600;
 const FAILED_AUTH_MAX_ATTEMPTS = 10;
+const QUOTA_CRON_DAILY_INTERVAL_MS = 23 * 60 * 60 * 1000;
+const QUOTA_CRON_NEAR_RESET_INTERVAL_MS = 60 * 60 * 1000;
+const QUOTA_CRON_NEAR_RESET_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 export default {
   async fetch(request, env, ctx) {
@@ -42,6 +46,16 @@ export default {
     }
 
     return json({ ok: false, error: "not_found" }, 404);
+  },
+
+  async scheduled(controller, env, ctx) {
+    if (!quotaSurvivalCronEnabled(env)) return;
+    const task = handleQuotaSurvivalCron(controller, env);
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(task);
+    } else {
+      await task;
+    }
   }
 };
 
@@ -49,19 +63,24 @@ async function handleWake(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);
   if (!context.ok) return json(context.body, context.status);
 
-  const data = await startCodespaceData(context.codespaceName, context.token, env);
+  const data = withSurvivalFields(await startCodespaceData(context.codespaceName, context.token, env), env);
   data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
   const event = eventFromResult("wake", context.codespaceName, data);
   const historyRecorded = await recordHistory(env, {
     ...event,
     history_recorded_at: new Date().toISOString()
   });
+  const quotaIncident = await recordQuotaIncident(env, event, data);
   const notifications = await queueNotifications(env, event, ctx);
 
   return json({
     ...data,
     history_enabled: Boolean(env.WAKER_KV),
     history_recorded: historyRecorded,
+    quota_incident_recorded: quotaIncident.recorded,
+    quota_drought_active: quotaIncident.incident
+      ? quotaIncident.incident.quota_drought_active === true
+      : data.quota_blocked === true,
     notification_status: notifications.status,
     notifications_deferred: notifications.deferred,
     notification_errors: notifications.errors
@@ -75,24 +94,29 @@ async function handleHealth(request, env, ctx) {
   const codespaceName = context.codespaceName;
   const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN);
   const routeProbe = await probeXhttpRoute(codespaceName, codespacePort(env));
-  const data = {
+  const data = withSurvivalFields({
     ...status,
     route_ready: routeProbe.usable,
     route_probe: routeProbe,
     next_action: nextActionForWake(status, routeProbe),
     message: healthMessage(status, routeProbe)
-  };
+  }, env);
   const event = eventFromResult("health", codespaceName, data);
   const historyRecorded = await recordHistory(env, {
     ...event,
     history_recorded_at: new Date().toISOString()
   });
+  const quotaIncident = await recordQuotaIncident(env, event, data);
   const notifications = await queueNotifications(env, event, ctx);
 
   return json({
     ...data,
     history_enabled: Boolean(env.WAKER_KV),
     history_recorded: historyRecorded,
+    quota_incident_recorded: quotaIncident.recorded,
+    quota_drought_active: quotaIncident.incident
+      ? quotaIncident.incident.quota_drought_active === true
+      : data.quota_blocked === true,
     notification_status: notifications.status,
     notifications_deferred: notifications.deferred,
     notification_errors: notifications.errors
@@ -104,10 +128,12 @@ async function handleHistory(request, env) {
   if (!context.ok) return json(context.body, context.status);
 
   const history = await readHistory(env, context.codespaceName);
+  const quotaIncident = await readQuotaIncident(env, context.codespaceName);
   return json({
     ok: true,
     codespace: context.codespaceName,
     history_enabled: Boolean(env.WAKER_KV),
+    quota_incident: quotaIncident,
     history
   }, 200);
 }
@@ -211,7 +237,24 @@ async function startCodespaceData(name, token, env) {
   const body = parseBody(text);
 
   const githubFailure = githubFailureForResponse(res, body, name);
-  if (githubFailure) return githubFailure;
+  if (githubFailure) {
+    if (githubFailure.reason === "quota_or_billing_blocked") {
+      const status = await getCodespaceStatus(name, token);
+      return {
+        ...githubFailure,
+        state: status.state || null,
+        pending_operation: status.pending_operation ?? null,
+        last_used_at: status.last_used_at || null,
+        idle_timeout_minutes: status.idle_timeout_minutes || null,
+        location: status.location || null,
+        retention_period_minutes: status.retention_period_minutes ?? null,
+        retention_expires_at: status.retention_expires_at || null,
+        route_ready: false,
+        route_probe: null
+      };
+    }
+    return githubFailure;
+  }
 
   const accepted = res.ok || res.status === 202 || res.status === 304 || res.status === 409;
   if (!accepted) {
@@ -239,6 +282,9 @@ async function startCodespaceData(name, token, env) {
     pending_operation: readyState.pending_operation,
     last_used_at: readyState.last_used_at || (body && typeof body === "object" ? body.last_used_at || null : null),
     idle_timeout_minutes: readyState.idle_timeout_minutes || (body && typeof body === "object" ? body.idle_timeout_minutes || null : null),
+    location: readyState.location || (body && typeof body === "object" ? body.location || null : null),
+    retention_period_minutes: readyState.retention_period_minutes ?? (body && typeof body === "object" ? body.retention_period_minutes ?? null : null),
+    retention_expires_at: readyState.retention_expires_at || (body && typeof body === "object" ? body.retention_expires_at || null : null),
     github_wait_ms: readyState.waited_ms,
     github_wait_attempts: readyState.attempts,
     route_ready: routeProbe.usable,
@@ -336,6 +382,8 @@ async function getCodespaceStatus(codespaceName, token) {
     last_used_at: body && typeof body === "object" ? body.last_used_at || null : null,
     idle_timeout_minutes: body && typeof body === "object" ? body.idle_timeout_minutes || null : null,
     location: body && typeof body === "object" ? body.location || null : null,
+    retention_period_minutes: body && typeof body === "object" ? body.retention_period_minutes ?? null : null,
+    retention_expires_at: body && typeof body === "object" ? body.retention_expires_at || null : null,
     message: "Codespace status loaded."
   };
 }
@@ -448,6 +496,82 @@ function responseStatusFor(data) {
   return 502;
 }
 
+function withSurvivalFields(data, env) {
+  const now = currentDate(env);
+  const quotaBlocked = data.reason === "quota_or_billing_blocked" || Number(data.status) === 402;
+  const retentionPeriod = normalizeNullableNumber(data.retention_period_minutes);
+  const retentionExpires = data.retention_expires_at || null;
+  const retentionRisk = retentionRiskFor(retentionExpires, retentionPeriod, now);
+  const resetEstimate = nextMonthlyQuotaResetIso(now);
+  const survivalNextAction = survivalNextActionFor({
+    ...data,
+    quota_blocked: quotaBlocked,
+    retention_period_minutes: retentionPeriod,
+    retention_expires_at: retentionExpires,
+    retention_risk: retentionRisk,
+    quota_reset_estimate_utc: resetEstimate
+  });
+  const next = {
+    ...data,
+    quota_blocked: quotaBlocked,
+    quota_reset_estimate_utc: resetEstimate,
+    retention_period_minutes: retentionPeriod,
+    retention_expires_at: retentionExpires,
+    retention_risk: retentionRisk,
+    survival_next_action: survivalNextAction
+  };
+  if (quotaBlocked) {
+    next.route_ready = false;
+    if (!("route_probe" in next)) next.route_probe = null;
+    next.next_action = survivalNextAction;
+  }
+  return next;
+}
+
+function currentDate(env, scheduledTime) {
+  const candidate = env && env.TEST_NOW_UTC ? Date.parse(env.TEST_NOW_UTC) : Number.NaN;
+  if (Number.isFinite(candidate)) return new Date(candidate);
+  if (Number.isFinite(scheduledTime)) return new Date(scheduledTime);
+  return new Date();
+}
+
+function nextMonthlyQuotaResetIso(now) {
+  const reset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0));
+  return reset.toISOString().replace(".000Z", "Z");
+}
+
+function normalizeNullableNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function retentionRiskFor(retentionExpiresAt, retentionPeriodMinutes, now) {
+  if (!retentionExpiresAt) return retentionPeriodMinutes == null ? "unknown" : "safe";
+  const expires = Date.parse(retentionExpiresAt);
+  if (!Number.isFinite(expires)) return "unknown";
+  const remaining = expires - now.getTime();
+  if (remaining <= 3 * 24 * 60 * 60 * 1000) return "urgent";
+  if (remaining <= 7 * 24 * 60 * 60 * 1000) return "warning";
+  return "safe";
+}
+
+function survivalNextActionFor(data) {
+  if (data.quota_blocked) {
+    return `Quota or billing is blocking starts. Mark this Codespace as Keep codespace in GitHub now, then retry after the estimated quota reset at ${data.quota_reset_estimate_utc}.`;
+  }
+  if (data.reason === "codespace_not_found_or_token_cannot_access_it" || Number(data.status) === 404) {
+    return "Codespace is missing or the token cannot access it. If GitHub deleted it, create a new Codespace and generate new configs.";
+  }
+  if (data.retention_risk === "urgent" || data.retention_risk === "warning") {
+    return "Mark this Codespace as Keep codespace in GitHub Codespaces so the same domain/configs can survive until quota resets.";
+  }
+  if (data.retention_risk === "unknown") {
+    return "Open GitHub Codespaces and confirm this Codespace is marked Keep codespace before quota runs out.";
+  }
+  return "No quota survival action needed now. For best safety, mark this Codespace as Keep codespace before quota runs out.";
+}
+
 function isTransientGithubStatusFailure(last) {
   const status = Number(last && last.status || 0);
   return status === 0 || status >= 500;
@@ -505,6 +629,10 @@ function eventFromResult(kind, codespace, data) {
     route_waited_ms: data.route_probe ? data.route_probe.waited_ms : null,
     route_attempts: data.route_probe ? data.route_probe.attempts : null,
     reason: data.reason || null,
+    quota_blocked: data.quota_blocked === true,
+    quota_reset_estimate_utc: data.quota_reset_estimate_utc || null,
+    retention_expires_at: data.retention_expires_at || null,
+    retention_risk: data.retention_risk || null,
     token_warning: data.token_warning || null,
     message: data.message || null
   };
@@ -523,6 +651,50 @@ async function recordHistory(env, event) {
   }
 }
 
+async function recordQuotaIncident(env, event, data) {
+  if (!env.WAKER_KV) return { recorded: false, incident: null };
+  try {
+    const nowIso = currentDate(env).toISOString();
+    const existing = await readQuotaIncident(env, event.codespace) || {};
+    const incident = {
+      ...existing,
+      codespace: event.codespace,
+      last_observed_at: nowIso,
+      quota_reset_estimate_utc: data.quota_reset_estimate_utc || existing.quota_reset_estimate_utc || null,
+      retention_period_minutes: data.retention_period_minutes ?? existing.retention_period_minutes ?? null,
+      retention_expires_at: data.retention_expires_at || existing.retention_expires_at || null,
+      retention_risk: data.retention_risk || existing.retention_risk || "unknown"
+    };
+
+    if (data.quota_blocked) {
+      incident.first_quota_blocked_at = incident.first_quota_blocked_at || nowIso;
+      incident.latest_quota_blocked_at = nowIso;
+      incident.quota_drought_active = true;
+      incident.same_codespace_exists = data.reason === "codespace_not_found_or_token_cannot_access_it" ? false : true;
+    } else if (data.ok) {
+      incident.same_codespace_exists = true;
+      if (event.kind === "wake" || event.kind === "cron_wake") {
+        incident.last_successful_start_at = nowIso;
+      }
+      if (event.kind === "health" || event.kind === "cron_health") {
+        incident.last_successful_health_at = nowIso;
+      }
+      if (event.kind === "wake" || event.kind === "cron_wake" || data.route_ready === true) {
+        incident.quota_drought_active = false;
+      } else if (incident.quota_drought_active !== true) {
+        incident.quota_drought_active = false;
+      }
+    } else if (data.reason === "codespace_not_found_or_token_cannot_access_it") {
+      incident.same_codespace_exists = false;
+    }
+
+    await env.WAKER_KV.put(quotaIncidentKey(event.codespace), JSON.stringify(incident));
+    return { recorded: true, incident };
+  } catch {
+    return { recorded: false, incident: null };
+  }
+}
+
 async function readHistory(env, codespace) {
   if (!env.WAKER_KV) return [];
 
@@ -535,9 +707,102 @@ async function readHistory(env, codespace) {
   }
 }
 
+async function readQuotaIncident(env, codespace) {
+  if (!env.WAKER_KV) return null;
+
+  try {
+    const text = await env.WAKER_KV.get(quotaIncidentKey(codespace));
+    const parsed = text ? JSON.parse(text) : null;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function historyKey(codespace) {
   const suffix = String(codespace || "unknown").trim() || "unknown";
   return HISTORY_KEY_PREFIX + encodeURIComponent(suffix);
+}
+
+function quotaIncidentKey(codespace) {
+  const suffix = String(codespace || "unknown").trim() || "unknown";
+  return QUOTA_INCIDENT_KEY_PREFIX + encodeURIComponent(suffix);
+}
+
+function quotaSurvivalCronEnabled(env) {
+  const value = String(env && env.QUOTA_SURVIVAL_CRON_ENABLED || "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+async function handleQuotaSurvivalCron(controller, env) {
+  const codespaceName = String(env.CODESPACE_NAME || "").trim();
+  if (!env.WAKER_KV || !codespaceName || !env.GITHUB_TOKEN) {
+    return { ok: false, skipped: "missing_kv_codespace_or_token" };
+  }
+
+  const incident = await readQuotaIncident(env, codespaceName);
+  if (!incident || incident.quota_drought_active !== true) {
+    return { ok: true, skipped: "no_active_quota_drought" };
+  }
+
+  const now = currentDate(env, controller && controller.scheduledTime);
+  if (!quotaCronCheckAllowed(incident, now)) {
+    return { ok: true, skipped: "quota_cron_throttled" };
+  }
+
+  const nearReset = quotaCronNearReset(incident, now);
+  if (nearReset && !quotaCronWakeAllowed(incident)) {
+    if (resultNeedsCronStamp(incident, now)) {
+      incident.last_cron_check_at = now.toISOString();
+      await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(incident));
+    }
+    return { ok: true, skipped: "quota_cron_near_reset_wake_already_attempted" };
+  }
+  const data = withSurvivalFields(
+    nearReset
+      ? await startCodespaceData(codespaceName, env.GITHUB_TOKEN, env)
+      : await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN),
+    env
+  );
+  const event = eventFromResult(nearReset ? "cron_wake" : "cron_health", codespaceName, data);
+  await recordHistory(env, {
+    ...event,
+    history_recorded_at: now.toISOString()
+  });
+  const result = await recordQuotaIncident(env, event, data);
+  if (result.incident) {
+    result.incident.last_cron_check_at = now.toISOString();
+    if (nearReset) {
+      result.incident.last_cron_wake_at = now.toISOString();
+      result.incident.last_cron_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
+    }
+    await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(result.incident));
+  }
+  return { ok: true, near_reset: nearReset, quota_blocked: data.quota_blocked === true };
+}
+
+function quotaCronCheckAllowed(incident, now) {
+  const last = Date.parse(incident.last_cron_check_at || "");
+  if (!Number.isFinite(last)) return true;
+  const interval = quotaCronNearReset(incident, now)
+    ? QUOTA_CRON_NEAR_RESET_INTERVAL_MS
+    : QUOTA_CRON_DAILY_INTERVAL_MS;
+  return now.getTime() - last >= interval;
+}
+
+function quotaCronNearReset(incident, now) {
+  const reset = Date.parse(incident.quota_reset_estimate_utc || "");
+  if (!Number.isFinite(reset)) return false;
+  return now.getTime() >= reset - QUOTA_CRON_NEAR_RESET_WINDOW_MS;
+}
+
+function quotaCronWakeAllowed(incident) {
+  return incident.last_cron_wake_reset_estimate_utc !== incident.quota_reset_estimate_utc;
+}
+
+function resultNeedsCronStamp(incident, now) {
+  const last = Date.parse(incident.last_cron_check_at || "");
+  return !Number.isFinite(last) || now.getTime() - last >= QUOTA_CRON_NEAR_RESET_INTERVAL_MS;
 }
 
 async function sendNotifications(env, event) {
@@ -977,6 +1242,18 @@ function renderDashboard() {
   </section>
 
   <section class="card">
+    <h2>Quota Survival</h2>
+    <div class="grid">
+      <div class="metric"><span>Quota block</span><strong id="quotaBlocked">Not checked</strong></div>
+      <div class="metric"><span>Estimated reset</span><strong id="quotaReset">Not checked</strong></div>
+      <div class="metric"><span>Retention risk</span><strong id="retentionRisk">Not checked</strong></div>
+      <div class="metric"><span>Retention expires</span><strong id="retentionExpires">Not checked</strong></div>
+      <div class="metric"><span>Quota drought</span><strong id="quotaDrought">Not checked</strong></div>
+      <div class="metric"><span>Survival action</span><strong id="survivalAction">Not checked</strong></div>
+    </div>
+  </section>
+
+  <section class="card">
     <h2>Progress</h2>
     <ol id="progress">
       <li>Waiting for a wake or health check</li>
@@ -999,6 +1276,8 @@ function renderDashboard() {
       <div class="metric"><span>Wake success</span><strong>Not loaded</strong></div>
       <div class="metric"><span>Best latency</span><strong>Not loaded</strong></div>
       <div class="metric"><span>Last stuck route</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>Quota blocks</span><strong>Not loaded</strong></div>
+      <div class="metric"><span>Quota drought</span><strong>Not loaded</strong></div>
     </div>
     <h3>Latency trend</h3>
     <div id="latencyTrend" class="history"></div>
@@ -1147,6 +1426,14 @@ function renderResult(data) {
   document.getElementById("lastUsed").textContent = data.last_used_at || "Unknown";
   document.getElementById("lastFailure").textContent = routeSettlingFailureText(data, route, routeReady);
   document.getElementById("nextAction").textContent = data.next_action || "No action suggested";
+  document.getElementById("quotaBlocked").textContent = data.quota_blocked ? "Quota blocked" : "No block seen";
+  document.getElementById("quotaBlocked").className = data.quota_blocked ? "bad" : "good";
+  document.getElementById("quotaReset").textContent = data.quota_reset_estimate_utc || "Unknown";
+  document.getElementById("retentionRisk").textContent = data.retention_risk || "Unknown";
+  document.getElementById("retentionRisk").className = data.retention_risk === "urgent" ? "bad" : data.retention_risk === "warning" ? "warn" : "";
+  document.getElementById("retentionExpires").textContent = data.retention_expires_at || "Not scheduled / unknown";
+  document.getElementById("quotaDrought").textContent = data.quota_drought_active ? "Active" : "No active drought";
+  document.getElementById("survivalAction").textContent = data.survival_next_action || "Not checked";
   resultEl.textContent = JSON.stringify(data, null, 2);
   lastStatusText = [
     "G2ray Codespace Waker",
@@ -1156,6 +1443,10 @@ function renderResult(data) {
     "route_ready=" + routeReady,
     "route_http_status=" + (route.http_status || "unknown"),
     "latency_ms=" + (route.latency_ms == null ? "unknown" : route.latency_ms),
+    "quota_blocked=" + Boolean(data.quota_blocked),
+    "retention_risk=" + (data.retention_risk || "unknown"),
+    "quota_reset_estimate_utc=" + (data.quota_reset_estimate_utc || "unknown"),
+    "survival_next_action=" + (data.survival_next_action || ""),
     "next_action=" + (data.next_action || ""),
     "message=" + (data.message || data.error || "")
   ].join("\\n");
@@ -1194,7 +1485,7 @@ function renderHistory(data) {
     ? "Recent wake and health events."
     : "History is disabled because WAKER_KV is not configured.";
   const events = data.history || [];
-  renderHistorySummary(events);
+  renderHistorySummary(events, data.quota_incident || null);
   renderLatencyTrend(events);
   for (const event of events) {
     const item = document.createElement("div");
@@ -1213,7 +1504,7 @@ function renderHistory(data) {
   }
 }
 
-function renderHistorySummary(events) {
+function renderHistorySummary(events, quotaIncident) {
   const summary = summarizeHistory(events);
   historySummary.innerHTML = "";
   const cards = [
@@ -1222,7 +1513,9 @@ function renderHistorySummary(events) {
     ["HTTP 404", String(summary.http404)],
     ["Wake success", summary.wakeOk + " ok / " + summary.wakeFail + " fail"],
     ["Best latency", summary.bestLatency == null ? "None" : summary.bestLatency + "ms"],
-    ["Last stuck route", summary.lastStuck || "None seen"]
+    ["Last stuck route", summary.lastStuck || "None seen"],
+    ["Quota blocks", String(summary.quotaBlocks)],
+    ["Quota drought", quotaIncident && quotaIncident.quota_drought_active ? "Active" : "Inactive / none"]
   ];
   for (const [label, value] of cards) {
     const card = document.createElement("div");
@@ -1244,6 +1537,7 @@ function summarizeHistory(events) {
     http404: 0,
     wakeOk: 0,
     wakeFail: 0,
+    quotaBlocks: 0,
     bestLatency: null,
     lastStuck: ""
   };
@@ -1252,6 +1546,7 @@ function summarizeHistory(events) {
     if (event.route_http_status === 404) summary.http404 += 1;
     if (event.kind === "wake" && event.ok) summary.wakeOk += 1;
     if (event.kind === "wake" && !event.ok) summary.wakeFail += 1;
+    if (event.quota_blocked === true || event.reason === "quota_or_billing_blocked") summary.quotaBlocks += 1;
     if (Number.isFinite(event.route_latency_ms)) {
       summary.bestLatency = summary.bestLatency == null
         ? event.route_latency_ms

@@ -153,6 +153,8 @@ bash ./g2ray.sh
 
 GitHub can still stop a Codespace for idle timeout, quota, billing, manual stop, rebuild, or retention policy. No process inside the Codespace can restart it after that because all Codespace processes are stopped. To reduce surprise stops, set your GitHub Codespaces **Default idle timeout** to **240 minutes** in GitHub account settings.
 
+Before you get close to monthly quota exhaustion, also mark the Codespace as **Keep codespace** from the GitHub Codespaces page. GitHub quota exhaustion does not immediately mean deletion, but stopped Codespaces can still be removed by retention policy. The same VLESS configs survive into the next monthly reset only if the same Codespace name/domain survives.
+
 To change the idle timeout:
 
 1. Open GitHub in your browser.
@@ -228,7 +230,7 @@ On first setup, the panel shows a small recovery card so you can copy these reco
 
 If you want a phone/browser/curl-accessible manual wake button, this repo includes a Cloudflare Worker template in `worker/codespace-waker/`. The `GET /wake` page is public so it can load in your browser, but `POST /wake` and the `/api/*` actions are protected by your wake secret. The Worker stores the GitHub token and wake secret as Cloudflare secrets, not in git.
 
-The Worker also provides a **Health dashboard** page for mobile use. The page itself can load in a browser, but wake, health, history, and copyable status actions require your wake secret. It shows GitHub state, XHTTP route readiness, route latency, idle timeout, last-used time, last failure, copyable status text, route history summary, latency trend, and optional KV-backed history. This is external health only; it does not expose your UUID, VLESS links, or the panel's full option `14) Diagnostics` output.
+The Worker also provides a **Health dashboard** page for mobile use. The page itself can load in a browser, but wake, health, history, and copyable status actions require your wake secret. It shows GitHub state, XHTTP route readiness, route latency, idle timeout, last-used time, last failure, quota survival state, retention/deletion risk, copyable status text, route history summary, latency trend, and optional KV-backed history. This is external health only; it does not expose your UUID, VLESS links, or the panel's full option `14) Diagnostics` output.
 
 The panel can guide this from **Option 15: Recovery / Waker Setup**. It detects the current Codespace name, generates a wake secret, reminds you to set Default idle timeout to 240 minutes, and saves only non-sensitive metadata such as the Worker URL and wake-secret fingerprint.
 
@@ -254,9 +256,12 @@ Cloudflare dashboard binding types:
 Optional Cloudflare dashboard bindings:
 
 - `WAKER_KV`: KV namespace binding for dashboard history.
+- `QUOTA_SURVIVAL_CRON_ENABLED`: **Plaintext** variable set to `true` only if you also configure a Cloudflare Cron Trigger and want conservative quota-reset checks.
 - `DISCORD_WEBHOOK_URL`: **Secret** variable for Discord alerts.
 - `TELEGRAM_BOT_TOKEN`: **Secret** variable for Telegram alerts.
 - `TELEGRAM_CHAT_ID`: **Secret** variable for Telegram alerts.
+
+With `WAKER_KV`, the Worker records quota-block incidents: first `HTTP 402`, latest `HTTP 402`, last successful wake/health check, and whether the same Codespace still appears accessible. With `QUOTA_SURVIVAL_CRON_ENABLED=true`, a Cloudflare Cron Trigger can check this state conservatively; it does not bypass quota and does not try repeated starts until the estimated monthly reset window.
 
 The Worker URL can be entered with or without `https://`, and with or without `/wake`; the panel normalizes it to `https://YOUR_WORKER.workers.dev/wake`.
 
@@ -334,7 +339,7 @@ G2rayXCodeLeafy/
 Ensure you have activated Option `7` in the G2ray panel (Toggle Anti-Sleep Mode) to spawn a background Tmux session that simulates activity while the Codespace is running. This is best-effort: GitHub may still stop the Codespace when quota, budget, idle-timeout policy, or retention/deletion rules apply.
 
 **Will it restart after my monthly quota resets?**
-Not by itself while GitHub is blocking or stopping the Codespace, because no code runs inside a stopped Codespace. After the monthly included usage resets, reopen the Codespace from GitHub; `postStartCommand` runs `g2ray.sh --silent-start`, starts Xray, starts the supervisor, and refreshes exported configs.
+Not by itself while GitHub is blocking or stopping the Codespace, because no code runs inside a stopped Codespace. The Worker can show `HTTP 402`, estimate the next monthly reset, and, if you enabled optional KV/Cron, check conservatively near reset. The same configs work next month only if the same Codespace survives, so mark it as **Keep codespace** before quota runs out. After the monthly included usage resets, reopen it from GitHub or the Worker; `postStartCommand` runs `g2ray.sh --silent-start`, starts Xray, starts the supervisor, and refreshes exported configs.
 
 **Is the 15 GB limit my VPN data limit?**
 No. GitHub's 15 GB-month included allowance is Codespaces storage. The panel's RX/TX traffic counter measures tunnel traffic for your visibility, but it is not the same as the GitHub storage quota.

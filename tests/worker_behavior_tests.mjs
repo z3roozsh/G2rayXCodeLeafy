@@ -20,6 +20,9 @@ function makeKv() {
     },
     async put(key, value) {
       store.set(key, value);
+    },
+    dump() {
+      return Object.fromEntries(store.entries());
     }
   };
 }
@@ -105,6 +108,312 @@ async function testGithubHttp429Classification() {
   assert.equal(body.retry_after_epoch, 1780000123);
   assert.match(body.next_action, /GitHub is throttling/);
   console.log("PASS: Worker classifies GitHub HTTP 429 rate limits");
+}
+
+async function testQuotaBlockIncludesSurvivalFields() {
+  let statusCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ message: "Payment required" }), {
+        status: 402,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Shutdown",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        retention_expires_at: "2026-06-20T00:00:00Z",
+        last_used_at: "2026-06-10T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/wake"),
+    baseEnv({ TEST_NOW_UTC: "2026-06-15T12:00:00Z" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 402);
+  assert.equal(body.reason, "quota_or_billing_blocked");
+  assert.equal(body.quota_blocked, true);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
+  assert.equal(body.retention_period_minutes, 43200);
+  assert.equal(body.retention_expires_at, "2026-06-20T00:00:00Z");
+  assert.equal(body.retention_risk, "warning");
+  assert.match(body.survival_next_action, /Keep codespace/);
+  assert.equal(statusCalls, 1);
+  console.log("PASS: Worker quota blocks include survival fields");
+}
+
+async function testRetentionMissingFieldsAreUnknown() {
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-06-10T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ TEST_NOW_UTC: "2026-06-15T12:00:00Z" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.quota_blocked, false);
+  assert.equal(body.retention_period_minutes, null);
+  assert.equal(body.retention_expires_at, null);
+  assert.equal(body.retention_risk, "unknown");
+  assert.equal(body.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
+  console.log("PASS: Worker treats missing retention fields as unknown");
+}
+
+async function testMonthlyResetEstimateCrossesYear() {
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ message: "Payment required" }), {
+        status: 402,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Shutdown",
+        pending_operation: false
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/wake"),
+    baseEnv({ TEST_NOW_UTC: "2026-12-31T23:00:00Z" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 402);
+  assert.equal(body.quota_reset_estimate_utc, "2027-01-01T00:00:00Z");
+  console.log("PASS: Worker monthly reset estimate crosses year boundary");
+}
+
+async function testKvQuotaIncidentHistoryRecordsBlockedAndRecovery() {
+  const kv = makeKv();
+  let routeReady = false;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start") && !routeReady) {
+      return new Response(JSON.stringify({ message: "Payment required" }), {
+        status: 402,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("/start")) {
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: routeReady ? "Available" : "Shutdown",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        retention_expires_at: routeReady ? null : "2026-06-20T00:00:00Z",
+        last_used_at: "2026-06-10T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({ WAKER_KV: kv, TEST_NOW_UTC: "2026-06-15T12:00:00Z" });
+  let response = await worker.fetch(makeRequest("/api/wake"), env, {});
+  let body = await responseJson(response);
+  assert.equal(response.status, 402);
+  assert.equal(body.quota_incident_recorded, true);
+  assert.equal(body.quota_drought_active, true);
+
+  routeReady = true;
+  env.TEST_NOW_UTC = "2026-07-01T00:05:00Z";
+  response = await worker.fetch(makeRequest("/api/wake"), env, {});
+  body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.quota_incident_recorded, true);
+  assert.equal(body.quota_drought_active, false);
+
+  response = await worker.fetch(makeRequest("/api/history"), env, {});
+  body = await responseJson(response);
+  assert.equal(body.quota_incident.first_quota_blocked_at, "2026-06-15T12:00:00.000Z");
+  assert.equal(body.quota_incident.latest_quota_blocked_at, "2026-06-15T12:00:00.000Z");
+  assert.equal(body.quota_incident.last_successful_start_at, "2026-07-01T00:05:00.000Z");
+  assert.equal(body.quota_incident.quota_drought_active, false);
+  assert.equal(body.quota_incident.same_codespace_exists, true);
+  console.log("PASS: Worker KV quota incident history records blocked and recovery states");
+}
+
+async function testScheduledQuotaCronIsDisabledAndThrottledBeforeReset() {
+  const kv = makeKv();
+  await kv.put("quota-incident:behavior-space", JSON.stringify({
+    quota_drought_active: true,
+    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
+  }));
+  let statusCalls = 0;
+  let startCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      startCalls += 1;
+      return new Response(JSON.stringify({ message: "should not start before reset window" }), {
+        status: 500,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Shutdown",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        retention_expires_at: "2026-06-25T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const disabledPromises = [];
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-06-15T00:00:00Z") },
+    baseEnv({ WAKER_KV: kv }),
+    { waitUntil(promise) { disabledPromises.push(promise); } }
+  );
+  assert.equal(disabledPromises.length, 0);
+  assert.equal(statusCalls, 0);
+
+  const env = baseEnv({
+    WAKER_KV: kv,
+    QUOTA_SURVIVAL_CRON_ENABLED: "true",
+    TEST_NOW_UTC: "2026-06-15T00:00:00Z"
+  });
+  const waitUntilPromises = [];
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-06-15T00:00:00Z") },
+    env,
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  await Promise.all(waitUntilPromises);
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-06-15T01:00:00Z") },
+    env,
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  await Promise.all(waitUntilPromises);
+  assert.equal(statusCalls, 1);
+  assert.equal(startCalls, 0);
+  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
+  assert.equal(incident.quota_drought_active, true);
+  assert.equal(incident.last_successful_health_at, "2026-06-15T00:00:00.000Z");
+  console.log("PASS: Worker scheduled quota survival cron is disabled by default and throttled before reset");
+}
+
+async function testScheduledQuotaCronAttemptsOneNearResetWake() {
+  const kv = makeKv();
+  await kv.put("quota-incident:behavior-space", JSON.stringify({
+    quota_drought_active: true,
+    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
+  }));
+  let startCalls = 0;
+  let statusCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      startCalls += 1;
+      return new Response(JSON.stringify({ message: "Payment required" }), {
+        status: 402,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Shutdown",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        retention_expires_at: "2026-07-20T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({
+    WAKER_KV: kv,
+    QUOTA_SURVIVAL_CRON_ENABLED: "true",
+    TEST_NOW_UTC: "2026-06-30T19:00:00Z"
+  });
+  let waitUntilPromises = [];
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-06-30T19:00:00Z") },
+    env,
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  await Promise.all(waitUntilPromises);
+
+  env.TEST_NOW_UTC = "2026-06-30T20:00:00Z";
+  waitUntilPromises = [];
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-06-30T20:00:00Z") },
+    env,
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  await Promise.all(waitUntilPromises);
+
+  assert.equal(startCalls, 1);
+  assert.equal(statusCalls, 1);
+  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
+  assert.equal(incident.quota_drought_active, true);
+  assert.equal(incident.last_cron_wake_reset_estimate_utc, "2026-07-01T00:00:00Z");
+  console.log("PASS: Worker scheduled quota survival cron attempts only one near-reset wake");
 }
 
 async function testWakeFailureIncludesNextAction() {
@@ -202,6 +511,9 @@ async function testDashboardIncludesRouteHistorySummaryUi() {
   const html = await response.text();
   assert.equal(response.status, 200);
   assert.match(html, /Route history summary/);
+  assert.match(html, /Quota Survival/);
+  assert.match(html, /quotaBlocked/);
+  assert.match(html, /quotaReset/);
   assert.match(html, /latencyTrend/);
   assert.match(html, /renderHistorySummary/);
   assert.match(html, /History request failed:/);
@@ -432,6 +744,12 @@ try {
   await testFailedSecretRateLimit();
   await testGithubRateLimitClassification();
   await testGithubHttp429Classification();
+  await testQuotaBlockIncludesSurvivalFields();
+  await testRetentionMissingFieldsAreUnknown();
+  await testMonthlyResetEstimateCrossesYear();
+  await testKvQuotaIncidentHistoryRecordsBlockedAndRecovery();
+  await testScheduledQuotaCronIsDisabledAndThrottledBeforeReset();
+  await testScheduledQuotaCronAttemptsOneNearResetWake();
   await testWakeFailureIncludesNextAction();
   await testHealthTreatsHttp400RouteAsUsable();
   await testWakeRequiresStableRouteReadiness();

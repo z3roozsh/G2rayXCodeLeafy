@@ -707,6 +707,10 @@ show_waker_recovery_guide() {
     echo -e "  6. If it stays stuck, open the panel and use option ${WHITE}6) Recover Now${NC}.\n"
     echo -e "  This works only if the Codespace still exists and GitHub quota/token are valid."
     echo -e "  It cannot bypass quota, billing, deletion, or account restrictions.\n"
+    echo -e "  ${WHITE}${B}Quota survival${NC}"
+    echo -e "  If GitHub returns ${WHITE}HTTP 402${NC}, the Codespace is quota/billing blocked."
+    echo -e "  The same configs can work after the monthly reset only if this same Codespace survives."
+    echo -e "  Before quota runs out, open GitHub Codespaces, use the ${WHITE}...${NC} menu, and choose ${WHITE}Keep codespace${NC}.\n"
     echo -e "  ${WHITE}${B}Saved Waker${NC}"
     waker_metadata_summary | sed 's/^/  /'
     echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
@@ -725,6 +729,9 @@ setup_cloudflare_waker() {
     echo -e "  ${WHITE}Codespaces app domain:${NC} ${GREEN}${PORT_DOMAIN}${NC}\n"
     echo -e "  First, set GitHub Codespaces ${WHITE}Default idle timeout${NC} to ${WHITE}240 minutes${NC}:"
     echo -e "  GitHub -> Settings -> Codespaces -> Default idle timeout -> 240 minutes.\n"
+    echo -e "  To survive monthly quota exhaustion, mark this Codespace as ${WHITE}Keep codespace${NC}:"
+    echo -e "  GitHub -> Codespaces -> this Codespace -> ${WHITE}...${NC} menu -> ${WHITE}Keep codespace${NC}."
+    echo -e "  Same configs survive next month only if this same Codespace is not deleted.\n"
     echo -e "  ${WHITE}${B}Step 1 - Create a GitHub token${NC}"
     echo -e "  Recommended classic token path:"
     echo -e "  ${WHITE}https://github.com/settings/tokens/new?scopes=codespace${NC}"
@@ -743,6 +750,8 @@ setup_cloudflare_waker() {
     echo -e "  ${WHITE}WAKE_SECRET${NC}  -> the wake secret below\n"
     echo -e "  Optional: if you changed XRAY_PORT, add ${WHITE}CODESPACE_PORT${NC} as a Plaintext variable."
     echo -e "  Leave it unset for the default port 443.\n"
+    echo -e "  Optional: bind ${WHITE}WAKER_KV${NC} and set ${WHITE}QUOTA_SURVIVAL_CRON_ENABLED=true${NC}"
+    echo -e "  only if you want quota-block history and conservative post-reset checks.\n"
     echo -e "  The wake secret is shown once. Save it now and paste it into Cloudflare:"
     echo -e "  ${GREEN}${wake_secret}${NC}"
     echo -e "  ${DIM}Fingerprint saved locally: ${wake_fingerprint}${NC}\n"
@@ -1738,6 +1747,7 @@ estimate_quota() {
     echo -e "  Remaining  : ${GREEN}${h_left}h ${m_left}m${NC} ${DIM}(of local ${quota_hours}h estimate)${NC}"
     echo -e "  Depletion  : ${DIM}${dtime}${NC}"
     echo -e "  ${DIM}GitHub billing is authoritative; 15 GB-month is storage quota, not traffic quota.${NC}"
+    echo -e "  ${DIM}If quota blocks starts, mark the Codespace as Keep codespace so the same configs can survive until reset.${NC}"
 }
 
 show_resource_stats() {

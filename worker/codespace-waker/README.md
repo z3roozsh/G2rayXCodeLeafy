@@ -67,6 +67,10 @@ Optional: add `CODESPACE_PORT` as a **Plaintext** variable only if you changed t
 
 Optional history: create a Cloudflare KV namespace and bind it as `WAKER_KV`. Without this binding, the dashboard still works but shows history as disabled. With `WAKER_KV`, it stores recent wake/health events, route HTTP status, latency, route wait time, and last failures under a per-Codespace key so the dashboard can show repeated HTTP `404` settling and latency trends.
 
+Quota survival history also uses `WAKER_KV`. When GitHub returns HTTP `402`, the Worker records the first quota block, latest quota block, estimated monthly reset, retention/deletion fields from GitHub, and the next later successful wake or health check. This helps confirm that the same Codespace survived into the next monthly reset.
+
+Optional quota survival Cron: add a Cloudflare Cron Trigger only if you want automatic low-frequency checks while quota is blocked, then set `QUOTA_SURVIVAL_CRON_ENABLED=true` as a **Plaintext** variable. The Worker is disabled by default for scheduled events, checks at most about daily before reset, and only attempts a wake near the estimated monthly reset window.
+
 Optional alerts:
 
 - Add `DISCORD_WEBHOOK_URL` as a **Secret** variable to notify a Discord channel.
@@ -139,11 +143,16 @@ If you create a new Codespace, change region, rename/recreate the Codespace, or 
 - `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
 - `route_ready: false` with HTTP `0`: DNS, TLS, or the app route did not answer before the Worker timeout.
 - `next_action`: the fastest manual recovery step to try next.
+- `quota_blocked: true`: GitHub returned HTTP `402`, so quota or billing is blocking the start.
+- `quota_reset_estimate_utc`: the next first-of-month UTC estimate for included-usage reset.
+- `retention_period_minutes` / `retention_expires_at`: GitHub Codespaces retention fields when the API returns them.
+- `retention_risk`: `safe`, `warning`, `urgent`, or `unknown` based on `retention_expires_at`.
+- `survival_next_action`: what to do to preserve the same Codespace/configs through quota reset.
 - `notification_status: "none"`: no Discord/Telegram alert was needed, or no alert channel is configured.
 - `notification_status: "deferred"` / `notifications_deferred: true`: Discord or Telegram delivery is running after the response through Cloudflare `waitUntil`; check Worker logs if an alert does not arrive.
 - `notification_status: "failed"`: notification delivery was attempted synchronously and `notification_errors` contains the delivery error.
 - `401`: Wrong wake secret, or GitHub rejected the stored token. Check the JSON `error`, `reason`, or `token_warning` field to tell which side rejected the request.
-- `402`: GitHub quota or billing blocked the start. Wait for quota reset or adjust GitHub billing settings.
+- `402`: GitHub quota or billing blocked the start. Mark the Codespace as **Keep codespace**, wait for quota reset or adjust GitHub billing settings, then start the same Codespace again.
 - `403`: GitHub token is rejected, expired, or missing the right scope.
 - `404`: Codespace name is wrong or the token cannot access it.
 - `429`: Either too many wrong wake-secret attempts hit the optional KV-backed Worker rate limit, or GitHub rate-limited the token. Check `reason` and `retry_after_seconds`.
