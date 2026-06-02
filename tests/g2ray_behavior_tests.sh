@@ -27,6 +27,7 @@ reset_runtime_paths() {
     CONFIG_FILE="$DATA_DIR/config.json"
     UUID_FILE="$DATA_DIR/uuid.txt"
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
+    ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
     LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
     PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
     MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -102,27 +103,47 @@ test_port_visibility_cache_is_scoped_by_codespace_and_port() {
     pass "port visibility cache is scoped by codespace and port"
 }
 
-test_cached_route_order_prefers_last_good_then_latency() {
+test_cached_route_order_uses_reliability_then_average_latency() {
     reset_runtime_paths
     cat > "$ROUTE_HEALTH_FILE" <<'EOF'
-2026-05-30T00:00:00Z	20.0.0.1	200	40	true
-2026-05-30T00:00:00Z	20.0.0.2	200	900	true
+2026-05-30T00:00:00Z	20.0.0.1	200	10	true
+2026-05-30T00:00:00Z	20.0.0.2	200	80	true
 2026-05-30T00:00:00Z	20.0.0.3	404	10	false
 EOF
+    cat > "$ROUTE_STATS_FILE" <<'EOF'
+20.0.0.1	5	1	4	10	10	10	10	200	true	2026-05-30T00:00:00Z
+20.0.0.2	5	5	0	80	70	90	80	200	true	2026-05-30T00:00:00Z
+EOF
     cat > "$LAST_GOOD_ROUTE_FILE" <<'EOF'
-ip=20.0.0.2
+ip=20.0.0.1
 http_status=200
-latency_ms=900
+latency_ms=10
 source=test
 checked_at=2026-05-30T00:00:00Z
 EOF
     mapfile -t routes < <(cached_usable_fallback_ips)
-    [[ "${routes[0]:-}" == "20.0.0.2" ]] || fail "last good route was not preferred first"
-    [[ "${routes[1]:-}" == "20.0.0.1" ]] || fail "remaining routes were not ordered by latency"
-    pass "cached route health orders exports by last-good and latency"
+    [[ "${routes[0]:-}" == "20.0.0.2" ]] || fail "reliable route was not preferred over a flaky fast last probe"
+    [[ "${routes[1]:-}" == "20.0.0.1" ]] || fail "flaky route was not kept after reliable route"
+    pass "cached route health orders exports by reliability and average latency"
 }
 
-test_cached_route_order_prefers_pinned_route_before_last_good() {
+test_route_candidate_stats_track_average_and_success_rate() {
+    reset_runtime_paths
+    update_route_candidate_stats 20.0.0.1 200 100
+    update_route_candidate_stats 20.0.0.1 404 900
+    update_route_candidate_stats 20.0.0.1 200 300
+
+    local row
+    row=$(awk -F '\t' '$1 == "20.0.0.1" {print $0}' "$ROUTE_STATS_FILE")
+    [[ "$row" == $'20.0.0.1\t3\t2\t1\t200\t100\t300\t300\t200\ttrue\t'* ]] \
+        || fail "route stats did not track samples/success/failure/average/min/max/last: $row"
+    printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t300\ttrue\n' > "$ROUTE_HEALTH_FILE"
+    route_candidate_health_summary | grep -Fq 'avg=200ms success=2/3' \
+        || fail "route candidate summary does not show average latency and success ratio"
+    pass "route candidate stats track rolling average and reliability"
+}
+
+test_cached_route_order_prefers_pinned_route_then_latency_without_stats() {
     reset_runtime_paths
     cat > "$ROUTE_HEALTH_FILE" <<'EOF'
 2026-05-30T00:00:00Z	20.0.0.1	200	500	true
@@ -139,8 +160,25 @@ EOF
     pin_route_candidate 20.0.0.1
     mapfile -t routes < <(cached_usable_fallback_ips)
     [[ "${routes[0]:-}" == "20.0.0.1" ]] || fail "pinned route was not preferred first"
-    [[ "${routes[1]:-}" == "20.0.0.2" ]] || fail "last good route was not preferred after pinned route"
-    pass "cached route health orders exports by pinned route, last-good route, then latency"
+    [[ "${routes[1]:-}" == "20.0.0.2" ]] || fail "unpinned routes were not ordered by latency when stats were absent"
+    pass "cached route health orders exports by pinned route, then latency when stats are absent"
+}
+
+test_route_monitor_default_and_hard_cap_are_wide_but_bounded() {
+    reset_runtime_paths
+    ROUTE_MONITOR_MAX_CANDIDATES=""
+    [[ "$(route_monitor_max_candidates)" == "24" ]] || fail "empty route monitor max did not default to 24"
+
+    ROUTE_MONITOR_MAX_CANDIDATES=0
+    [[ "$(route_monitor_max_candidates)" == "24" ]] || fail "zero route monitor max did not default to 24"
+
+    ROUTE_MONITOR_MAX_CANDIDATES=12
+    [[ "$(route_monitor_max_candidates)" == "12" ]] || fail "valid route monitor max was not honored"
+
+    ROUTE_MONITOR_MAX_CANDIDATES=99
+    [[ "$(route_monitor_max_candidates)" == "32" ]] || fail "route monitor max was not hard-capped at 32"
+
+    pass "route monitor scans enough candidates for 20 exports while staying bounded"
 }
 
 test_blacklisted_route_is_excluded_from_cached_exports() {
@@ -170,6 +208,9 @@ test_manual_route_candidates_are_validated_and_resettable() {
     cat > "$ROUTE_HEALTH_FILE" <<'EOF'
 2026-05-30T00:00:00Z	20.0.0.9	200	40	true
 EOF
+    cat > "$ROUTE_STATS_FILE" <<'EOF'
+20.0.0.9	1	1	0	40	40	40	40	200	true	2026-05-30T00:00:00Z
+EOF
     cat > "$LAST_GOOD_ROUTE_FILE" <<'EOF'
 ip=20.0.0.9
 http_status=200
@@ -182,6 +223,7 @@ EOF
     [[ "$(cat "$PINNED_ROUTE_FILE" 2>/dev/null)" == "20.0.0.9" ]] || fail "cache reset removed pinned route preference"
     grep -Fxq "20.0.0.2" "$BLACKLISTED_ROUTE_CANDIDATES_FILE" || fail "cache reset removed blacklist preferences"
     [[ ! -e "$ROUTE_HEALTH_FILE" ]] || fail "route health cache was not reset"
+    [[ ! -e "$ROUTE_STATS_FILE" ]] || fail "route stats cache was not reset"
     [[ ! -e "$LAST_GOOD_ROUTE_FILE" ]] || fail "last-good route cache was not reset"
     reset_route_candidate_state
     [[ ! -e "$MANUAL_ROUTE_CANDIDATES_FILE" ]] || fail "manual route file was not reset"
@@ -638,8 +680,10 @@ test_support_bundle_marks_unreadable_optional_logs() {
 
 test_port_visibility_is_throttled
 test_port_visibility_cache_is_scoped_by_codespace_and_port
-test_cached_route_order_prefers_last_good_then_latency
-test_cached_route_order_prefers_pinned_route_before_last_good
+test_cached_route_order_uses_reliability_then_average_latency
+test_route_candidate_stats_track_average_and_success_rate
+test_cached_route_order_prefers_pinned_route_then_latency_without_stats
+test_route_monitor_default_and_hard_cap_are_wide_but_bounded
 test_blacklisted_route_is_excluded_from_cached_exports
 test_manual_route_candidates_are_validated_and_resettable
 test_route_preference_write_failures_return_failure

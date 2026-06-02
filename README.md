@@ -112,8 +112,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_QR_MODE` **(Optional)** — Controls QR display in the config view: `recommended` (default), `all`, or `none`.
 - `G2RAY_EXTRA_FALLBACK_IPS` **(Optional)** — Adds comma-, semicolon-, or space-separated IP fallback candidates before auto-detected ones.
 - `G2RAY_DEFAULT_FALLBACK_IPS` **(Optional)** — Replaces the built-in fallback IP candidate list.
-- `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported IP fallback links. Default: `3`.
-- `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `8`, hard-capped at `12`.
+- `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported usable IP fallback links. Default: `20`.
+- `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `24`, hard-capped at `32`.
 - `G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES` **(Optional)** — Caps live fallback route probes in option `14) Diagnostics`. Default: `12`.
 - `G2RAY_ROUTE_HEALTH_TTL_SEC` **(Optional)** — Seconds cached route health can be reused to order exported configs before refreshing. Default: `300`.
 - `G2RAY_PORT_PUBLIC_TTL_SEC` **(Optional)** — Seconds to trust the last successful `gh codespace ports visibility 443:public` call before calling GitHub again. Default: `300`.
@@ -128,6 +128,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_QUOTA_SECONDS` **(Optional)** — Local monthly quota estimate in seconds. Default: `216000` (60 wall-clock hours on a 2-core Codespace).
 
 Generated links include `allowInsecure=1` for compatibility with IP fallback links that still route through the Codespaces SNI/Host. This is a compatibility tradeoff: clients that honor the flag may relax TLS certificate verification.
+
+By default the panel can export up to 20 usable IP fallback configs plus the domain config, ordered by rolling route health: success ratio, average successful XHTTP latency, and latest XHTTP latency. These numbers are `OPTIONS` probes against the Codespaces XHTTP route, not ICMP ping or full throughput tests. If GitHub/DNS exposes fewer healthy unique edge routes, the panel exports fewer rather than duplicating weak or unusable routes.
 
 The panel saves high-resolution QR PNG files under `data/qr/` for the displayed configs. If a phone QR scanner struggles with the terminal QR preview, open the PNG in VS Code/browser, import the copy-ready link from the panel output, or use `configs-to-copy-for-mobile.txt`. Terminal zoom, font rendering, and dark themes can make dense QR codes harder to scan.
 
@@ -208,7 +210,7 @@ bash ./g2ray.sh --support-bundle
 
 `--recover-now --json` runs the same soft recovery path but prints a machine-readable result with `status`, `route_ready`, `edge_probe`, and `next_action` fields. It is for automation already running inside the Codespace after the Codespace has been started or attached. External VPS automation cannot run this command inside a stopped Codespace; use the Cloudflare Worker wake endpoint or GitHub Codespaces API first, then use this command from inside the Codespace if local route recovery is still needed.
 
-`--support-bundle` creates a redacted `.tar.gz` support bundle under `logs/`. It includes doctor JSON, diagnostics, structured event logs, route health, route-settling history, and Xray logs while redacting VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets.
+`--support-bundle` creates a redacted `.tar.gz` support bundle under `logs/`. It includes doctor JSON, diagnostics, structured event logs, route health, rolling route stats, route-settling history, and Xray logs while redacting VLESS links, UUIDs, bearer tokens, GitHub tokens, and wake secrets.
 
 After `git pull`, reattach the panel or run:
 
@@ -222,7 +224,7 @@ Persistent logs are written to `logs/g2ray.log`, `logs/g2ray-events.jsonl`, and 
 
 Option `16) Live Monitor` is a foreground status screen for intentional terminal monitoring. It refreshes engine state, local/edge XHTTP probes, supervisor heartbeat, self-heal counters, route-settling history, best route candidates, and recent events without restarting Xray.
 
-Option `17) Route Candidates` opens the Route Candidates manager. It shows measured route IPs, lets you add a manual IPv4 candidate, pin a preferred route, blacklist a bad route, unblacklist/remove entries, reset measured route health without wiping preferences, explicitly reset all route preferences, and refresh exports. Use this only for specific edge IPs you have measured; it does not scan broad Azure/GitHub ranges.
+Option `17) Route Candidates` opens the Route Candidates manager. It shows measured route IPs with last latency, rolling average latency, and success ratio; lets you add a manual IPv4 candidate, pin a preferred route, blacklist a bad route, unblacklist/remove entries, reset measured route health without wiping preferences, explicitly reset all route preferences, and refresh exports. Use this only for specific edge IPs you have measured; it does not scan broad Azure/GitHub ranges.
 
 On first setup, the panel shows a small recovery card so you can copy these recovery commands safely: `bash ./g2ray.sh --doctor-json`, `bash ./g2ray.sh --recover-now`, `bash ./g2ray.sh --recover-now --json`, `bash ./g2ray.sh --support-bundle`, and, when a Worker is configured, a curl template using `Authorization: Bearer <WAKE_SECRET>`. The raw wake secret is never printed from saved metadata.
 

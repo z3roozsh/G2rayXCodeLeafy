@@ -26,6 +26,7 @@ ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
 EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
+ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
 LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
 PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
 MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -49,9 +50,9 @@ XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
 [[ "$XRAY_PORT" =~ ^[0-9]+$ && "$XRAY_PORT" -gt 0 && "$XRAY_PORT" -le 65535 ]] || XRAY_PORT=443
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
-DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
-MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
-ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-8}"
+DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.69.79.91 20.85.77.48 20.120.56.11 20.125.70.28 20.90.66.7 20.103.221.187 20.207.70.99}"
+MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-20}"
+ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-24}"
 DIAGNOSTIC_MAX_FALLBACK_PROBES="${G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES:-12}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
@@ -506,7 +507,7 @@ reset_route_candidate_state() {
 }
 
 reset_route_candidate_cache() {
-    rm -f "$ROUTE_HEALTH_FILE" "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true
+    rm -f "$ROUTE_HEALTH_FILE" "$ROUTE_STATS_FILE" "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true
     log_event INFO "route_candidate cache_reset"
 }
 
@@ -1886,9 +1887,63 @@ generate_domain_link() {
 
 route_monitor_max_candidates() {
     local max="$ROUTE_MONITOR_MAX_CANDIDATES"
-    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=8
-    (( max > 12 )) && max=12
+    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=24
+    (( max > 32 )) && max=32
     printf '%s' "$max"
+}
+
+update_route_candidate_stats() {
+    local ip="$1" code="${2:-0}" ms="${3:-0}" usable=false checked tmp
+    valid_ipv4 "$ip" || return 0
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
+    [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
+    xhttp_status_usable "$code" && usable=true
+    checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+    mkdir -p "$DATA_DIR" 2>/dev/null || true
+    [[ -f "$ROUTE_STATS_FILE" ]] || : > "$ROUTE_STATS_FILE"
+    tmp=$(mktemp "$DATA_DIR/route_stats.XXXXXX") || return 1
+    awk -F '\t' -v OFS='\t' \
+        -v target="$ip" -v code="$code" -v ms="$ms" -v usable="$usable" -v checked="$checked" '
+        function emit(ip, samples, successes, failures, avg, min, max, last_ms, last_code, last_usable, last_checked) {
+            if (samples < 1) samples = 1
+            printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+                ip, samples, successes, failures, avg, min, max,
+                last_ms, last_code, last_usable, last_checked
+        }
+        $1 == target {
+            found = 1
+            samples = ($2 ~ /^[0-9]+$/) ? $2 + 1 : 1
+            successes = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
+            failures = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 0
+            avg = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
+            min = ($6 ~ /^[0-9]+$/) ? $6 + 0 : 0
+            max = ($7 ~ /^[0-9]+$/) ? $7 + 0 : 0
+            if (usable == "true") {
+                successes += 1
+                avg = (successes == 1) ? ms : int((((avg * (successes - 1)) + ms) / successes) + 0.5)
+                min = (min == 0 || ms < min) ? ms : min
+                max = (ms > max) ? ms : max
+            } else {
+                failures += 1
+            }
+            emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked)
+            next
+        }
+        NF >= 1 { print }
+        END {
+            if (!found) {
+                samples = 1
+                successes = (usable == "true") ? 1 : 0
+                failures = (usable == "true") ? 0 : 1
+                avg = (usable == "true") ? ms : 0
+                min = (usable == "true") ? ms : 0
+                max = (usable == "true") ? ms : 0
+                emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked)
+            }
+        }
+    ' "$ROUTE_STATS_FILE" 2>/dev/null > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$ROUTE_STATS_FILE" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$ROUTE_STATS_FILE" 2>/dev/null || true
 }
 
 record_route_candidate_health() {
@@ -1897,6 +1952,7 @@ record_route_candidate_health() {
     xhttp_status_usable "$code" && usable=true
     printf '%s\t%s\t%s\t%s\t%s\n' \
         "$checked" "$ip" "${code:-0}" "${ms:-0}" "$usable" >> "${route_health_tmp:-$ROUTE_HEALTH_FILE}"
+    update_route_candidate_stats "$ip" "$code" "$ms" || true
 }
 
 save_last_good_route() {
@@ -1970,19 +2026,36 @@ route_health_cache_fresh() {
 
 cached_usable_fallback_ips() {
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
-    local last_good pinned
+    local last_good pinned stats_input
     pinned=$(pinned_route_value)
     last_good=$(last_good_route_value)
-    awk -F '\t' -v pinned="$pinned" -v last_good="$last_good" '
-        NF >= 5 && $5 == "true" {
-            latency = ($4 ~ /^[0-9]+$/) ? $4 : 99999999
-            if ($2 == pinned) preferred = 0
-            else if ($2 == last_good) preferred = 1
-            else preferred = 2
-            printf "%d\t%08d\t%s\t%s\t%s\n", preferred, latency, $2, $3, $4
+    stats_input="$ROUTE_STATS_FILE"
+    [[ -s "$stats_input" ]] || stats_input="/dev/null"
+    awk -F '\t' -v pinned="$pinned" -v last_good="$last_good" -v stats_file="$stats_input" '
+        FILENAME == stats_file {
+            if (NF >= 11) {
+                samples[$1] = ($2 ~ /^[0-9]+$/) ? $2 + 0 : 0
+                successes[$1] = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
+                avg[$1] = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
+                latest[$1] = ($8 ~ /^[0-9]+$/) ? $8 + 0 : 0
+            }
+            next
         }
-    ' "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n \
-        | while IFS=$'\t' read -r _preferred _latency ip _code _ms; do
+        NF >= 5 && $5 == "true" {
+            ip = $2
+            latency = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 99999999
+            total = ((ip in samples) && samples[ip] > 0) ? samples[ip] : 1
+            ok = (ip in successes) ? successes[ip] : 1
+            success_penalty = int(((total - ok) * 1000) / total)
+            avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
+            last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
+            pinned_rank = (ip == pinned) ? 0 : 1
+            last_good_rank = (ip == last_good) ? 0 : 1
+            printf "%d\t%04d\t%08d\t%08d\t%d\t%s\t%s\t%s\n",
+                pinned_rank, success_penalty, avg_ms, last_ms, last_good_rank, ip, $3, $4
+        }
+    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
+        | while IFS=$'\t' read -r _pinned _success _avg _latest _last_good ip _code _ms; do
             valid_ipv4 "$ip" || continue
             candidate_blacklisted "$ip" && continue
             printf '%s\n' "$ip"
@@ -1990,7 +2063,7 @@ cached_usable_fallback_ips() {
 }
 
 route_candidate_health_summary() {
-    local pinned
+    local pinned stats_input
     pinned=$(pinned_route_value)
     printf 'Pinned route : %s\n' "${pinned:-none}"
     if [[ ! -s "$ROUTE_HEALTH_FILE" ]]; then
@@ -2002,16 +2075,36 @@ route_candidate_health_summary() {
     local last
     last=$(awk -F '\t' 'END{print $1}' "$ROUTE_HEALTH_FILE" 2>/dev/null)
     printf 'Last refresh : %s\n' "${last:-unknown}"
-    printf 'Candidates   : best usable routes first\n'
-    awk -F '\t' '
-        NF >= 5 {
-            rank = ($5 == "true") ? 0 : 1
-            latency = ($4 ~ /^[0-9]+$/) ? $4 : 99999999
-            line = sprintf("%-15s HTTP %-3s %4sms usable=%s", $2, $3, $4, $5)
-            printf "%d\t%08d\t%s\t%s\n", rank, latency, $2, line
+    printf 'Candidates   : pinned first, then best reliable usable routes\n'
+    stats_input="$ROUTE_STATS_FILE"
+    [[ -s "$stats_input" ]] || stats_input="/dev/null"
+    awk -F '\t' -v pinned="$pinned" -v stats_file="$stats_input" '
+        FILENAME == stats_file {
+            if (NF >= 11) {
+                samples[$1] = ($2 ~ /^[0-9]+$/) ? $2 + 0 : 0
+                successes[$1] = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
+                avg[$1] = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
+                latest[$1] = ($8 ~ /^[0-9]+$/) ? $8 + 0 : 0
+            }
+            next
         }
-    ' "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n \
-        | while IFS=$'\t' read -r _rank _latency ip line; do
+        NF >= 5 {
+            ip = $2
+            usable_rank = ($5 == "true") ? 0 : 1
+            latency = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 99999999
+            total = ((ip in samples) && samples[ip] > 0) ? samples[ip] : 1
+            ok = (ip in successes) ? successes[ip] : (($5 == "true") ? 1 : 0)
+            success_penalty = int(((total - ok) * 1000) / total)
+            avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
+            last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
+            pinned_rank = (ip == pinned) ? 0 : 1
+            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s usable=%s",
+                ip, $3, last_ms, avg_ms, ok, total, $5)
+            printf "%d\t%d\t%04d\t%08d\t%08d\t%s\t%s\n",
+                pinned_rank, usable_rank, success_penalty, avg_ms, last_ms, ip, line
+        }
+    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
+        | while IFS=$'\t' read -r _pinned _usable _success _avg _latest ip line; do
             candidate_blacklisted "$ip" && continue
             printf '%s\n' "$line"
         done
@@ -2061,6 +2154,7 @@ show_route_candidate_manager() {
                 echo -ne "  ${GREEN}IPv4 to pin:${NC} "
                 read -r ip || continue
                 if pin_route_candidate "$ip"; then
+                    refresh_route_candidate_health >/dev/null 2>&1 || true
                     refresh_config_exports >/dev/null 2>&1 || true
                     echo -e "  ${GREEN}Pinned preferred route.${NC}"
                 else
@@ -2191,6 +2285,7 @@ usable_fallback_ips() {
         [[ -n "$ip" ]] || continue
         candidate_blacklisted "$ip" && continue
         read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
+        update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" || true
         if xhttp_status_usable "$ip_probe"; then
             printf '%s\n' "$ip"
             save_last_good_route "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe"
@@ -2413,6 +2508,7 @@ create_support_bundle() {
     copy_redacted_log_family "$LOG_DIR/xray.log" "$tmp/logs/xray.log"
     copy_redacted_log_family "$LOG_DIR/xray-error.log" "$tmp/logs/xray-error.log"
     copy_redacted_file "$ROUTE_HEALTH_FILE" "$tmp/state/route_candidate_health.tsv"
+    copy_redacted_file "$ROUTE_STATS_FILE" "$tmp/state/route_candidate_stats.tsv"
     copy_redacted_file "$LAST_GOOD_ROUTE_FILE" "$tmp/state/last_good_route.txt"
     copy_redacted_file "$ROUTE_SETTLING_HISTORY_FILE" "$tmp/state/route_settling_history.tsv"
     copy_redacted_file "$PINNED_ROUTE_FILE" "$tmp/state/pinned_route.txt"

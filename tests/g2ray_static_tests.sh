@@ -241,10 +241,10 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'script does not allow manually supplied fallback IPs'
     grep_fixed 'DEFAULT_FALLBACK_IPS=' "$SCRIPT" \
         || fail 'script does not provide built-in fallback IPs for DNS-blocked networks'
-    grep_fixed '20.85.77.48 20.207.70.99 20.120.56.11' "$SCRIPT" \
-        || fail 'built-in fallback IPs do not prefer the current East US tunnel edges before the historical fallback'
-    grep_fixed '20.120.56.11' "$SCRIPT" \
-        || fail 'script does not include the historically working East US tunnel IP'
+    for ip in 20.69.79.91 20.85.77.48 20.120.56.11 20.125.70.28 20.90.66.7 20.103.221.187 20.207.70.99; do
+        grep_fixed "$ip" "$SCRIPT" \
+            || fail "script does not include observed Codespaces fallback IP $ip"
+    done
     grep_fixed 'dns.google/resolve' "$SCRIPT" \
         || fail 'script does not query Google DNS-over-HTTPS for fallback IPs'
     grep_fixed 'cloudflare-dns.com/dns-query' "$SCRIPT" \
@@ -807,8 +807,12 @@ test_worker_rate_limits_and_classifies_github_errors() {
 test_route_candidate_monitor_is_bounded() {
     grep_fixed 'ROUTE_HEALTH_FILE=' "$SCRIPT" \
         || fail 'route candidate monitor has no bounded health cache file'
+    grep_fixed 'ROUTE_STATS_FILE=' "$SCRIPT" \
+        || fail 'route candidate monitor has no rolling stats file'
     grep_fixed 'ROUTE_MONITOR_MAX_CANDIDATES=' "$SCRIPT" \
         || fail 'route candidate monitor does not cap candidate probes'
+    grep_fixed 'update_route_candidate_stats()' "$SCRIPT" \
+        || fail 'route candidate monitor cannot maintain rolling averages'
     grep_fixed 'refresh_route_candidate_health()' "$SCRIPT" \
         || fail 'route candidate monitor cannot refresh candidate health'
     grep_fixed 'route_candidate_health_summary()' "$SCRIPT" \
@@ -817,6 +821,12 @@ test_route_candidate_monitor_is_bounded() {
         || fail 'previously measured route candidates are not reused across resolver refreshes'
     grep_fixed 'record_route_candidate_health "$ip" "$ip_probe" "$ip_ms"' "$SCRIPT" \
         || fail 'route candidate monitor does not persist per-candidate probe results'
+    grep_fixed 'update_route_candidate_stats "$ip" "$code" "$ms"' "$SCRIPT" \
+        || fail 'route candidate probes do not update rolling route stats'
+    grep_fixed 'success=' "$SCRIPT" \
+        || fail 'route candidate diagnostics do not show route reliability'
+    grep_fixed 'avg=' "$SCRIPT" \
+        || fail 'route candidate diagnostics do not show average latency'
     grep_fixed 'refresh_route_candidate_health >/dev/null 2>&1 || true' "$SCRIPT" \
         || fail 'background supervisor does not refresh route candidate health'
     grep_fixed 'route_candidate_health_summary | sed' "$SCRIPT" \
@@ -872,6 +882,13 @@ test_route_candidate_manager_and_live_monitor_are_present() {
         || fail 'manual route additions do not report persistence failures'
     grep_fixed '_atomic_write "$PINNED_ROUTE_FILE" "$ip" || return 1' "$SCRIPT" \
         || fail 'pinned routes do not report persistence failures'
+    awk '
+        /if pin_route_candidate "\$ip"; then/ {in_pin=1; next}
+        in_pin && /else/ {in_pin=0}
+        in_pin && /refresh_route_candidate_health >\/dev\/null 2>&1 \|\| true/ {saw_refresh=1}
+        in_pin && /refresh_config_exports >\/dev\/null 2>&1 \|\| true/ && saw_refresh {saw_export_after_refresh=1}
+        END {exit !(saw_refresh && saw_export_after_refresh)}
+    ' "$SCRIPT" || fail 'pinning a preferred route does not refresh route health before exports'
     grep_fixed 'append_unique_route "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
         || fail 'blacklisted route additions do not report persistence failures'
     grep_fixed 'remove_route_from_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
@@ -932,6 +949,8 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'last-good route save helper is missing'
     grep_fixed 'cached_usable_fallback_ips()' "$SCRIPT" \
         || fail 'exports cannot use cached route health'
+    grep_fixed 'ROUTE_STATS_FILE' "$SCRIPT" \
+        || fail 'exports cannot use rolling route stats'
     grep_fixed 'route_health_cache_fresh()' "$SCRIPT" \
         || fail 'route health cache has no freshness guard'
     grep_fixed 'Route Settling History' "$SCRIPT" \
@@ -1254,10 +1273,20 @@ test_logs_are_bounded_and_quota_is_cycle_aware() {
 test_fallback_link_count_is_capped() {
     grep_fixed 'MAX_FALLBACK_LINKS=' "$SCRIPT" \
         || fail 'fallback link cap is not configurable'
+    grep_fixed 'MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-20}"' "$SCRIPT" \
+        || fail 'fallback link default is not 20 exported IP routes'
+    grep_fixed 'ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-24}"' "$SCRIPT" \
+        || fail 'route monitor default does not scan enough candidates for 20 exports'
+    grep_fixed '(( max > 32 )) && max=32' "$SCRIPT" \
+        || fail 'route monitor hard cap is not bounded at 32 candidates'
     grep_fixed '(( index > max_links )) && break' "$SCRIPT" \
         || fail 'fallback link generation does not cap weak extra routes'
     grep_fixed 'G2RAY_MAX_FALLBACK_LINKS' "$README" \
         || fail 'README does not document the fallback link cap'
+    grep_fixed 'Default: `20`' "$README" \
+        || fail 'README does not document 20 exported fallback links by default'
+    grep_fixed 'Default: `24`, hard-capped at `32`' "$README" \
+        || fail 'README does not document the widened bounded route scanner default'
     pass 'fallback link count is capped and documented'
 }
 
