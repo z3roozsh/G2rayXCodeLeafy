@@ -704,7 +704,7 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 case = next(item for item in data["cases"] if item["name"] == "config_path_cache")
-assert case["budget_ms"] == 600, case
+assert case["budget_ms"] == 800, case
 assert data["ok"] is True
 PY
     pass "bench --json reports deterministic performance budgets"

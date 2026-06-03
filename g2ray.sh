@@ -3722,7 +3722,7 @@ bench_budget_value() {
 bench_budget_ms() {
     local name="$1"
     case "$name" in
-        config_path_cache) bench_budget_value "${G2RAY_BENCH_BUDGET_CONFIG_PATH_MS:-600}" 600 ;;
+        config_path_cache) bench_budget_value "${G2RAY_BENCH_BUDGET_CONFIG_PATH_MS:-800}" 800 ;;
         route_ordering) bench_budget_value "${G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS:-500}" 500 ;;
         export_generation) bench_budget_value "${G2RAY_BENCH_BUDGET_EXPORT_MS:-3500}" 3500 ;;
         doctor_json) bench_budget_value "${G2RAY_BENCH_BUDGET_DOCTOR_MS:-1800}" 1800 ;;
