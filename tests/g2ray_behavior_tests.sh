@@ -29,6 +29,7 @@ reset_runtime_paths() {
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
     ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
     ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+    DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
@@ -59,6 +60,7 @@ reset_runtime_paths() {
     MAX_FALLBACK_LINKS=20
     ROUTE_MONITOR_MAX_CANDIDATES=24
     ROUTE_HEALTH_TTL_SEC=300
+    DNS_CACHE_TTL_SEC=300
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
     unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
@@ -370,6 +372,7 @@ latency_ms=40
 source=test
 checked_at=2026-05-30T00:00:00Z
 EOF
+    printf '1780000000\tbehavior.example\tdns_google\t20.0.0.9\n' > "$DNS_CANDIDATE_CACHE_FILE"
     reset_route_candidate_cache
     grep -Fxq "20.0.0.9" "$MANUAL_ROUTE_CANDIDATES_FILE" || fail "cache reset removed manual route preferences"
     [[ "$(cat "$PINNED_ROUTE_FILE" 2>/dev/null)" == "20.0.0.9" ]] || fail "cache reset removed pinned route preference"
@@ -378,6 +381,7 @@ EOF
     [[ ! -e "$ROUTE_STATS_FILE" ]] || fail "route stats cache was not reset"
     [[ ! -e "$LAST_GOOD_ROUTE_FILE" ]] || fail "last-good route cache was not reset"
     [[ ! -e "$ROUTE_COOLDOWN_FILE" ]] || fail "route cooldown cache was not reset"
+    [[ ! -e "$DNS_CANDIDATE_CACHE_FILE" ]] || fail "DNS candidate cache was not reset"
     reset_route_candidate_state
     [[ ! -e "$MANUAL_ROUTE_CANDIDATES_FILE" ]] || fail "manual route file was not reset"
     [[ ! -e "$PINNED_ROUTE_FILE" ]] || fail "pinned route file was not reset"
@@ -476,6 +480,35 @@ EOF
     mapfile -t routes < <(resolve_domain_ips "")
     [[ "${routes[0]:-}" == "20.0.0.8" ]] || fail "cached route health was not reused as a resolver candidate"
     pass "cached route health keeps discovered candidates durable"
+}
+
+test_dns_candidate_cache_reuses_fresh_provider_results() {
+    (
+        reset_runtime_paths
+        DEFAULT_FALLBACK_IPS=""
+        G2RAY_EXTRA_FALLBACK_IPS=""
+        DNS_CACHE_TTL_SEC=300
+        dig() { return 1; }
+        getent() { return 1; }
+        curl_remote_ip() { return 0; }
+        local calls_file="$TMP_ROOT/dns-json-calls.txt"
+        : > "$calls_file"
+        json_dns_ips() {
+            printf 'call\n' >> "$calls_file"
+            printf '20.0.0.9\n'
+        }
+
+        mapfile -t rows < <(resolve_domain_ips_with_sources "behavior.example")
+        printf '%s\n' "${rows[@]}" | awk -F '\t' '$2 == "20.0.0.9" {found = 1} END {exit !found}' \
+            || fail "resolver did not use provider result: ${rows[*]:-none}"
+        [[ -s "$DNS_CANDIDATE_CACHE_FILE" ]] || fail "resolver did not write DNS candidate cache"
+
+        json_dns_ips() { fail "fresh DNS candidate cache did not suppress provider lookup"; }
+        mapfile -t rows < <(resolve_domain_ips_with_sources "behavior.example")
+        printf '%s\n' "${rows[@]}" | awk -F '\t' '$2 == "20.0.0.9" {found = 1} END {exit !found}' \
+            || fail "resolver did not reuse fresh DNS candidate cache: ${rows[*]:-none}"
+    )
+    pass "DNS candidate cache reuses fresh provider results"
 }
 
 test_last_known_state_scans_full_current_log() {
@@ -828,6 +861,7 @@ test_doctor_json_reports_probe_state() {
     CODESPACE_NAME="behavior-space"
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     XRAY_PORT=443
+    touch "$CONFIG_FILE"
     xray_running() { return 0; }
     is_port_open() { return 0; }
     xhttp_probe_metrics() {
@@ -841,6 +875,7 @@ test_doctor_json_reports_probe_state() {
     output="$(print_doctor_json)"
     grep -Fq '"codespace": "behavior-space"' <<< "$output" || fail "doctor json missing codespace"
     grep -Fq '"edge_probe": {"http_status": 404' <<< "$output" || fail "doctor json missing edge probe"
+    grep -Fq '"next_action_code": "wait_route_or_recover"' <<< "$output" || fail "doctor json missing actionable next_action_code"
     grep -Fq '"structured_log_file":' <<< "$output" || fail "doctor json missing structured log path"
     grep -Fq '"diagnostic_log_file":' <<< "$output" || fail "doctor json missing diagnostic log path"
     grep -Fq '"latency_focus": false' <<< "$output" || fail "doctor json missing latency focus state"
@@ -942,6 +977,7 @@ test_recover_now_json_reports_ready_contract() {
         grep -Fq '"status": "ready"' <<< "$output" || fail "recover_now_json did not report ready status"
         grep -Fq '"route_ready": true' <<< "$output" || fail "recover_now_json did not report route_ready=true"
         grep -Fq '"edge_probe": {"http_status": 200' <<< "$output" || fail "recover_now_json missing edge probe status"
+        grep -Fq '"next_action_code": "retry_vless_config"' <<< "$output" || fail "recover_now_json missing ready next_action_code"
     )
     pass "recover now json reports ready contract"
 }
@@ -970,7 +1006,8 @@ test_recover_now_json_reports_settling_contract() {
         grep -Fq '"ok": false' <<< "$output" || fail "recover_now_json did not report ok=false while settling"
         grep -Fq '"status": "settling"' <<< "$output" || fail "recover_now_json did not report settling status"
         grep -Fq '"route_ready": false' <<< "$output" || fail "recover_now_json did not report route_ready=false"
-        grep -Fq '"next_action": "Wait and retry health, or open the panel and run Recover Now if it stays stuck."' <<< "$output" \
+        grep -Fq '"next_action_code": "wait_route_or_recover"' <<< "$output" || fail "recover_now_json missing settling next_action_code"
+        grep -Fq '"next_action": "Wait for the Codespaces route to settle, or run Recover Now if it stays stuck."' <<< "$output" \
             || fail "recover_now_json missing settling next action"
     )
     pass "recover now json reports settling contract"
@@ -994,6 +1031,7 @@ test_recover_now_json_treats_followup_ready_probe_as_success() {
         grep -Fq '"status": "ready"' <<< "$output" || fail "follow-up ready recover_now_json did not report ready"
         grep -Fq '"exit_code": 0' <<< "$output" || fail "follow-up ready recover_now_json did not expose final exit_code=0"
         grep -Fq '"recover_exit_code": 1' <<< "$output" || fail "follow-up ready recover_now_json did not preserve recover_exit_code"
+        grep -Fq '"next_action_code": "retry_vless_config"' <<< "$output" || fail "follow-up ready recover_now_json missing next_action_code"
     )
     pass "recover now json treats follow-up ready probe as success"
 }
@@ -1253,6 +1291,7 @@ test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
+test_dns_candidate_cache_reuses_fresh_provider_results
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
 test_usable_fallback_ips_fills_partial_fresh_cache

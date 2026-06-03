@@ -118,6 +118,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_ROUTE_MONITOR_MAX_CANDIDATES` **(Optional)** — Caps cached candidate route probes shown in diagnostics. Default: `24`, hard-capped at `32`.
 - `G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES` **(Optional)** — Caps live fallback route probes in option `14) Diagnostics`. Default: `12`.
 - `G2RAY_ROUTE_HEALTH_TTL_SEC` **(Optional)** — Seconds cached route health can be reused to order exported configs before refreshing. Default: `300`.
+- `G2RAY_DNS_CACHE_TTL_SEC` **(Optional)** — Seconds DNS/provider-discovered route IP candidates stay cached before provider lookups run again. Default: `300`; set `0` to disable this DNS candidate cache.
 - `G2RAY_ROUTE_PROBE_CONCURRENCY` **(Optional)** — Maximum parallel route candidate probes during a route-health refresh. Default: `4`, hard-capped at `8`.
 - `G2RAY_ROUTE_FAILURE_COOLDOWN_SEC` **(Optional)** — Seconds to temporarily skip candidates that timed out or returned edge/origin errors. Default: `180`.
 - `G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC` **(Optional)** — Seconds a last-good route can break ties in exported config ordering. Default: `1800`; set `0` to disable last-good tie preference.

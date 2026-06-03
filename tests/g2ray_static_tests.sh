@@ -1023,6 +1023,18 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'last-good route save helper is missing'
     grep_fixed 'cached_usable_fallback_ips()' "$SCRIPT" \
         || fail 'exports cannot use cached route health'
+    grep_fixed 'DNS_CANDIDATE_CACHE_FILE=' "$SCRIPT" \
+        || fail 'DNS candidate cache file is not defined'
+    grep_fixed 'read_dns_candidate_cache "$domain"' "$SCRIPT" \
+        || fail 'resolver does not reuse fresh cached DNS candidates'
+    grep_fixed 'resolve_dns_provider_ips_with_sources "$domain"' "$SCRIPT" \
+        || fail 'resolver does not centralize DNS provider discovery'
+    grep_fixed 'pids+=("$!")' "$SCRIPT" \
+        || fail 'DNS provider discovery is not run with bounded parallel workers'
+    grep_fixed 'write_dns_candidate_cache "$domain" "$provider_rows"' "$SCRIPT" \
+        || fail 'resolver does not persist fresh DNS provider candidates'
+    grep_fixed '"next_action_code": "$(json_escape "$next_action_code")"' "$SCRIPT" \
+        || fail 'panel JSON outputs do not expose stable next_action_code values'
     grep_fixed 'ROUTE_STATS_FILE' "$SCRIPT" \
         || fail 'exports cannot use rolling route stats'
     grep_fixed 'route_health_cache_fresh()' "$SCRIPT" \
@@ -1387,6 +1399,8 @@ test_fallback_link_count_is_capped() {
         || fail 'fallback link generation does not cap weak extra routes'
     grep_fixed 'G2RAY_MAX_FALLBACK_LINKS' "$README" \
         || fail 'README does not document the fallback link cap'
+    grep_fixed 'G2RAY_DNS_CACHE_TTL_SEC' "$README" \
+        || fail 'README does not document the DNS candidate cache TTL'
     grep_fixed 'Default: `20`' "$README" \
         || fail 'README does not document 20 exported fallback links by default'
     grep_fixed 'Default: `24`, hard-capped at `32`' "$README" \

@@ -63,6 +63,7 @@ EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
 ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
 ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
 LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
@@ -104,6 +105,7 @@ FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
 ROUTE_READY_STABLE_PROBES="${G2RAY_ROUTE_READY_STABLE_PROBES:-2}"
 ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
+DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
 ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
 ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-4}"
 ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
@@ -118,6 +120,7 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$RUNTIME_LOCK_WAIT_ATTEMPTS" =~ ^[0-9]+$ && "$RUNTIME_LOCK_WAIT_ATTEMPTS" -ge 1 ]] || RUNTIME_LOCK_WAIT_ATTEMPTS=900
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
 [[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
+[[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
 [[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=4
 (( ROUTE_PROBE_CONCURRENCY > 8 )) && ROUTE_PROBE_CONCURRENCY=8
 
@@ -421,6 +424,72 @@ curl_remote_ip() {
     [[ "$ip" =~ ^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$ ]] && printf '%s\n' "$ip"
 }
 
+dns_cache_ttl_sec() {
+    [[ "${DNS_CACHE_TTL_SEC:-300}" =~ ^[0-9]+$ ]] && printf '%s' "$DNS_CACHE_TTL_SEC" || printf '300'
+}
+
+read_dns_candidate_cache() {
+    local domain="${1:-}" ttl now
+    [[ -n "$domain" && -s "$DNS_CANDIDATE_CACHE_FILE" ]] || return 1
+    ttl=$(dns_cache_ttl_sec)
+    (( ttl > 0 )) || return 1
+    now=$(date +%s)
+    awk -F '\t' -v domain="$domain" -v now="$now" -v ttl="$ttl" '
+        $2 == domain && $1 ~ /^[0-9]+$/ && now >= $1 && now - $1 <= ttl && $3 != "" && $4 != "" {
+            print $3 "\t" $4
+            found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$DNS_CANDIDATE_CACHE_FILE" 2>/dev/null
+}
+
+write_dns_candidate_cache() {
+    local domain="${1:-}" rows="${2:-}" ttl now tmp
+    [[ -n "$domain" && -n "$rows" ]] || return 0
+    ttl=$(dns_cache_ttl_sec)
+    (( ttl > 0 )) || return 0
+    mkdir -p "$(dirname "$DNS_CANDIDATE_CACHE_FILE")" 2>/dev/null || true
+    now=$(date +%s)
+    tmp=$(mktemp "${DNS_CANDIDATE_CACHE_FILE}.XXXXXX") || return 0
+    if [[ -s "$DNS_CANDIDATE_CACHE_FILE" ]]; then
+        awk -F '\t' -v domain="$domain" '$2 != domain {print}' "$DNS_CANDIDATE_CACHE_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r source ip; do
+        valid_ipv4 "$ip" || continue
+        printf '%s\t%s\t%s\t%s\n' "$now" "$domain" "${source:-unknown}" "$ip"
+    done >> "$tmp"
+    if [[ -s "$tmp" ]]; then
+        mv -f "$tmp" "$DNS_CANDIDATE_CACHE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+        chmod 600 "$DNS_CANDIDATE_CACHE_FILE" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
+resolve_dns_provider_ips_with_sources() {
+    local domain="${1:-}" tmpdir pids=()
+    [[ -n "$domain" ]] || return 0
+    tmpdir=$(mktemp -d "${DATA_DIR}/dns-resolve.XXXXXX" 2>/dev/null || mktemp -d)
+    if command -v dig >/dev/null 2>&1; then
+        (dig +short "$domain" A 2>/dev/null | awk 'NF {print "dig\t" $0}' > "$tmpdir/dig") &
+        pids+=("$!")
+    fi
+    (getent hosts "$domain" 2>/dev/null | awk '{print "getent\t" $1}' > "$tmpdir/getent") &
+    pids+=("$!")
+    ({ json_dns_ips "https://dns.google/resolve?name=${domain}&type=A" || true; } | awk 'NF {print "dns_google\t" $0}' > "$tmpdir/dns_google") &
+    pids+=("$!")
+    ({ json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_cloudflare\t" $0}' > "$tmpdir/dns_cloudflare") &
+    pids+=("$!")
+    ({ curl_remote_ip "$domain" || true; } | awk 'NF {print "remote_http\t" $0}' > "$tmpdir/remote_http") &
+    pids+=("$!")
+    local pid
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    cat "$tmpdir"/* 2>/dev/null || true
+    rm -rf "$tmpdir" 2>/dev/null || true
+}
+
 xhttp_config_path() {
     local cache_key cached_key cached_path path
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -496,6 +565,37 @@ xhttp_probe_status() {
 xhttp_status_usable() {
     local code="${1:-0}"
     [[ "$code" == "200" || "$code" == "400" ]]
+}
+
+panel_next_action_code() {
+    local engine="${1:-false}" listener="${2:-false}" edge_code="${3:-0}" config_present="${4:-true}"
+    if [[ "$config_present" != "true" ]]; then
+        printf 'generate_config'
+    elif xhttp_status_usable "$edge_code"; then
+        printf 'retry_vless_config'
+    elif [[ "$engine" != "true" ]]; then
+        printf 'start_engine'
+    elif [[ "$listener" != "true" ]]; then
+        printf 'restart_engine'
+    elif [[ "$edge_code" == "404" ]]; then
+        printf 'wait_route_or_recover'
+    elif [[ "$edge_code" == "0" || "$edge_code" == "000" ]]; then
+        printf 'check_dns_or_ports'
+    else
+        printf 'open_diagnostics'
+    fi
+}
+
+panel_next_action_text() {
+    case "${1:-open_diagnostics}" in
+        generate_config) printf 'Generate a config and start the engine.' ;;
+        start_engine) printf 'Start the Xray engine, then check the route again.' ;;
+        restart_engine) printf 'Restart the engine so the listener opens on the configured port.' ;;
+        retry_vless_config) printf 'Try the same VLESS config again.' ;;
+        wait_route_or_recover) printf 'Wait for the Codespaces route to settle, or run Recover Now if it stays stuck.' ;;
+        check_dns_or_ports) printf 'Check DNS, GitHub port visibility, and the Codespaces Ports tab.' ;;
+        *) printf 'Open diagnostics and inspect the support bundle logs.' ;;
+    esac
 }
 
 increment_route_bad_count() {
@@ -735,7 +835,7 @@ reset_route_candidate_state() {
 }
 
 reset_route_candidate_cache() {
-    rm -f "$ROUTE_HEALTH_FILE" "$ROUTE_STATS_FILE" "$LAST_GOOD_ROUTE_FILE" "$ROUTE_COOLDOWN_FILE" 2>/dev/null || true
+    rm -f "$ROUTE_HEALTH_FILE" "$ROUTE_STATS_FILE" "$LAST_GOOD_ROUTE_FILE" "$ROUTE_COOLDOWN_FILE" "$DNS_CANDIDATE_CACHE_FILE" 2>/dev/null || true
     log_event INFO "route_candidate cache_reset"
 }
 
@@ -758,7 +858,14 @@ route_candidate_state_summary() {
 }
 
 resolve_domain_ips_with_sources() {
-    local domain="$1" candidates
+    local domain="$1" candidates provider_rows
+    if [[ -n "$domain" ]]; then
+        provider_rows=$(read_dns_candidate_cache "$domain" 2>/dev/null || true)
+        if [[ -z "$provider_rows" ]]; then
+            provider_rows=$(resolve_dns_provider_ips_with_sources "$domain" || true)
+            [[ -n "$provider_rows" ]] && write_dns_candidate_cache "$domain" "$provider_rows"
+        fi
+    fi
     candidates=$({
         pinned_route_value | awk 'NF {print "pinned\t" $0}'
         manual_route_candidates | awk 'NF {print "manual\t" $0}'
@@ -766,13 +873,7 @@ resolve_domain_ips_with_sources() {
         if [[ -n "${G2RAY_EXTRA_FALLBACK_IPS:-}" ]]; then
             printf '%s\n' "$G2RAY_EXTRA_FALLBACK_IPS" | tr ',; ' '\n' | awk 'NF {print "extra\t" $0}'
         fi
-        if command -v dig >/dev/null 2>&1; then
-            dig +short "$domain" A 2>/dev/null | awk 'NF {print "dig\t" $0}' || true
-        fi
-        getent hosts "$domain" 2>/dev/null | awk '{print "getent\t" $1}' || true
-        { json_dns_ips "https://dns.google/resolve?name=${domain}&type=A" || true; } | awk 'NF {print "dns_google\t" $0}'
-        { json_dns_ips "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_cloudflare\t" $0}'
-        { curl_remote_ip "$domain" || true; } | awk 'NF {print "remote_http\t" $0}'
+        [[ -n "${provider_rows:-}" ]] && printf '%s\n' "$provider_rows"
         printf '%s\n' "$DEFAULT_FALLBACK_IPS" | tr ',; ' '\n' | awk 'NF {print "builtin\t" $0}'
     } | while IFS=$'\t' read -r source ip; do
         valid_ipv4 "$ip" || continue
@@ -3202,6 +3303,7 @@ create_support_bundle() {
     copy_redacted_file "$ROUTE_HEALTH_FILE" "$tmp/state/route_candidate_health.tsv"
     copy_redacted_file "$ROUTE_STATS_FILE" "$tmp/state/route_candidate_stats.tsv"
     copy_redacted_file "$LAST_GOOD_ROUTE_FILE" "$tmp/state/last_good_route.txt"
+    copy_redacted_file "$DNS_CANDIDATE_CACHE_FILE" "$tmp/state/dns_candidate_cache.tsv"
     copy_redacted_file "$ROUTE_SETTLING_HISTORY_FILE" "$tmp/state/route_settling_history.tsv"
     copy_redacted_file "$PINNED_ROUTE_FILE" "$tmp/state/pinned_route.txt"
     copy_redacted_file "$MANUAL_ROUTE_CANDIDATES_FILE" "$tmp/state/manual_route_candidates.txt"
@@ -3472,7 +3574,7 @@ recover_now() {
 }
 
 recover_now_json() {
-    local recover_rc=0 rc=0 xcode=0 xms=0 route_ready=false engine=false listener=false status next_action ok_bool=false
+    local recover_rc=0 rc=0 xcode=0 xms=0 route_ready=false engine=false listener=false status next_action next_action_code ok_bool=false
     if recover_now --no-prompt >/dev/null 2>&1; then
         recover_rc=0
     else
@@ -3482,20 +3584,25 @@ recover_now_json() {
     if xhttp_status_usable "$xcode"; then
         route_ready=true
         status="ready"
-        next_action="Try the same VLESS config again."
         rc=0
     elif [[ "$xcode" == "404" ]]; then
         status="settling"
-        next_action="Wait and retry health, or open the panel and run Recover Now if it stays stuck."
         rc="$recover_rc"
     else
         status="failed"
-        next_action="Open diagnostics and inspect the support bundle logs."
         rc="$recover_rc"
     fi
     [[ "$route_ready" != true && "$rc" -eq 0 ]] && rc=1
     xray_running && engine=true
     is_port_open && listener=true
+    if [[ "$route_ready" == true ]]; then
+        next_action_code="retry_vless_config"
+    elif [[ "$xcode" == "404" ]]; then
+        next_action_code="wait_route_or_recover"
+    else
+        next_action_code=$(panel_next_action_code "$engine" "$listener" "$xcode" true)
+    fi
+    next_action=$(panel_next_action_text "$next_action_code")
     [[ "$route_ready" == true && "$rc" -eq 0 ]] && ok_bool=true
     log_event INFO "recover_now_json requested ok=${ok_bool} status=${status} route_ready=${route_ready} xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} rc=${rc} recover_rc=${recover_rc}"
     cat <<JSON
@@ -3508,6 +3615,7 @@ recover_now_json() {
   "edge_probe": {"http_status": ${xcode:-0}, "latency_ms": ${xms:-0}, "usable": $(xhttp_status_usable "$xcode" && printf true || printf false)},
   "exit_code": ${rc},
   "recover_exit_code": ${recover_rc},
+  "next_action_code": "$(json_escape "$next_action_code")",
   "next_action": "$(json_escape "$next_action")",
   "log_file": "$(json_escape "$LOG_FILE")",
   "structured_log_file": "$(json_escape "$STRUCTURED_LOG_FILE")",
@@ -3669,17 +3777,20 @@ ensure_runtime_ready() {
 }
 
 print_doctor_json() {
-    local engine=false listener=false local_probe=0 local_ms=0 edge_probe=0 edge_ms=0 supervisor last_good waker_url doctor_port
+    local engine=false listener=false local_probe=0 local_ms=0 edge_probe=0 edge_ms=0 supervisor last_good waker_url doctor_port config_present=false next_action_code next_action
     doctor_port="$XRAY_PORT"
     [[ "$doctor_port" =~ ^[0-9]+$ && "$doctor_port" -gt 0 && "$doctor_port" -le 65535 ]] || doctor_port=443
     xray_running && engine=true
     is_port_open && listener=true
+    [[ -f "$CONFIG_FILE" ]] && config_present=true
     read -r local_probe local_ms < <(xhttp_probe_metrics local)
     read -r edge_probe edge_ms < <(xhttp_probe_metrics external)
     supervisor=$(background_supervisor_status | tr '\r\n' ' ' | cut -c1-180)
     last_good=$(last_good_route_value)
     waker_url=$(waker_metadata_value worker_url)
-    log_event INFO "doctor_json requested engine=${engine} listener=${listener} edge_probe=${edge_probe:-0} edge_ms=${edge_ms:-0}"
+    next_action_code=$(panel_next_action_code "$engine" "$listener" "$edge_probe" "$config_present")
+    next_action=$(panel_next_action_text "$next_action_code")
+    log_event INFO "doctor_json requested engine=${engine} listener=${listener} edge_probe=${edge_probe:-0} edge_ms=${edge_ms:-0} next_action_code=${next_action_code}"
     cat <<JSON
 {
   "ok": true,
@@ -3688,9 +3799,11 @@ print_doctor_json() {
   "port": ${doctor_port},
   "engine_running": ${engine},
   "listener_open": ${listener},
-  "config_present": $([[ -f "$CONFIG_FILE" ]] && printf true || printf false),
+  "config_present": ${config_present},
   "local_probe": {"http_status": ${local_probe:-0}, "latency_ms": ${local_ms:-0}, "usable": $(xhttp_status_usable "$local_probe" && printf true || printf false)},
   "edge_probe": {"http_status": ${edge_probe:-0}, "latency_ms": ${edge_ms:-0}, "usable": $(xhttp_status_usable "$edge_probe" && printf true || printf false)},
+  "next_action_code": "$(json_escape "$next_action_code")",
+  "next_action": "$(json_escape "$next_action")",
   "supervisor": "$(json_escape "$supervisor")",
   "last_good_route": "$(json_escape "$last_good")",
   "waker_configured": $([[ -n "$waker_url" ]] && printf true || printf false),
@@ -3782,6 +3895,7 @@ bench_rebind_runtime_paths() {
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
     ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
     ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+    DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
