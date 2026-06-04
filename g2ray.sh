@@ -674,13 +674,13 @@ last_log_event_matching() {
 }
 
 last_known_state_summary() {
-    local failure repair export
+    local failure repair last_export
     failure=$(last_log_event_matching 'route_unusable|edge_unreachable|engine_not_ready|started_route_unusable|started_route_still_unusable|port_public_failed|launch_failed|timeout|failed')
     repair=$(last_log_event_matching 'route_repair public_ok|route_repair public_failed|force_reconnect verify_external|force_reconnect start_engine ok|restart_ok|started_route_ready|route_repaired|runtime_ready .*action=skip_reconnect')
-    export=$(last_log_event_matching 'config_exports refreshed|fallback_route_unusable|fallback_route_filter')
+    last_export=$(last_log_event_matching 'config_exports refreshed|fallback_route_unusable|fallback_route_filter')
     printf 'Last failure : %s\n' "$failure"
     printf 'Last repair  : %s\n' "$repair"
-    printf 'Last export  : %s\n' "$export"
+    printf 'Last export  : %s\n' "$last_export"
 }
 
 valid_ipv4() {
