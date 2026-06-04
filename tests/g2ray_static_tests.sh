@@ -427,6 +427,10 @@ test_runtime_control_paths_are_hardened() {
         || fail 'codespace detection does not validate candidate names'
     grep_fixed '[[ "$name" != "null" ]]' "$SCRIPT" \
         || fail 'codespace detection can accept literal null as a real name'
+    grep_fixed '/workspaces/.codespaces/shared/environment-variables.json' "$SCRIPT" \
+        || fail 'headless Codespace detection does not read the shared Codespaces environment file'
+    grep_fixed 'detect_codespace_name_from_waker_metadata' "$SCRIPT" \
+        || fail 'headless Codespace detection does not fall back to saved local metadata'
     grep_fixed 'xray_listener_ready()' "$SCRIPT" \
         || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
     grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \
@@ -1594,6 +1598,10 @@ test_docs_and_public_configs_are_consistent() {
 test_devcontainer_tooling_is_not_duplicated() {
     grep_fixed 'dnsutils' "$ROOT_DIR/.devcontainer/Dockerfile" \
         || fail 'Dockerfile does not install dnsutils for dig-based DNS resolution'
+    grep_fixed 'python-is-python3' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'Dockerfile does not provide python for the in-Codespace behavior test suite'
+    grep_fixed 'nodejs npm' "$ROOT_DIR/.devcontainer/Dockerfile" \
+        || fail 'Dockerfile does not provide Node/npm for Worker checks inside Codespace'
     if grep_fixed 'vnstat' "$ROOT_DIR/.devcontainer/Dockerfile"; then
         fail 'Dockerfile still installs unused vnstat'
     fi

@@ -8,6 +8,7 @@ LABEL maintainer="G2rayXCodeLeafy" \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash curl wget unzip ca-certificates sudo openssl uuid-runtime tmux tzdata \
         qrencode jq bc net-tools libcap2-bin iproute2 dnsutils \
+        python3 python-is-python3 nodejs npm \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN wget -qO xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \

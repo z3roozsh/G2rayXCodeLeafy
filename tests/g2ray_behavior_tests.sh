@@ -98,6 +98,47 @@ test_port_visibility_is_throttled() {
     pass "port visibility calls are throttled and forceable"
 }
 
+test_codespace_detection_uses_shared_environment_in_headless_ssh() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME=""
+        CODESPACE_ENV_JSON_FILE="$TMP_ROOT/shared-environment-variables.json"
+        CODESPACE_SHARED_ENV_FILE="$TMP_ROOT/missing-shared.env"
+        CONFIG_META_FILE="$TMP_ROOT/missing-configs-meta.json"
+        WAKER_METADATA_FILE="$DATA_DIR/missing-waker-metadata.txt"
+        PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
+        printf '{ "CODESPACE_NAME": "real-codespace-name-123" }\n' > "$CODESPACE_ENV_JSON_FILE"
+        run_gh() { return 1; }
+        hostname() { printf 'codespaces-container-hostname\n'; }
+
+        local detected
+        detected="$(_detect_codespace_name)"
+        [[ "$detected" == "real-codespace-name-123" ]] \
+            || fail "headless detection used '$detected' instead of Codespaces shared environment"
+    )
+    pass "codespace detection uses shared environment in headless SSH sessions"
+}
+
+test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME=""
+        CODESPACE_ENV_JSON_FILE="$TMP_ROOT/missing-shared-environment.json"
+        CODESPACE_SHARED_ENV_FILE="$TMP_ROOT/missing-shared.env"
+        CONFIG_META_FILE="$TMP_ROOT/missing-configs-meta.json"
+        PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
+        printf 'worker_url=https://example.invalid/wake\ncodespace_name=metadata-codespace-name\n' > "$WAKER_METADATA_FILE"
+        run_gh() { return 1; }
+        hostname() { printf 'codespaces-container-hostname\n'; }
+
+        local detected
+        detected="$(_detect_codespace_name)"
+        [[ "$detected" == "metadata-codespace-name" ]] \
+            || fail "headless detection used '$detected' instead of local waker metadata"
+    )
+    pass "codespace detection uses local metadata when gh is unauthenticated"
+}
+
 test_runtime_lock_serializes_operations_and_allows_reentry() {
     reset_runtime_paths
     RUNTIME_LOCK_WAIT_ATTEMPTS=1
@@ -1346,6 +1387,8 @@ test_support_bundle_marks_unreadable_optional_logs() {
 }
 
 test_port_visibility_is_throttled
+test_codespace_detection_uses_shared_environment_in_headless_ssh
+test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_cached_route_order_uses_reliability_then_average_latency

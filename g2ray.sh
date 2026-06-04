@@ -90,6 +90,8 @@ QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+CODESPACE_ENV_JSON_FILE="${G2RAY_CODESPACE_ENV_JSON_FILE:-/workspaces/.codespaces/shared/environment-variables.json}"
+CODESPACE_SHARED_ENV_FILE="${G2RAY_CODESPACE_SHARED_ENV_FILE:-/workspaces/.codespaces/shared/.env}"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
 [[ "$XRAY_PORT" =~ ^[0-9]+$ && "$XRAY_PORT" -gt 0 && "$XRAY_PORT" -le 65535 ]] || XRAY_PORT=443
@@ -357,10 +359,60 @@ file_fingerprint() {
     fi
 }
 
+detect_codespace_name_from_json_file() {
+    local file="$1" n
+    [[ -r "$file" ]] || return 1
+    n=$(sed -nE 's/.*"CODESPACE_NAME"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$file" 2>/dev/null | head -n 1)
+    [[ -n "$n" ]] || n=$(sed -nE 's/.*"codespace"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$file" 2>/dev/null | head -n 1)
+    valid_codespace_name "$n" || return 1
+    printf '%s' "$n"
+}
+
+detect_codespace_name_from_env_file() {
+    local file="$1" n
+    [[ -r "$file" ]] || return 1
+    n=$(sed -nE 's/^CODESPACE_NAME=(.*)$/\1/p' "$file" 2>/dev/null | head -n 1)
+    n="${n%\"}"; n="${n#\"}"
+    n="${n%\'}"; n="${n#\'}"
+    valid_codespace_name "$n" || return 1
+    printf '%s' "$n"
+}
+
+detect_codespace_name_from_waker_metadata() {
+    local n
+    [[ -r "$WAKER_METADATA_FILE" ]] || return 1
+    n=$(sed -nE 's/^codespace_name=(.+)$/\1/p' "$WAKER_METADATA_FILE" 2>/dev/null | head -n 1)
+    valid_codespace_name "$n" || return 1
+    printf '%s' "$n"
+}
+
+detect_codespace_name_from_port_stamp() {
+    local stamp n
+    for stamp in "$PORT_PUBLIC_STAMP_FILE".*."$XRAY_PORT"; do
+        [[ -e "$stamp" ]] || continue
+        n="${stamp#"$PORT_PUBLIC_STAMP_FILE".}"
+        n="${n%."$XRAY_PORT"}"
+        valid_codespace_name "$n" || continue
+        printf '%s' "$n"
+        return 0
+    done
+    return 1
+}
+
 _detect_codespace_name() {
     valid_codespace_name "${CODESPACE_NAME:-}" && { printf '%s' "$CODESPACE_NAME"; return; }
+    local n
+    n=$(detect_codespace_name_from_json_file "$CODESPACE_ENV_JSON_FILE" 2>/dev/null || true)
+    valid_codespace_name "$n" && { printf '%s' "$n"; return; }
+    n=$(detect_codespace_name_from_env_file "$CODESPACE_SHARED_ENV_FILE" 2>/dev/null || true)
+    valid_codespace_name "$n" && { printf '%s' "$n"; return; }
+    n=$(detect_codespace_name_from_waker_metadata 2>/dev/null || true)
+    valid_codespace_name "$n" && { printf '%s' "$n"; return; }
+    n=$(detect_codespace_name_from_json_file "$CONFIG_META_FILE" 2>/dev/null || true)
+    valid_codespace_name "$n" && { printf '%s' "$n"; return; }
+    n=$(detect_codespace_name_from_port_stamp 2>/dev/null || true)
+    valid_codespace_name "$n" && { printf '%s' "$n"; return; }
     if command -v gh >/dev/null 2>&1; then
-        local n
         n=$(run_gh codespace list --limit 1 --json name --jq '.[0].name // ""' 2>/dev/null || true)
         valid_codespace_name "$n" && { printf '%s' "$n"; return; }
         sleep 2
