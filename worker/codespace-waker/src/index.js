@@ -551,10 +551,9 @@ function githubFailureForResponse(res, body, codespaceName) {
       ok: false,
       status: res.status,
       codespace: codespaceName,
-      reason: "github_token_rejected_or_missing_scope",
+      reason: "github_forbidden",
       detail: githubErrorDetail(body),
-      token_warning: "GitHub token rejected or expired",
-      message: "GitHub token rejected or expired. Rotate the token or add the codespace scope."
+      message: "GitHub rejected the request with HTTP 403. Check GitHub policy, account access, token permissions, and organization restrictions."
     };
   }
 
@@ -759,6 +758,9 @@ function isCodespaceAvailable(status) {
 }
 
 function nextActionForWake(status, routeProbe) {
+  if (status.start_accepted && status.reason === "codespace_state_not_ready") {
+    return "GitHub accepted the start request. Wait for the Codespace to finish starting, then press Check Health again.";
+  }
   if (status.reason === "github_rate_limited" || status.reason === "github_secondary_rate_limited") {
     return "GitHub is throttling this token. Wait for the retry/reset window, then press Check Health or Start Codespace again.";
   }
@@ -767,6 +769,9 @@ function nextActionForWake(status, routeProbe) {
   }
   if (status.reason === "github_token_scope_missing") {
     return "Create a new classic GitHub token with the codespace scope, then update Worker secret GITHUB_TOKEN.";
+  }
+  if (status.reason === "github_forbidden") {
+    return "Check GitHub policy or access for this account and Codespace. Rotate the token only if GitHub says the token is invalid or missing the codespace scope.";
   }
   if (!status.ok) return "Open GitHub Codespaces or rotate the GitHub token, then try the Worker again.";
   if (!isCodespaceAvailable(status)) return "Wait for GitHub to finish starting the Codespace, then press Check Health.";
@@ -790,6 +795,12 @@ function nextActionCodeFor(status, routeProbe) {
   }
   if (status.reason === "github_token_rejected_or_missing_scope" || status.reason === "github_token_scope_missing") {
     return "rotate_github_token";
+  }
+  if (status.reason === "github_forbidden") {
+    return "check_github_policy_or_access";
+  }
+  if (status.start_accepted && status.reason === "codespace_state_not_ready") {
+    return "wait_codespace_available";
   }
   if (status.reason === "codespace_not_found_or_token_cannot_access_it" || Number(status.status) === 404) {
     return "codespace_missing_or_inaccessible";
@@ -824,7 +835,9 @@ function healthMessage(status, routeProbe) {
 }
 
 function eventFromResult(kind, codespace, data) {
-  const routeChecked = data.route_checked !== false;
+  const routeChecked = data.route_checked === false ? false : Boolean(data.route_probe);
+  const routeReady = routeChecked && data.route_ready != null ? data.route_ready === true : null;
+  const routeProbeDuration = data.route_probe ? data.route_probe.latency_ms : null;
   return {
     ts: new Date().toISOString(),
     kind,
@@ -833,9 +846,10 @@ function eventFromResult(kind, codespace, data) {
     github_status: data.status || null,
     state: data.state || null,
     route_checked: routeChecked,
-    route_ready: routeChecked && data.route_ready != null ? data.route_ready === true : null,
+    route_ready: routeReady,
     route_http_status: data.route_probe ? data.route_probe.http_status : null,
-    route_latency_ms: data.route_probe ? data.route_probe.latency_ms : null,
+    route_latency_ms: routeReady === true ? routeProbeDuration : null,
+    route_probe_duration_ms: routeProbeDuration,
     route_waited_ms: data.route_probe ? data.route_probe.waited_ms : null,
     route_attempts: data.route_probe ? data.route_probe.attempts : null,
     reason: data.reason || null,
@@ -1057,7 +1071,7 @@ async function handleQuotaSurvivalCron(controller, env) {
   }
 
   const nearReset = quotaCronNearReset(incident, now);
-  if (nearReset && !quotaCronWakeAllowed(incident)) {
+  if (nearReset && !quotaCronWakeAllowed(incident, now)) {
     if (resultNeedsCronStamp(incident, now)) {
       incident.last_cron_check_at = now.toISOString();
       await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(incident));
@@ -1079,8 +1093,13 @@ async function handleQuotaSurvivalCron(controller, env) {
   if (result.incident) {
     result.incident.last_cron_check_at = now.toISOString();
     if (nearReset) {
-      result.incident.last_cron_wake_at = now.toISOString();
-      result.incident.last_cron_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
+      if (quotaCronPostReset(incident, now)) {
+        result.incident.last_cron_post_reset_wake_at = now.toISOString();
+        result.incident.last_cron_post_reset_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
+      } else {
+        result.incident.last_cron_wake_at = now.toISOString();
+        result.incident.last_cron_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
+      }
     }
     await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(result.incident));
   }
@@ -1102,8 +1121,17 @@ function quotaCronNearReset(incident, now) {
   return now.getTime() >= reset - QUOTA_CRON_NEAR_RESET_WINDOW_MS;
 }
 
-function quotaCronWakeAllowed(incident) {
-  return incident.last_cron_wake_reset_estimate_utc !== incident.quota_reset_estimate_utc;
+function quotaCronPostReset(incident, now) {
+  const reset = Date.parse(incident.quota_reset_estimate_utc || "");
+  return Number.isFinite(reset) && now.getTime() >= reset;
+}
+
+function quotaCronWakeAllowed(incident, now) {
+  const resetEstimate = incident.quota_reset_estimate_utc || null;
+  if (quotaCronPostReset(incident, now)) {
+    return incident.last_cron_post_reset_wake_reset_estimate_utc !== resetEstimate;
+  }
+  return incident.last_cron_wake_reset_estimate_utc !== resetEstimate;
 }
 
 function resultNeedsCronStamp(incident, now) {

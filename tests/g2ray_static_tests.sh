@@ -1179,8 +1179,10 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'wizard/test flow does not use the safer bearer secret form'
     grep_fixed 'WAKER_TEST_TIMEOUT_SEC' "$SCRIPT" \
         || fail 'panel Worker test timeout is not configurable for long wake waits'
-    grep_fixed 'curl -sS -m "$WAKER_TEST_TIMEOUT_SEC"' "$SCRIPT" \
+    grep_fixed 'printf '\''max-time = "%s"\n'\'' "$WAKER_TEST_TIMEOUT_SEC"' "$SCRIPT" \
         || fail 'panel Worker test still uses a fixed short curl timeout'
+    grep_fixed 'curl --config "$curl_config"' "$SCRIPT" \
+        || fail 'panel Worker test exposes the wake secret through curl arguments'
     grep_fixed '.route_ready // empty' "$SCRIPT" \
         || fail 'panel Worker test does not show route_ready from the Worker response'
     grep_fixed '.route_probe.http_status // empty' "$SCRIPT" \

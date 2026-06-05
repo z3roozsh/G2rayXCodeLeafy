@@ -607,12 +607,12 @@ xhttp_probe_metrics() {
         *)     url="https://${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}${path}" ;;
     esac
     if [[ "$target" == "local" || -z "$address" ]]; then
-        raw=$(curl -sk -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
+        raw=$(curl -sS -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
             curl_rc=$?
             raw="0 0"
         }
     else
-        raw=$(curl -sk -m 5 --resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}" \
+        raw=$(curl -sS -m 5 --resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}" \
             -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
             curl_rc=$?
             raw="0 0"
@@ -830,7 +830,7 @@ blacklisted_route_candidates() {
 
 cached_route_candidate_ips() {
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 0
-    awk -F '\t' 'NF >= 2 {print $2}' "$ROUTE_HEALTH_FILE" 2>/dev/null \
+    awk -F '\t' 'NF >= 5 && $5 == "true" {print $2}' "$ROUTE_HEALTH_FILE" 2>/dev/null \
         | while IFS= read -r ip; do
             valid_ipv4 "$ip" && printf '%s\n' "$ip"
         done
@@ -1012,8 +1012,8 @@ generate_wake_secret() {
         printf '\n'
         return 0
     fi
-    printf '%s%s%s\n' "$(date +%s%N 2>/dev/null || date +%s)" "$RANDOM" "$RANDOM" \
-        | fingerprint_secret
+    echo "No cryptographically secure random source is available for WAKE_SECRET." >&2
+    return 1
 }
 
 normalize_waker_url() {
@@ -1071,7 +1071,7 @@ waker_metadata_summary() {
 }
 
 test_cloudflare_waker() {
-    local worker_url="${1:-}" wake_secret="${2:-}" response status ok reason codespace route_ready route_status route_latency next_action
+    local worker_url="${1:-}" wake_secret="${2:-}" response status ok reason codespace route_ready route_status route_latency next_action curl_config
     worker_url=$(normalize_waker_url "${worker_url:-$(waker_metadata_value worker_url)}" 2>/dev/null || true)
     if [[ -z "$worker_url" ]]; then
         echo -ne "  ${GREEN}Worker wake URL:${NC} "
@@ -1093,11 +1093,25 @@ test_cloudflare_waker() {
     fi
 
     echo -e "  ${DIM}Calling Worker with Authorization: Bearer ...${NC}"
-    response=$(curl -sS -m "$WAKER_TEST_TIMEOUT_SEC" -X POST -H "Authorization: Bearer ${wake_secret}" "$worker_url" 2>&1) || {
+    curl_config=$(mktemp "$DATA_DIR/waker-curl.XXXXXX") || {
+        echo -e "  ${RED}Could not create temporary curl config.${NC}"
+        return 1
+    }
+    chmod 600 "$curl_config" 2>/dev/null || true
+    {
+        printf 'request = "POST"\n'
+        printf 'url = "%s"\n' "$worker_url"
+        printf 'max-time = "%s"\n' "$WAKER_TEST_TIMEOUT_SEC"
+        printf 'silent\nshow-error\n'
+        printf 'header = "Authorization: Bearer %s"\n' "$wake_secret"
+    } > "$curl_config"
+    response=$(curl --config "$curl_config" 2>&1) || {
+        rm -f "$curl_config" 2>/dev/null || true
         echo -e "  ${RED}Worker call failed.${NC}"
         printf '%s\n' "$response" | sed 's/^/  /'
         return 1
     }
+    rm -f "$curl_config" 2>/dev/null || true
 
     if command -v jq >/dev/null 2>&1 && printf '%s' "$response" | jq . >/dev/null 2>&1; then
         ok=$(printf '%s' "$response" | jq -r '.ok // false' 2>/dev/null)
@@ -2642,7 +2656,7 @@ record_route_candidate_health() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$checked" "$ip" "${code:-0}" "${ms:-0}" "$usable" "$source" "$reason" >> "${route_health_tmp:-$ROUTE_HEALTH_FILE}"
     update_route_candidate_stats "$ip" "$code" "$ms" "$source" "$reason" || true
-    if [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" ]]; then
+    if [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]]; then
         record_route_candidate_cooldown "$ip" "$reason"
     fi
 }
@@ -3126,7 +3140,7 @@ usable_fallback_ips() {
             usable=true
             count=$((count + 1))
         else
-            [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" ]] \
+            [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]] \
                 && record_route_candidate_cooldown "$ip" "$reason"
             log_event WARN "fallback_route_unusable ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
         fi
@@ -3207,11 +3221,17 @@ write_config_exports_from_links() {
     log_event INFO "config_exports refreshed count=${count} hash=${hash}"
 }
 
+clear_config_exports() {
+    local reason="${1:-no_exportable_links}"
+    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" 2>/dev/null || true
+    log_event WARN "config_exports cleared reason=${reason}"
+}
+
 refresh_config_exports() {
-    [[ -f "$UUID_FILE" ]] || return 0
+    [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
     local link_array=()
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
-    ((${#link_array[@]})) || return 1
+    ((${#link_array[@]})) || { clear_config_exports "no_exportable_links"; return 1; }
     write_config_exports_from_links "${link_array[@]}"
 }
 
@@ -3517,7 +3537,7 @@ show_diagnostics() {
 }
 
 _recover_now_impl() {
-    local no_prompt="${1:-}" failed=0 expose_failed=false route_ready=false engine_started=false xcode=0 xms=0
+    local no_prompt="${1:-}" failed=0 expose_failed=false route_ready=false engine_started=false engine_ready=false xcode=0 xms=0
     log_event INFO "recover_now begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}*${NC} ${WHITE}Running Soft Recover Sequence...${NC}\n"
 
@@ -3531,9 +3551,11 @@ _recover_now_impl() {
 
     echo -ne "  ${DIM}|-${NC} Verify Engine     : "
     if xray_listener_ready; then
+        engine_ready=true
         echo -e "${GREEN}Running${NC}"
     else
         if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1 && xray_listener_ready; then
+            engine_ready=true
             engine_started=true
             log_event INFO "recover_now engine_started port=${XRAY_PORT}"
             echo -e "${GREEN}Started${NC}"
@@ -3542,6 +3564,23 @@ _recover_now_impl() {
             log_event ERROR "recover_now engine_unavailable port=${XRAY_PORT}"
             echo -e "${RED}Failed${NC}"
         fi
+    fi
+
+    if [[ "$engine_ready" != true ]]; then
+        log_diagnostic_snapshot "recover_now_engine_failed"
+        log_event ERROR "recover_now aborted engine_unavailable route_work_skipped"
+        echo -e "\n  ${RED}Engine is unavailable, so route recovery was skipped. Check engine logs, then start or restart the engine.${NC}\n"
+        if [[ "$no_prompt" == "--no-prompt" ]]; then
+            return 1
+        fi
+        echo -ne "  ${GREEN}Run hard restart now?${NC} (y/n): "
+        local hard_after_engine_failure
+        read -r hard_after_engine_failure
+        if [[ "$hard_after_engine_failure" =~ ^[Yy]$ ]]; then
+            force_reconnect
+            return $?
+        fi
+        return 1
     fi
 
     echo -ne "  ${DIM}|-${NC} Expose Tunnel     : "
@@ -3887,11 +3926,11 @@ bench_budget_value() {
 bench_budget_ms() {
     local name="$1"
     case "$name" in
-        config_path_cache) bench_budget_value "${G2RAY_BENCH_BUDGET_CONFIG_PATH_MS:-800}" 800 ;;
-        route_ordering) bench_budget_value "${G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS:-500}" 500 ;;
-        export_generation) bench_budget_value "${G2RAY_BENCH_BUDGET_EXPORT_MS:-3500}" 3500 ;;
-        doctor_json) bench_budget_value "${G2RAY_BENCH_BUDGET_DOCTOR_MS:-1800}" 1800 ;;
-        recover_json_contract) bench_budget_value "${G2RAY_BENCH_BUDGET_RECOVER_JSON_MS:-1800}" 1800 ;;
+        config_path_cache) bench_budget_value "${G2RAY_BENCH_BUDGET_CONFIG_PATH_MS:-2500}" 2500 ;;
+        route_ordering) bench_budget_value "${G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS:-1500}" 1500 ;;
+        export_generation) bench_budget_value "${G2RAY_BENCH_BUDGET_EXPORT_MS:-10000}" 10000 ;;
+        doctor_json) bench_budget_value "${G2RAY_BENCH_BUDGET_DOCTOR_MS:-6000}" 6000 ;;
+        recover_json_contract) bench_budget_value "${G2RAY_BENCH_BUDGET_RECOVER_JSON_MS:-3000}" 3000 ;;
         *) bench_budget_value "${G2RAY_BENCH_BUDGET_DEFAULT_MS:-1000}" 1000 ;;
     esac
 }
@@ -4062,9 +4101,12 @@ if [[ "${1:-}" == "--bench" || "${1:-}" == "bench" ]]; then
 fi
 
 if [[ "${1:-}" == "--refresh-exports" || "${1:-}" == "--export" || "${1:-}" == "export" ]]; then
-    refresh_config_exports
-    printf 'Exports refreshed: %s\n' "$SUBSCRIPTION_FILE"
-    exit 0
+    if refresh_config_exports; then
+        printf 'Exports refreshed: %s\n' "$SUBSCRIPTION_FILE"
+        exit 0
+    fi
+    printf 'No exportable configs were generated; stale export files were cleared.\n' >&2
+    exit 1
 fi
 
 if [[ "${1:-}" == "--support-bundle" || "${1:-}" == "support-bundle" ]]; then

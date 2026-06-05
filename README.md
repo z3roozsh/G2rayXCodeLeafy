@@ -166,7 +166,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 
 Generated links use `insecure=0&allowInsecure=0` by default so clients keep TLS certificate verification enabled. If a specific client cannot handle IP fallback links with SNI/Host routing, `allowInsecure=1` can be tried manually as a compatibility workaround, but that relaxes certificate verification and is not the default.
 
-By default the panel can export up to 20 usable IP fallback configs plus the domain config, ordered by rolling route health: success ratio, average successful XHTTP latency, recent weighted latency, latest XHTTP latency, and temporary cooldowns for candidates that timed out. These numbers are `OPTIONS` probes against the Codespaces XHTTP route, not ICMP ping or full throughput tests. If GitHub/DNS exposes fewer healthy unique edge routes, the panel exports fewer rather than duplicating weak or unusable routes.
+By default the panel can export up to 20 usable IP fallback configs plus the domain config, ordered by rolling route health: pinned preference, failure penalty, recent weighted XHTTP latency, latest XHTTP latency, and temporary cooldowns for candidates that timed out or returned edge/origin errors. These numbers are strict-TLS `OPTIONS` probes against the Codespaces XHTTP route, not ICMP ping or full throughput tests. If GitHub/DNS exposes fewer healthy unique edge routes, the panel exports fewer rather than duplicating weak or unusable routes.
 
 If your own network blocks the app.github.dev domain but measured IP fallback links work, set `G2RAY_EXPORT_DOMAIN_LINK=0` or write `0` to `data/export_domain_link.txt` before refreshing exports. The default keeps the domain link because it remains useful on networks where app.github.dev is allowed.
 
@@ -263,7 +263,10 @@ bash ./g2ray.sh bench --json --mock
 Local verification commands:
 
 ```bash
-bash -n ./g2ray.sh ./scripts/post-start.sh ./tests/g2ray_static_tests.sh ./tests/g2ray_behavior_tests.sh
+bash -n ./g2ray.sh
+bash -n ./scripts/post-start.sh
+bash -n ./tests/g2ray_static_tests.sh
+bash -n ./tests/g2ray_behavior_tests.sh
 bash ./tests/g2ray_static_tests.sh
 bash ./tests/g2ray_behavior_tests.sh
 bash ./g2ray.sh bench --json --mock
@@ -293,6 +296,8 @@ Option `18) Toggle Low-Overhead Mode` reduces INFO-level app logging and slows l
 Option `49) Toggle Latency Focus Mode` is more aggressive than low-overhead mode. It keeps heartbeat, session accounting, and self-heal alive, but suppresses non-error app logs and skips noncritical background route/export/message refreshes while the mode is active. Use it briefly while measuring client latency; turn it off before collecting support logs or expecting automatic export updates.
 
 The config screen writes three local export helpers: `configs-to-copy-for-mobile.txt`, `configs-subscription-base64.txt`, and `data/configs-meta.json`. They are ignored by git by default because they include live connection credentials or metadata. Use them locally inside the Codespace, or copy them only through a private channel you control. This project intentionally does not publish a raw GitHub subscription URL.
+
+Codespaces port `443` is made publicly reachable so your private client config can reach the XHTTP listener through GitHub's app route. Treat every generated VLESS link and local subscription file as a bearer credential: keep them private, regenerate the config if they leak, and do not operate a public/shared access service.
 
 On first setup, the panel shows a small recovery card so you can copy these recovery commands safely: `bash ./g2ray.sh --doctor-json`, `bash ./g2ray.sh --recover-now`, `bash ./g2ray.sh --recover-now --json`, `bash ./g2ray.sh --support-bundle`, and, when a Worker is configured, a curl template using `Authorization: Bearer <WAKE_SECRET>`. The raw wake secret is never printed from saved metadata.
 
@@ -358,9 +363,15 @@ Wake call:
 
 ```bash
 read -rsp "Wake secret: " WAKE_SECRET; echo
-curl -X POST -H "Authorization: Bearer ${WAKE_SECRET}" https://YOUR_WORKER.workers.dev/wake
+curl --config - <<EOF
+request = "POST"
+url = "https://YOUR_WORKER.workers.dev/wake"
+header = "Authorization: Bearer ${WAKE_SECRET}"
+EOF
 unset WAKE_SECRET
 ```
+
+The `curl --config -` form keeps the expanded wake secret out of process arguments. The URL and secret are still bearer credentials; run the command only on machines you trust.
 
 PowerShell wake call:
 

@@ -119,6 +119,28 @@ async function testGithubScopeFailureClassification() {
   console.log("PASS: Worker classifies token scope failures distinctly");
 }
 
+async function testGithubUnknownForbiddenClassificationIsNeutral() {
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({ message: "Organization policy blocks this request" }), {
+        status: 403,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/health"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 403);
+  assert.equal(body.reason, "github_forbidden");
+  assert.equal(body.token_warning ?? null, null);
+  assert.equal(body.next_action_code, "check_github_policy_or_access");
+  assert.match(body.next_action, /policy or access/i);
+  console.log("PASS: Worker classifies unknown GitHub 403 without false token-rotation guidance");
+}
+
 async function testWakeSettlingIncludesRetryMetadata() {
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -754,6 +776,81 @@ async function testScheduledQuotaCronAttemptsOneNearResetWake() {
   console.log("PASS: Worker scheduled quota survival cron attempts only one near-reset wake");
 }
 
+async function testScheduledQuotaCronRetriesAfterResetIfPreResetWakeStillBlocked() {
+  const kv = makeKv();
+  await kv.put("quota-incident:behavior-space", JSON.stringify({
+    quota_drought_active: true,
+    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
+  }));
+  let startCalls = 0;
+  let routeCalls = 0;
+  let afterReset = false;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/start")) {
+      startCalls += 1;
+      if (!afterReset) {
+        return new Response(JSON.stringify({ message: "Payment required" }), {
+          status: 402,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ state: "Available" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: afterReset ? "Available" : "Shutdown",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        retention_expires_at: "2026-07-20T00:00:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({
+    WAKER_KV: kv,
+    QUOTA_SURVIVAL_CRON_ENABLED: "true",
+    ROUTE_READY_STABLE_SLEEP_MS: "0",
+    TEST_NOW_UTC: "2026-06-30T19:00:00Z"
+  });
+  let waitUntilPromises = [];
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-06-30T19:00:00Z") },
+    env,
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  await Promise.all(waitUntilPromises);
+
+  afterReset = true;
+  env.TEST_NOW_UTC = "2026-07-01T00:05:00Z";
+  waitUntilPromises = [];
+  await worker.scheduled(
+    { scheduledTime: Date.parse("2026-07-01T00:05:00Z") },
+    env,
+    { waitUntil(promise) { waitUntilPromises.push(promise); } }
+  );
+  await Promise.all(waitUntilPromises);
+
+  assert.equal(startCalls, 2);
+  assert.equal(routeCalls >= 2, true);
+  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
+  assert.equal(incident.quota_drought_active, false);
+  assert.equal(incident.last_successful_start_at, "2026-07-01T00:05:00.000Z");
+  console.log("PASS: Worker quota cron retries after reset if a pre-reset wake was still quota-blocked");
+}
+
 async function testWakeFailureIncludesNextAction() {
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -977,6 +1074,7 @@ async function testHealthRequiresStableRouteReadiness() {
 
 async function testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut() {
   let statusCalls = 0;
+  const kv = makeKv();
   globalThis.fetch = async (input) => {
     const url = String(input);
     if (url.includes("/start")) {
@@ -1003,7 +1101,7 @@ async function testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut() {
 
   const response = await worker.fetch(
     makeRequest("/api/wake"),
-    baseEnv({ GITHUB_STATE_WAIT_MS: "5", GITHUB_STATE_POLL_INTERVAL_MS: "1" }),
+    baseEnv({ WAKER_KV: kv, GITHUB_STATE_WAIT_MS: "5", GITHUB_STATE_POLL_INTERVAL_MS: "1" }),
     {}
   );
   const body = await responseJson(response);
@@ -1011,9 +1109,62 @@ async function testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut() {
   assert.equal(body.ok, false);
   assert.equal(body.start_accepted, true);
   assert.equal(body.reason, "codespace_state_not_ready");
+  assert.equal(body.next_action_code, "wait_codespace_available");
+  assert.match(body.next_action, /finish starting/i);
   assert.equal(body.github_wait_attempts >= 1, true);
   assert.equal(statusCalls >= 1, true);
+  const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history[0].route_checked, false);
   console.log("PASS: Worker preserves start_accepted when GitHub state wait times out");
+}
+
+async function testHistorySeparatesFailedProbeDurationFromReadyLatency() {
+  const kv = makeKv();
+  let ready = false;
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: ready ? 200 : 404 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ WAKER_KV: kv, ROUTE_WAIT_MS: "5", ROUTE_POLL_INTERVAL_MS: "1" }),
+    {}
+  );
+  let history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history[0].route_ready, false);
+  assert.equal(history.history[0].route_latency_ms, null);
+  assert.equal(Number.isFinite(history.history[0].route_probe_duration_ms), true);
+
+  ready = true;
+  await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ WAKER_KV: kv, ROUTE_READY_STABLE_SLEEP_MS: "0" }),
+    {}
+  );
+  history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
+  assert.equal(history.history[0].route_ready, true);
+  assert.equal(Number.isFinite(history.history[0].route_latency_ms), true);
+  assert.equal(Number.isFinite(history.history[0].route_probe_duration_ms), true);
+  assert.equal(routeCalls >= 3, true);
+  console.log("PASS: Worker history separates failed probe duration from ready-route latency");
 }
 
 async function testDashboardIncludesRouteHistorySummaryUi() {
@@ -1455,6 +1606,7 @@ try {
   await testFailedSecretRateLimit();
   await testGithubRateLimitClassification();
   await testGithubScopeFailureClassification();
+  await testGithubUnknownForbiddenClassificationIsNeutral();
   await testWakeSettlingIncludesRetryMetadata();
   await testHealthCanSkipRouteProbe();
   await testHealthSkipRoutePreservesGithubFailureGuidance();
@@ -1470,6 +1622,7 @@ try {
   await testHistoryWorksWithoutGithubToken();
   await testScheduledQuotaCronIsDisabledAndThrottledBeforeReset();
   await testScheduledQuotaCronAttemptsOneNearResetWake();
+  await testScheduledQuotaCronRetriesAfterResetIfPreResetWakeStillBlocked();
   await testWakeFailureIncludesNextAction();
   await testHealthTreatsHttp400RouteAsUsable();
   await testWakeRequiresStableRouteReadiness();
@@ -1477,6 +1630,7 @@ try {
   await testWakeDoesNotClaimReadyFromSingleDeadlineProbe();
   await testHealthRequiresStableRouteReadiness();
   await testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut();
+  await testHistorySeparatesFailedProbeDurationFromReadyLatency();
   await testDashboardIncludesRouteHistorySummaryUi();
   await testHistoryRejectsBadSecretClearly();
   await testResponsesIncludeSecurityHeaders();

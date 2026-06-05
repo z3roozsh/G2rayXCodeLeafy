@@ -128,13 +128,15 @@ Recommended CLI call:
 
 ```bash
 read -rsp "Wake secret: " WAKE_SECRET; echo
-curl -X POST \
-  -H "Authorization: Bearer ${WAKE_SECRET}" \
-  https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev/wake
+curl --config - <<EOF
+request = "POST"
+url = "https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev/wake"
+header = "Authorization: Bearer ${WAKE_SECRET}"
+EOF
 unset WAKE_SECRET
 ```
 
-Opening the Worker URL in a browser and entering the wake secret in the form is preferred because it keeps the secret out of shell history.
+Opening the Worker URL in a browser and entering the wake secret in the form is preferred because it keeps the secret out of shell history. The `curl --config -` form also keeps the expanded secret out of process arguments; use it only on machines you trust.
 
 If you create a new Codespace, change region, rename/recreate the Codespace, or change the panel's `XRAY_PORT`, update `CODESPACE_NAME` and optional `CODESPACE_PORT`, redeploy the Worker, then return to panel option `15` and save/test the Worker URL again.
 

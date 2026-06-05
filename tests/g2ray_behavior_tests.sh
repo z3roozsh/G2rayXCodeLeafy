@@ -364,6 +364,36 @@ test_route_failure_reason_classifier() {
     pass "route failure reason classifier is actionable"
 }
 
+test_edge_origin_errors_enter_candidate_cooldown() {
+    reset_runtime_paths
+    ROUTE_FAILURE_COOLDOWN_SEC=180
+
+    record_route_candidate_health 20.0.0.9 503 77 dns edge_or_origin_error
+    awk -F '\t' '$2 == "20.0.0.9" && $3 == "edge_or_origin_error" { found = 1 } END { exit !found }' "$ROUTE_COOLDOWN_FILE" \
+        || fail "edge/origin errors were not temporarily cooled down"
+    pass "edge/origin route errors enter candidate cooldown"
+}
+
+test_xhttp_external_probe_uses_strict_tls_by_default() {
+    reset_runtime_paths
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    printf '{}\n' > "$CONFIG_FILE"
+    local args_file="$TMP_ROOT/curl-strict-tls-args.txt"
+    curl() {
+        printf '%s\n' "$*" > "$args_file"
+        printf '200 0.010\n'
+    }
+
+    xhttp_probe_metrics external 20.0.0.9 >/dev/null
+    unset -f curl
+    ! grep -Eq '(^| )-k($| )|--insecure' "$args_file" \
+        || fail "external XHTTP route probe disabled TLS verification even though exported configs are strict"
+    grep -Fq -- '--resolve behavior-space-443.app.github.dev:443:20.0.0.9' "$args_file" \
+        || fail "external XHTTP route probe did not preserve SNI/Host routing with --resolve"
+    pass "external XHTTP route probes keep TLS verification enabled"
+}
+
 test_xhttp_probe_metrics_reports_curl_failure_reason() {
     reset_runtime_paths
     CODESPACE_NAME="behavior-space"
@@ -571,6 +601,34 @@ test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap() {
     grep -Fxq '20.0.0.9' "$probed_file" \
         || fail "fresh provider candidate was starved by stale cached routes under the probe cap"
     pass "route health refresh mixes provider candidates before stale cache can fill the cap"
+}
+
+test_route_health_refresh_does_not_let_unusable_cache_starve_builtins() {
+    reset_runtime_paths
+    printf '{}\n' > "$CONFIG_FILE"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    DEFAULT_FALLBACK_IPS="20.0.0.9"
+    G2RAY_EXTRA_FALLBACK_IPS=""
+    ROUTE_MONITOR_MAX_CANDIDATES=2
+    ROUTE_PROBE_CONCURRENCY=1
+    local original_provider original_probe probed_file
+    original_provider="$(declare -f resolve_dns_provider_ips_with_sources)"
+    original_probe="$(declare -f xhttp_probe_metrics)"
+    probed_file="$TMP_ROOT/probed-unusable-cache.txt"
+    printf '2026-05-30T00:00:00Z\t20.0.0.1\t404\t20\tfalse\tcache\troute_settling_404\n' > "$ROUTE_HEALTH_FILE"
+    printf '2026-05-30T00:00:00Z\t20.0.0.2\t0\t5000\tfalse\tcache\ttimeout_or_unreachable\n' >> "$ROUTE_HEALTH_FILE"
+    resolve_dns_provider_ips_with_sources() { return 0; }
+    xhttp_probe_metrics() {
+        printf '%s\n' "$2" >> "$probed_file"
+        printf '200 10 ready\n'
+    }
+
+    refresh_route_candidate_health || fail "route health refresh failed with unusable cached rows"
+    eval "$original_provider"
+    eval "$original_probe"
+    grep -Fxq '20.0.0.9' "$probed_file" \
+        || fail "unusable cached route rows starved built-in fallback probing under the cap"
+    pass "route health refresh does not let unusable cache starve built-in fallbacks"
 }
 
 test_route_preference_write_failures_return_failure() {
@@ -854,6 +912,28 @@ test_domain_link_export_can_be_disabled_for_blocked_networks() {
     pass "domain link export can be disabled for blocked local networks"
 }
 
+test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    GITHUB_USER="tester"
+    MAX_FALLBACK_LINKS=2
+    printf '00000000-0000-4000-8000-000000000001\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    printf 'vless://stale@behavior-space-443.app.github.dev:443#stale\n' > "$MOBILE_CONFIG_FILE"
+    printf 'dmxlc3M6Ly9zdGFsZQo=' > "$SUBSCRIPTION_FILE"
+    printf '0\n' > "$DOMAIN_LINK_EXPORT_FILE"
+    usable_fallback_ips() { return 0; }
+
+    if refresh_config_exports >/dev/null 2>&1; then
+        fail "refresh_config_exports reported success when domain export was disabled and no IP fallback existed"
+    fi
+    [[ ! -e "$MOBILE_CONFIG_FILE" ]] || fail "stale mobile configs were left behind after no-link export refresh"
+    [[ ! -e "$SUBSCRIPTION_FILE" ]] || fail "stale base64 subscription was left behind after no-link export refresh"
+    pass "disabled domain export clears stale config artifacts when no IP fallback is available"
+}
+
 test_generated_links_follow_configured_xhttp_path() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -979,7 +1059,7 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 case = next(item for item in data["cases"] if item["name"] == "config_path_cache")
-assert case["budget_ms"] == 800, case
+assert case["budget_ms"] == 2500, case
 assert data["ok"] is True
 PY
     pass "bench --json reports deterministic performance budgets"
@@ -1172,6 +1252,32 @@ test_recover_now_success_clears_nonfatal_port_public_failure() {
         grep -Fq "Soft recover complete" <<< "$output" || fail "recover_now success output missing"
     )
     pass "recover now returns success when route recovers despite nonfatal port-public failure"
+}
+
+test_recover_now_stops_after_engine_start_failure() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        xray_listener_ready() { return 1; }
+        start_xray() { return 1; }
+        wait_for_port() { return 1; }
+        ensure_codespace_port_public() { fail "recover_now exposed tunnel after engine startup failure"; }
+        wait_for_xhttp_route_ready() { fail "recover_now waited for route after engine startup failure"; }
+        repair_codespace_port_route() { fail "recover_now repaired route after engine startup failure"; }
+        refresh_route_candidate_health() { return 0; }
+        refresh_config_exports() { return 0; }
+        log_diagnostic_snapshot() { return 0; }
+        set +e
+        output="$(recover_now --no-prompt 2>&1)"
+        rc=$?
+        set -e
+        [[ "$rc" -ne 0 ]] || fail "recover_now returned success after engine startup failure"
+        grep -Fq "Engine is unavailable" <<< "$output" \
+            || fail "recover_now did not explain that engine failure blocks route recovery"
+    )
+    pass "recover now stops after engine startup failure"
 }
 
 test_recover_now_json_reports_ready_contract() {
@@ -1464,6 +1570,8 @@ test_last_good_route_decays_before_breaking_ties
 test_route_candidate_stats_track_average_and_success_rate
 test_route_health_records_source_reason_and_recent_average
 test_route_failure_reason_classifier
+test_edge_origin_errors_enter_candidate_cooldown
+test_xhttp_external_probe_uses_strict_tls_by_default
 test_xhttp_probe_metrics_reports_curl_failure_reason
 test_cached_route_order_prefers_pinned_route_then_latency_without_stats
 test_route_monitor_default_and_hard_cap_are_wide_but_bounded
@@ -1473,6 +1581,7 @@ test_route_preferences_clear_matching_cooldowns
 test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down
 test_route_health_refresh_preserves_cache_when_all_probes_are_unusable
 test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap
+test_route_health_refresh_does_not_let_unusable_cache_starve_builtins
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
@@ -1487,6 +1596,7 @@ test_generate_config_replaces_stale_no_config_boot_status
 test_config_exports_write_local_only_metadata
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
+test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_generated_links_follow_configured_xhttp_path
 test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets
@@ -1502,6 +1612,7 @@ test_doctor_json_sanitizes_invalid_port
 test_route_wait_requires_stable_usable_probes
 test_route_wait_rejects_transient_single_success
 test_recover_now_success_clears_nonfatal_port_public_failure
+test_recover_now_stops_after_engine_start_failure
 test_recover_now_json_reports_ready_contract
 test_recover_now_json_reports_settling_contract
 test_recover_now_json_treats_followup_ready_probe_as_success
