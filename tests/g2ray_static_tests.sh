@@ -256,7 +256,7 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
         || fail 'TCP Fast Open is not configurable via G2RAY_TCP_FAST_OPEN'
     grep_fixed '/proc/sys/net/ipv4/tcp_fastopen' "$SCRIPT" \
         || fail 'TCP Fast Open auto mode does not check kernel client support before enabling'
-    grep_fixed '"sockopt": { "tcpFastOpen": true }' "$SCRIPT" \
+    grep_fixed 'tcpFastOpen\": true' "$SCRIPT" \
         || fail 'generated config does not apply tcpFastOpen via outbound sockopt'
     grep_fixed '"settings": { "domainStrategy": "UseIPv4" }${direct_sockopt}' "$SCRIPT" \
         || fail 'tcpFastOpen sockopt is not attached to the freedom (direct) outbound'
@@ -265,6 +265,24 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
     grep_fixed 'TCP FastOpen:' "$SCRIPT" \
         || fail 'diagnostics do not surface TCP Fast Open status'
     pass 'TCP Fast Open is kernel-gated and applied only to the direct outbound'
+}
+
+test_connection_keepalive_and_halfclose_are_tuned() {
+    grep_fixed 'TCP_KEEPALIVE_INTERVAL_SEC=' "$SCRIPT" \
+        || fail 'TCP keepalive interval is not configurable'
+    grep_fixed 'G2RAY_TCP_KEEPALIVE_INTERVAL' "$SCRIPT" \
+        || fail 'TCP keepalive cannot be overridden via env'
+    grep_fixed 'tcpKeepAliveInterval' "$SCRIPT" \
+        || fail 'sockets do not enable TCP keepalive to clear stale/half-open connections'
+    grep_fixed 'tcpKeepAliveIdle' "$SCRIPT" \
+        || fail 'sockets do not set a TCP keepalive idle threshold'
+    # The inbound stream must carry a keepalive sockopt block (edge<->Xray).
+    grep_fixed '"sockopt": { "tcpKeepAliveInterval"' "$SCRIPT" \
+        || fail 'inbound stream settings do not set keepalive sockopt'
+    if grep_fixed 'uplinkOnly=1\ndownlinkOnly=2' "$SCRIPT"; then
+        fail 'profiles still use the over-aggressive 1/2 half-close timeouts that prematurely drop idle connections'
+    fi
+    pass 'TCP keepalive is enabled and half-close timeouts are not over-aggressive'
 }
 
 test_performance_profile_is_persistent_and_bench_is_isolated() {
@@ -1775,6 +1793,7 @@ test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
 test_tcp_fast_open_is_gated_and_outbound_only
+test_connection_keepalive_and_halfclose_are_tuned
 test_performance_profile_is_persistent_and_bench_is_isolated
 test_generated_links_include_domain_and_ip_variants
 test_terminal_branding_is_customized_red

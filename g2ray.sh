@@ -133,6 +133,15 @@ if [[ -z "$PERFORMANCE_PROFILE" && -f "$PERFORMANCE_PROFILE_FILE" ]]; then
     PERFORMANCE_PROFILE=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$PERFORMANCE_PROFILE_FILE" 2>/dev/null || true)
 fi
 [[ -n "$PERFORMANCE_PROFILE" ]] || PERFORMANCE_PROFILE="balanced"
+# TCP keepalive (seconds) applied to the inbound and direct-outbound sockets so
+# idle connections are kept warm and dead peers are detected/reset promptly,
+# instead of lingering as half-open sockets that a client reuses and stalls on.
+# These run datacenter<->datacenter (edge<->Xray, Xray<->origin); they do NOT
+# touch the mobile client's radio, so there is no battery cost.
+TCP_KEEPALIVE_INTERVAL_SEC="${G2RAY_TCP_KEEPALIVE_INTERVAL:-15}"
+TCP_KEEPALIVE_IDLE_SEC="${G2RAY_TCP_KEEPALIVE_IDLE:-30}"
+[[ "$TCP_KEEPALIVE_INTERVAL_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_INTERVAL_SEC=15
+[[ "$TCP_KEEPALIVE_IDLE_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_IDLE_SEC=30
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
@@ -2388,22 +2397,22 @@ performance_profile_settings() {
     local profile="${1:-$PERFORMANCE_PROFILE}"
     case "$profile" in
         low_latency|latency)
-            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=600\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
             ;;
         streaming|video)
-            printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=1\ndownlinkOnly=4\nbufferSize=768\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=true\nloglevel=warning\n'
             ;;
         unstable_mobile|mobile)
-            printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=4\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=900\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         low_overhead|minimal)
-            printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
+            printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
             ;;
         max_throughput|throughput|max|high_throughput)
-            printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=1\ndownlinkOnly=5\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
             ;;
         *)
-            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=600\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
             ;;
     esac
 }
@@ -2454,18 +2463,22 @@ generate_config() {
     max_concurrent_uploads="${max_concurrent_uploads:-16}"
     handshake="${handshake:-3}"
     conn_idle="${conn_idle:-600}"
-    uplink_only="${uplink_only:-1}"
-    downlink_only="${downlink_only:-2}"
+    uplink_only="${uplink_only:-2}"
+    downlink_only="${downlink_only:-5}"
     buffer_size="${buffer_size:-512}"
     sniff_quic="${sniff_quic:-true}"
     loglevel="${loglevel:-warning}"
     sniff_dest='["http", "tls"]'
     [[ "$sniff_quic" == "true" ]] && sniff_dest='["http", "tls", "quic"]'
-    local direct_sockopt="" tfo_state="off"
+    # Outbound socket options: TCP keepalive always (keep origin connections warm
+    # and detect dead peers), plus TCP Fast Open when the kernel supports it.
+    local direct_sockopt tfo_state="off" sockopt_inner
+    sockopt_inner="\"tcpKeepAliveInterval\": ${TCP_KEEPALIVE_INTERVAL_SEC}, \"tcpKeepAliveIdle\": ${TCP_KEEPALIVE_IDLE_SEC}"
     if tcp_fast_open_outbound_enabled; then
-        direct_sockopt=', "streamSettings": { "sockopt": { "tcpFastOpen": true } }'
+        sockopt_inner="\"tcpFastOpen\": true, ${sockopt_inner}"
         tfo_state="on"
     fi
+    direct_sockopt=", \"streamSettings\": { \"sockopt\": { ${sockopt_inner} } }"
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
     log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} tcp_fast_open=${tfo_state}"
     cat > "$CONFIG_FILE" << JSONEOF
@@ -2494,7 +2507,8 @@ generate_config() {
       },
       "streamSettings": {
         "network": "xhttp", "security": "none",
-        "xhttpSettings": { "mode": "packet-up", "path": "/", "maxUploadSize": ${max_upload_size}, "maxConcurrentUploads": ${max_concurrent_uploads} }
+        "xhttpSettings": { "mode": "packet-up", "path": "/", "maxUploadSize": ${max_upload_size}, "maxConcurrentUploads": ${max_concurrent_uploads} },
+        "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
     },
