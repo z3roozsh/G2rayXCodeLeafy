@@ -262,6 +262,8 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
         || fail 'tcpFastOpen sockopt is not attached to the freedom (direct) outbound'
     grep_fixed 'G2RAY_TCP_FAST_OPEN' "$README" \
         || fail 'README does not document the TCP Fast Open toggle'
+    grep_fixed 'TCP FastOpen:' "$SCRIPT" \
+        || fail 'diagnostics do not surface TCP Fast Open status'
     pass 'TCP Fast Open is kernel-gated and applied only to the direct outbound'
 }
 

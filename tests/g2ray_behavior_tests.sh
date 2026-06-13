@@ -1171,6 +1171,10 @@ test_performance_profile_settings_are_available() {
     grep -Fq 'maxConcurrentUploads=16' <<< "$balanced" || fail "balanced profile missing expected concurrency"
     grep -Fq 'maxConcurrentUploads=24' <<< "$low_latency" || fail "low_latency profile missing higher concurrency"
     grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
+    local max_throughput; max_throughput="$(performance_profile_settings max_throughput)"
+    grep -Fq 'name=max_throughput' <<< "$max_throughput" || fail "max_throughput profile is not selectable"
+    grep -Fq 'maxConcurrentUploads=32' <<< "$max_throughput" || fail "max_throughput profile does not raise upload concurrency"
+    grep -Fq 'bufferSize=2048' <<< "$max_throughput" || fail "max_throughput profile does not enlarge per-connection buffers"
     pass "performance profile settings are explicit and inspectable"
 }
 

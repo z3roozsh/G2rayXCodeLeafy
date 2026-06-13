@@ -2383,6 +2383,9 @@ performance_profile_settings() {
         low_overhead|minimal)
             printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
             ;;
+        max_throughput|throughput|max|high_throughput)
+            printf 'name=max_throughput\nmaxUploadSize=6000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=1\ndownlinkOnly=5\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
+            ;;
         *)
             printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=600\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
             ;;
@@ -3494,6 +3497,19 @@ show_diagnostics() {
             IFS=$'\t' read -r cfg_network cfg_security cfg_path cfg_mode cfg_uuid <<< "$cfg_line"
             echo -e "  Config    : ${WHITE}${cfg_network}/${cfg_security}${NC} ${DIM}path=${cfg_path} mode=${cfg_mode} uuid_hash=$(fingerprint_secret "$cfg_uuid")${NC}"
         fi
+    fi
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local tfo_cfg="off" tfo_kernel tfo_kernel_note="unknown"
+        if command -v jq >/dev/null 2>&1; then
+            [[ "$(jq -r '[.outbounds[]? | select(.tag=="direct") | .streamSettings.sockopt.tcpFastOpen] | first // false' "$CONFIG_FILE" 2>/dev/null)" == "true" ]] && tfo_cfg="on"
+        elif grep -Fq '"tcpFastOpen": true' "$CONFIG_FILE" 2>/dev/null; then
+            tfo_cfg="on"
+        fi
+        tfo_kernel=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || printf '?')
+        if [[ "$tfo_kernel" =~ ^[0-9]+$ ]]; then
+            (( (tfo_kernel & 1) == 1 )) && tfo_kernel_note="client-supported" || tfo_kernel_note="not-supported"
+        fi
+        echo -e "  TCP FastOpen: ${WHITE}${tfo_cfg}${NC} ${DIM}(outbound dials; kernel tcp_fastopen=${tfo_kernel} ${tfo_kernel_note})${NC}"
     fi
 
     echo -e "\n  ${WHITE}${B}Background Supervisor${NC}"
