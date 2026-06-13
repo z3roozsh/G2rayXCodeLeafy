@@ -267,6 +267,24 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
     pass 'TCP Fast Open is kernel-gated and applied only to the direct outbound'
 }
 
+test_performance_profile_is_persistent_and_bench_is_isolated() {
+    grep_fixed 'PERFORMANCE_PROFILE_FILE=' "$SCRIPT" \
+        || fail 'performance profile preference is not persisted to a file'
+    grep_fixed 'set_performance_profile()' "$SCRIPT" \
+        || fail 'script cannot persist a chosen performance profile'
+    grep_fixed 'valid_performance_profile()' "$SCRIPT" \
+        || fail 'script does not validate performance profile names'
+    grep_fixed 'G2RAY_PRESERVE_UUID' "$SCRIPT" \
+        || fail 'profile apply path does not preserve the existing UUID'
+    grep_fixed '== "--profile" || "${1:-}" == "profile"' "$SCRIPT" \
+        || fail 'script does not expose a profile subcommand'
+    grep_fixed 'G2RAY_BENCH_WANTS_LIVE' "$SCRIPT" \
+        || fail 'bench no longer gates live side effects behind an explicit flag'
+    grep_fixed '== "--live"' "$SCRIPT" \
+        || fail 'bench does not require --live before touching real data/logs'
+    pass 'performance profile persists and bench is isolated unless --live is given'
+}
+
 test_generated_links_include_domain_and_ip_variants() {
     grep_fixed 'resolve_domain_ip()' "$SCRIPT" \
         || fail 'script does not provide a resolver for the Codespaces app domain'
@@ -1757,6 +1775,7 @@ test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
 test_tcp_fast_open_is_gated_and_outbound_only
+test_performance_profile_is_persistent_and_bench_is_isolated
 test_generated_links_include_domain_and_ip_variants
 test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging

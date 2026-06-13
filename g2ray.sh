@@ -27,9 +27,16 @@ PROJECT_REPO="${G2RAY_PROJECT_REPO:-$(detect_project_repo_default)}"
 RAW_BASE_URL="${G2RAY_RAW_BASE_URL:-https://raw.githubusercontent.com/${PROJECT_REPO}/main}"
 
 G2RAY_BENCH_PREINIT_TMP="${G2RAY_BENCH_PREINIT_TMP:-}"
+# Benchmarks isolate to a throwaway runtime dir by default. Only an explicit
+# `--live` argument runs them against the real data/logs (which would reassert
+# port visibility and rewrite exports). This keeps plain `g2ray.sh bench` safe.
+G2RAY_BENCH_WANTS_LIVE=0
 case "${1:-}" in
     --bench|bench)
-        if [[ "${2:-}" == "--mock" || "${3:-}" == "--mock" || "${G2RAY_BENCH_MOCK:-0}" == "1" ]]; then
+        for _bench_arg in "$@"; do
+            [[ "$_bench_arg" == "--live" ]] && G2RAY_BENCH_WANTS_LIVE=1
+        done
+        if [[ "$G2RAY_BENCH_WANTS_LIVE" != "1" ]]; then
             umask 077
             if ! G2RAY_BENCH_PREINIT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/g2ray-bench.XXXXXX"); then
                 echo "Could not create temporary benchmark runtime directory." >&2
@@ -78,6 +85,7 @@ BLACKLISTED_ROUTE_CANDIDATES_FILE="$DATA_DIR/blacklisted_route_candidates.txt"
 ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
 PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
 QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
+PERFORMANCE_PROFILE_FILE="$DATA_DIR/performance_profile.txt"
 XRAY_PID_FILE="$DATA_DIR/xray.pid"
 SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
 SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
@@ -116,7 +124,15 @@ PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 LAST_GOOD_ROUTE_MAX_AGE_SEC="${G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC:-1800}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 RUNTIME_LOCK_WAIT_ATTEMPTS="${G2RAY_RUNTIME_LOCK_WAIT_ATTEMPTS:-900}"
-PERFORMANCE_PROFILE="${G2RAY_PERFORMANCE_PROFILE:-balanced}"
+# Profile resolution order: env var override, then the persisted preference
+# file (set via `g2ray.sh profile <name>`), then the balanced default. The file
+# makes the choice survive Codespace restarts and panels launched without the
+# env var (postAttachCommand, the background supervisor, etc.).
+PERFORMANCE_PROFILE="${G2RAY_PERFORMANCE_PROFILE:-}"
+if [[ -z "$PERFORMANCE_PROFILE" && -f "$PERFORMANCE_PROFILE_FILE" ]]; then
+    PERFORMANCE_PROFILE=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$PERFORMANCE_PROFILE_FILE" 2>/dev/null || true)
+fi
+[[ -n "$PERFORMANCE_PROFILE" ]] || PERFORMANCE_PROFILE="balanced"
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
@@ -2384,7 +2400,7 @@ performance_profile_settings() {
             printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
             ;;
         max_throughput|throughput|max|high_throughput)
-            printf 'name=max_throughput\nmaxUploadSize=6000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=1\ndownlinkOnly=5\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=1\ndownlinkOnly=5\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
             ;;
         *)
             printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=600\nuplinkOnly=1\ndownlinkOnly=2\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
@@ -2392,8 +2408,31 @@ performance_profile_settings() {
     esac
 }
 
+valid_performance_profile() {
+    case "${1:-}" in
+        balanced|low_latency|latency|streaming|video|unstable_mobile|mobile|low_overhead|minimal|max_throughput|throughput|max|high_throughput)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+set_performance_profile() {
+    local profile="${1:-}"
+    valid_performance_profile "$profile" || return 1
+    _atomic_write "$PERFORMANCE_PROFILE_FILE" "$profile"
+    chmod 600 "$PERFORMANCE_PROFILE_FILE" 2>/dev/null || true
+    PERFORMANCE_PROFILE="$profile"
+    log_event INFO "performance_profile preference set profile=${profile}"
+}
+
 generate_config() {
-    uuidgen > "$UUID_FILE"
+    # Keep the existing UUID when only re-applying a profile, so switching
+    # profiles does not invalidate already-imported client links.
+    if [[ "${G2RAY_PRESERVE_UUID:-0}" == "1" && -s "$UUID_FILE" ]]; then
+        :
+    else
+        uuidgen > "$UUID_FILE"
+    fi
     local uuid; uuid=$(cat "$UUID_FILE")
     local profile_name max_upload_size max_concurrent_uploads handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value
     while IFS='=' read -r key value; do
@@ -4172,12 +4211,39 @@ if [[ "${1:-}" == "--status" || "${1:-}" == "status" ]]; then
 fi
 
 if [[ "${1:-}" == "--bench" || "${1:-}" == "bench" ]]; then
-    if [[ "${2:-}" == "--json" ]]; then
-        bench_json "${3:-}"
+    # Default to isolated mock unless --live was explicitly requested.
+    if [[ "$G2RAY_BENCH_WANTS_LIVE" == "1" ]]; then
+        bench_json
     else
-        bench_json "${2:-}"
+        bench_json --mock
     fi
     exit $?
+fi
+
+if [[ "${1:-}" == "--profile" || "${1:-}" == "profile" ]]; then
+    case "${2:-}" in
+        ""|status|show|current)
+            printf 'current_profile=%s\n' "$PERFORMANCE_PROFILE"
+            printf 'available=balanced,low_latency,streaming,unstable_mobile,low_overhead,max_throughput\n'
+            exit 0
+            ;;
+    esac
+    if ! valid_performance_profile "$2"; then
+        printf 'Unknown profile: %s\n' "$2" >&2
+        printf 'available=balanced,low_latency,streaming,unstable_mobile,low_overhead,max_throughput\n' >&2
+        exit 1
+    fi
+    set_performance_profile "$2"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if G2RAY_PRESERVE_UUID=1 generate_config; then
+            printf '\nProfile %s applied to the existing config (same UUID; no need to re-import links).\n' "$2"
+            exit 0
+        fi
+        printf 'Profile %s saved, but applying to the running config failed; use panel option 2 to regenerate.\n' "$2" >&2
+        exit 1
+    fi
+    printf 'Profile %s saved; it will be used when you generate a config.\n' "$2"
+    exit 0
 fi
 
 if [[ "${1:-}" == "--refresh-exports" || "${1:-}" == "--export" || "${1:-}" == "export" ]]; then

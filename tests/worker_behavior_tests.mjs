@@ -19,13 +19,18 @@ function makeRequest(path, secret = "secret") {
 function makeKv() {
   const store = new Map();
   const putOptions = new Map();
+  let putCalls = 0;
   return {
     async get(key) {
       return store.get(key) || null;
     },
     async put(key, value, options = undefined) {
+      putCalls += 1;
       store.set(key, value);
       putOptions.set(key, options || null);
+    },
+    putCallCount() {
+      return putCalls;
     },
     dump() {
       return Object.fromEntries(store.entries());
@@ -66,6 +71,20 @@ async function testFailedSecretRateLimit() {
   assert.equal(body.retry_after_seconds, 600);
   assert.equal(env.WAKER_KV.putOptions("failed-auth:unknown").expirationTtl, 600);
   console.log("PASS: Worker rate-limits repeated bad wake secrets");
+}
+
+async function testFailedSecretRateLimitCapsKvWrites() {
+  const env = baseEnv({ WAKER_KV: makeKv() });
+  for (let i = 0; i < 30; i += 1) {
+    await worker.fetch(makeRequest("/api/health", "wrong-secret"), env, {});
+  }
+  // Once an IP is over the limit the Worker must stop writing to KV, so a single
+  // flooding IP cannot drain the free-tier daily write quota.
+  assert.ok(
+    env.WAKER_KV.putCallCount() <= 10,
+    `expected KV writes capped at the attempt limit, got ${env.WAKER_KV.putCallCount()}`
+  );
+  console.log("PASS: Worker caps KV writes for a flooding IP instead of writing on every request");
 }
 
 async function testMissingWakeSecretIsConfigurationError() {
@@ -1681,6 +1700,7 @@ async function testHealthRouteReadyTransitionNotification() {
 
 try {
   await testFailedSecretRateLimit();
+  await testFailedSecretRateLimitCapsKvWrites();
   await testMissingWakeSecretIsConfigurationError();
   await testGithubRateLimitClassification();
   await testGithubScopeFailureClassification();

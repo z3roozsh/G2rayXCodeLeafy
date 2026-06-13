@@ -212,23 +212,24 @@ async function requireAuthorizedContext(request, env, options = {}) {
 async function rateLimitFailedAuth(request, env) {
   if (!env.WAKER_KV) return null;
   const key = failedAuthKey(request);
+  const blocked = {
+    ok: false,
+    status: 429,
+    body: {
+      ok: false,
+      error: "too_many_failed_wake_secret_attempts",
+      reason: "worker_wake_secret_rate_limited",
+      retry_after_seconds: FAILED_AUTH_WINDOW_SECONDS
+    }
+  };
   try {
     const raw = await env.WAKER_KV.get(key);
     const count = Number.parseInt(raw || "0", 10) || 0;
-    const next = count + 1;
-    await env.WAKER_KV.put(key, String(next), { expirationTtl: FAILED_AUTH_WINDOW_SECONDS });
-    if (next > FAILED_AUTH_MAX_ATTEMPTS) {
-      return {
-        ok: false,
-        status: 429,
-        body: {
-          ok: false,
-          error: "too_many_failed_wake_secret_attempts",
-          reason: "worker_wake_secret_rate_limited",
-          retry_after_seconds: FAILED_AUTH_WINDOW_SECONDS
-        }
-      };
-    }
+    // Already at/over the limit: block WITHOUT another KV write, so a single
+    // attacker hammering one IP cannot drain the daily free-tier KV write quota.
+    if (count >= FAILED_AUTH_MAX_ATTEMPTS) return blocked;
+    await env.WAKER_KV.put(key, String(count + 1), { expirationTtl: FAILED_AUTH_WINDOW_SECONDS });
+    if (count + 1 > FAILED_AUTH_MAX_ATTEMPTS) return blocked;
   } catch {
     return null;
   }

@@ -152,7 +152,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_EXPORT_REVALIDATE_TOP_CACHED=0` **(Optional)** — Disable the default one-probe revalidation of the top cached route before exporting configs. Leave enabled for better protection against a stale first IP; disable only when you need fastest possible export generation.
 - `G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC` **(Optional)** — Seconds a last-good route can break ties in exported config ordering. Default: `1800`; set `0` to disable last-good tie preference.
 - `G2RAY_TCP_FAST_OPEN` **(Optional)** — Controls TCP Fast Open on the freedom (direct) outbound, which can save a round-trip when the Codespace opens connections to destination sites. `auto` (default) enables it only when the kernel advertises client TFO support (`net.ipv4.tcp_fastopen` bit `0x1`), so it never risks outbound dialing on a kernel that lacks it; `1` forces it on, `0` forces it off. Applies to a newly generated config; regenerate (option `2`) after changing it.
-- `G2RAY_PERFORMANCE_PROFILE` **(Optional)** — Config profile used when generating a new Xray config: `balanced` (default), `low_latency`, `streaming`, `unstable_mobile`, `low_overhead`, or `max_throughput`. `max_throughput` spends the Codespace's spare CPU/RAM on bigger XHTTP upload chunks, more concurrent upload streams, and larger per-connection buffers for higher download/upload speed on high-latency paths (it does not lower ping). Set it, then regenerate the config (option `2`) and re-import the new links.
+- `G2RAY_PERFORMANCE_PROFILE` **(Optional)** — Config profile used when generating a new Xray config: `balanced` (default), `low_latency`, `streaming`, `unstable_mobile`, `low_overhead`, or `max_throughput`. `max_throughput` spends the Codespace's spare CPU/RAM on bigger XHTTP upload chunks, more concurrent upload streams, and larger per-connection buffers for higher download/upload speed on high-latency paths (it does not lower ping). The selected profile persists in `data/performance_profile.txt`; the env var still overrides it. Prefer the `profile` subcommand below, which applies the change without changing your UUID.
 - `G2RAY_LOW_OVERHEAD=1` **(Optional)** — Starts the panel in low-overhead mode, reducing INFO logs and less-essential background route/export refreshes. You can also toggle this from option `18`.
 - `G2RAY_LATENCY_FOCUS=1` **(Optional)** — Starts the panel in latency-focus mode, keeping heartbeat/self-heal active while suppressing noncritical logs and minimizing background route/export refreshes. You can also toggle this from option `49`.
 - `G2RAY_PORT_PUBLIC_TTL_SEC` **(Optional)** — Seconds to trust the last successful `gh codespace ports visibility 443:public` call before calling GitHub again. Default: `300`.
@@ -250,8 +250,13 @@ bash ./g2ray.sh start
 bash ./g2ray.sh export
 bash ./g2ray.sh --support-bundle
 bash ./g2ray.sh latency-focus on
+bash ./g2ray.sh profile max_throughput
 bash ./g2ray.sh bench --json --mock
 ```
+
+`profile <name>` saves the performance profile to `data/performance_profile.txt` and, if a config already exists, re-applies it to the running config **keeping the same UUID**, so you do not have to re-import client links. Run `profile` (or `profile status`) with no name to print the current profile and the available names. This is the reliable way to switch profiles in a Codespace, because it does not depend on exporting `G2RAY_PERFORMANCE_PROFILE` in the same shell the panel happens to launch from.
+
+`bench` now runs in an isolated throwaway runtime directory by default; pass `bench --live` only if you intentionally want the budget checks to run against your real `data/`/`logs/` (which reasserts port visibility and rewrites exports). `bench --json --mock` remains the explicit isolated form CI uses.
 
 `--recover-now` is non-interactive and soft-only: it verifies/starts Xray, reasserts public port visibility, waits for route readiness, refreshes route candidates, and refreshes exported configs. If the route is still settling, it can exit nonzero; open the interactive panel and use option `6) Recover Now` if you want the hard restart prompt.
 
