@@ -2591,9 +2591,16 @@ generate_link_for_address() {
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     encoded_path=$(url_encode_query_value "$path")
-    if xhttp_link_keepalive_enabled && [[ "${XHTTP_LINK_KEEPALIVE_SEC:-0}" =~ ^[0-9]+$ ]] && (( XHTTP_LINK_KEEPALIVE_SEC > 0 )); then
-        extra_param="&extra=$(url_encode_query_value "{\"xmux\":{\"hKeepAlivePeriod\":${XHTTP_LINK_KEEPALIVE_SEC}}}")"
+    # The XHTTP `extra` object. G2RAY_XHTTP_EXTRA_JSON lets you supply the whole
+    # thing verbatim (e.g. extra xmux/scMaxEachPostBytes fields) for experiments;
+    # otherwise we emit just the xmux keepalive.
+    local extra_json=""
+    if [[ -n "${G2RAY_XHTTP_EXTRA_JSON:-}" ]]; then
+        extra_json="$G2RAY_XHTTP_EXTRA_JSON"
+    elif xhttp_link_keepalive_enabled && [[ "${XHTTP_LINK_KEEPALIVE_SEC:-0}" =~ ^[0-9]+$ ]] && (( XHTTP_LINK_KEEPALIVE_SEC > 0 )); then
+        extra_json="{\"xmux\":{\"hKeepAlivePeriod\":${XHTTP_LINK_KEEPALIVE_SEC}}}"
     fi
+    [[ -n "$extra_json" ]] && extra_param="&extra=$(url_encode_query_value "$extra_json")"
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=packet-up%s#G2rayXCodeLeafy|%s' \
         "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
 }
