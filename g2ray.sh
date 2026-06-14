@@ -142,6 +142,13 @@ TCP_KEEPALIVE_INTERVAL_SEC="${G2RAY_TCP_KEEPALIVE_INTERVAL:-15}"
 TCP_KEEPALIVE_IDLE_SEC="${G2RAY_TCP_KEEPALIVE_IDLE:-30}"
 [[ "$TCP_KEEPALIVE_INTERVAL_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_INTERVAL_SEC=15
 [[ "$TCP_KEEPALIVE_IDLE_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_IDLE_SEC=30
+# XHTTP client keepalive baked into exported links via the `extra` (xmux)
+# parameter. hKeepAlivePeriod sends HTTP/2 PINGs from the client so GitHub's
+# edge does not idle-close the session (the root cause of "app stops loading
+# until reopened"). xmux also consolidates streams, so fewer sessions can go
+# stale. Disable with G2RAY_XHTTP_KEEPALIVE=0 if a client cannot import the link.
+XHTTP_LINK_KEEPALIVE_SEC="${G2RAY_XHTTP_KEEPALIVE_SEC:-30}"
+[[ "$XHTTP_LINK_KEEPALIVE_SEC" =~ ^[0-9]+$ ]] || XHTTP_LINK_KEEPALIVE_SEC=30
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
@@ -2568,15 +2575,27 @@ url_encode_query_value() {
     printf '%s' "$encoded"
 }
 
+xhttp_link_keepalive_enabled() {
+    local value
+    value=$(printf '%s' "${G2RAY_XHTTP_KEEPALIVE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$value" in
+        0|false|no|off|disabled) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 generate_link_for_address() {
-    local address="$1" label_suffix="${2:-}" uuid path encoded_path
+    local address="$1" label_suffix="${2:-}" uuid path encoded_path extra_param=""
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     encoded_path=$(url_encode_query_value "$path")
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=packet-up#G2rayXCodeLeafy|%s' \
-        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "${GITHUB_USER:-User}${label_suffix}"
+    if xhttp_link_keepalive_enabled && [[ "${XHTTP_LINK_KEEPALIVE_SEC:-0}" =~ ^[0-9]+$ ]] && (( XHTTP_LINK_KEEPALIVE_SEC > 0 )); then
+        extra_param="&extra=$(url_encode_query_value "{\"xmux\":{\"hKeepAlivePeriod\":${XHTTP_LINK_KEEPALIVE_SEC}}}")"
+    fi
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=packet-up%s#G2rayXCodeLeafy|%s' \
+        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
 }
 
 generate_domain_link() {

@@ -282,7 +282,13 @@ test_connection_keepalive_and_halfclose_are_tuned() {
     if grep_fixed 'uplinkOnly=1\ndownlinkOnly=2' "$SCRIPT"; then
         fail 'profiles still use the over-aggressive 1/2 half-close timeouts that prematurely drop idle connections'
     fi
-    pass 'TCP keepalive is enabled and half-close timeouts are not over-aggressive'
+    grep_fixed 'xhttp_link_keepalive_enabled()' "$SCRIPT" \
+        || fail 'exported links cannot carry XHTTP client keepalive'
+    grep_fixed 'hKeepAlivePeriod' "$SCRIPT" \
+        || fail 'exported links do not set XHTTP xmux hKeepAlivePeriod to stop edge idle-close'
+    grep_fixed 'G2RAY_XHTTP_KEEPALIVE' "$SCRIPT" \
+        || fail 'XHTTP link keepalive is not toggleable for incompatible clients'
+    pass 'TCP keepalive, link XHTTP keepalive, and half-close timeouts are tuned'
 }
 
 test_performance_profile_is_persistent_and_bench_is_isolated() {
