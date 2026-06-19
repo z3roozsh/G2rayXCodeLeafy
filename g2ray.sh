@@ -2584,6 +2584,24 @@ xhttp_link_keepalive_enabled() {
     esac
 }
 
+xhttp_extra_json_valid() {
+    local value="${1:-}"
+    [[ -n "$value" ]] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$value" | jq -e 'type == "object"' >/dev/null 2>&1
+        return $?
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$value" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if isinstance(data, dict) else 1)' >/dev/null 2>&1
+        return $?
+    fi
+    if command -v python >/dev/null 2>&1; then
+        printf '%s' "$value" | python -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if isinstance(data, dict) else 1)' >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
 generate_link_for_address() {
     local address="$1" label_suffix="${2:-}" uuid path encoded_path extra_param=""
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
@@ -2596,8 +2614,13 @@ generate_link_for_address() {
     # otherwise we emit just the xmux keepalive.
     local extra_json=""
     if [[ -n "${G2RAY_XHTTP_EXTRA_JSON:-}" ]]; then
-        extra_json="$G2RAY_XHTTP_EXTRA_JSON"
-    elif xhttp_link_keepalive_enabled && [[ "${XHTTP_LINK_KEEPALIVE_SEC:-0}" =~ ^[0-9]+$ ]] && (( XHTTP_LINK_KEEPALIVE_SEC > 0 )); then
+        if xhttp_extra_json_valid "$G2RAY_XHTTP_EXTRA_JSON"; then
+            extra_json="$G2RAY_XHTTP_EXTRA_JSON"
+        else
+            log_event WARN "xhttp_extra_json invalid action=use_default_keepalive"
+        fi
+    fi
+    if [[ -z "$extra_json" ]] && xhttp_link_keepalive_enabled && [[ "${XHTTP_LINK_KEEPALIVE_SEC:-0}" =~ ^[0-9]+$ ]] && (( XHTTP_LINK_KEEPALIVE_SEC > 0 )); then
         extra_json="{\"xmux\":{\"hKeepAlivePeriod\":${XHTTP_LINK_KEEPALIVE_SEC}}}"
     fi
     [[ -n "$extra_json" ]] && extra_param="&extra=$(url_encode_query_value "$extra_json")"
@@ -2984,13 +3007,14 @@ cached_usable_fallback_ips() {
             avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
             score_ms = ((ip in ewma) && ewma[ip] > 0) ? ewma[ip] : avg_ms
             last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
+            route_score = score_ms + success_penalty
             pinned_rank = (ip == pinned) ? 0 : 1
             last_good_rank = (ip == last_good) ? 0 : 1
-            printf "%d\t%04d\t%08d\t%08d\t%d\t%s\t%s\t%s\n",
-                pinned_rank, success_penalty, score_ms, last_ms, last_good_rank, ip, $3, $4
+            printf "%d\t%08d\t%08d\t%04d\t%08d\t%d\t%s\t%s\t%s\n",
+                pinned_rank, route_score, score_ms, success_penalty, last_ms, last_good_rank, ip, $3, $4
         }
-    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
-        | while IFS=$'\t' read -r _pinned _success _avg _latest _last_good ip _code _ms; do
+    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n \
+        | while IFS=$'\t' read -r _pinned _route_score _avg _success _latest _last_good ip _code _ms; do
             valid_ipv4 "$ip" || continue
             candidate_blacklisted "$ip" && continue
             route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
@@ -3038,16 +3062,17 @@ route_candidate_health_summary() {
             avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
             score_ms = ((ip in ewma) && ewma[ip] > 0) ? ewma[ip] : avg_ms
             last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
+            route_score = score_ms + success_penalty
             pinned_rank = (ip == pinned) ? 0 : 1
             source = (NF >= 6 && $6 != "") ? $6 : "unknown"
             reason = (NF >= 7 && $7 != "") ? $7 : ((ip in last_reason) ? last_reason[ip] : "unknown")
             line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms recent_fail=%s usable=%s source=%s reason=%s",
                 ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, $5, source, reason)
-            printf "%d\t%d\t%04d\t%08d\t%08d\t%s\t%s\n",
-                pinned_rank, usable_rank, success_penalty, score_ms, last_ms, ip, line
+            printf "%d\t%d\t%08d\t%08d\t%04d\t%08d\t%s\t%s\n",
+                pinned_rank, usable_rank, route_score, score_ms, success_penalty, last_ms, ip, line
         }
-    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
-        | while IFS=$'\t' read -r _pinned _usable _success _avg _latest ip line; do
+    ' "$stats_input" "$ROUTE_HEALTH_FILE" 2>/dev/null | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n \
+        | while IFS=$'\t' read -r _pinned _usable _route_score _avg _success _latest ip line; do
             candidate_blacklisted "$ip" && continue
             printf '%s\n' "$line"
         done

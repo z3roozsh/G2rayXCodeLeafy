@@ -64,7 +64,7 @@ reset_runtime_paths() {
     DNS_CACHE_TTL_SEC=300
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_KEEPALIVE G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -294,6 +294,24 @@ EOF
     [[ "${routes[0]:-}" == "20.0.0.2" ]] || fail "recent weighted route score did not outrank stale cumulative average"
     [[ "${routes[1]:-}" == "20.0.0.1" ]] || fail "route with stale cumulative average was not kept second"
     pass "cached route health orders exports by recent weighted score"
+}
+
+test_cached_route_order_does_not_overweight_tiny_reliability_delta() {
+    reset_runtime_paths
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-06-17T03:19:17Z	20.207.70.99	200	2575	true	cache	ready
+2026-06-17T03:19:17Z	20.85.77.48	200	248	true	cache	ready
+EOF
+    cat > "$ROUTE_STATS_FILE" <<'EOF'
+20.207.70.99	302	299	3	2669	1000	3000	2575	200	true	2026-06-17T03:19:17Z	2289	0	ready
+20.85.77.48	533	525	8	160	50	700	248	200	true	2026-06-17T03:19:17Z	257	0	ready
+EOF
+    mapfile -t routes < <(cached_usable_fallback_ips)
+    [[ "${routes[0]:-}" == "20.85.77.48" ]] \
+        || fail "tiny reliability delta let a multi-second route outrank a much faster route: ${routes[*]:-none}"
+    [[ "${routes[1]:-}" == "20.207.70.99" ]] \
+        || fail "slower but usable route was not kept after the faster route"
+    pass "cached route health does not overweight tiny reliability deltas"
 }
 
 test_last_good_route_decays_before_breaking_ties() {
@@ -1000,6 +1018,28 @@ JSON
     pass "generated links follow configured XHTTP path"
 }
 
+test_custom_xhttp_extra_json_is_validated() {
+    reset_runtime_paths
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+
+    local link
+    G2RAY_XHTTP_EXTRA_JSON='{"xmux":{"hKeepAlivePeriod":15,"hMaxRequestTimes":600}}'
+    link="$(generate_link_for_address "20.0.0.1" "-ip1")"
+    [[ "$link" == *"hMaxRequestTimes"* || "$link" == *"hMaxRequestTimes%22%3A600"* ]] \
+        || fail "valid custom XHTTP extra JSON was not included in generated link: $link"
+
+    G2RAY_XHTTP_EXTRA_JSON='not-json'
+    link="$(generate_link_for_address "20.0.0.1" "-ip1")"
+    [[ "$link" != *"extra=not-json"* ]] \
+        || fail "invalid custom XHTTP extra JSON was exported verbatim"
+    [[ "$link" == *"hKeepAlivePeriod"* || "$link" == *"hKeepAlivePeriod%22%3A30"* ]] \
+        || fail "invalid custom XHTTP extra JSON did not fall back to default keepalive: $link"
+    pass "custom XHTTP extra JSON is validated"
+}
+
 test_config_metadata_sanitizes_invalid_max_fallback_links() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -1634,6 +1674,7 @@ test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_cached_route_order_uses_reliability_then_average_latency
 test_cached_route_order_uses_recent_weighted_score
+test_cached_route_order_does_not_overweight_tiny_reliability_delta
 test_last_good_route_decays_before_breaking_ties
 test_route_candidate_stats_track_average_and_success_rate
 test_route_health_records_source_reason_and_recent_average
@@ -1667,6 +1708,7 @@ test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_generated_links_follow_configured_xhttp_path
+test_custom_xhttp_extra_json_is_validated
 test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets
 test_low_overhead_mode_suppresses_info_logs
