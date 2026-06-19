@@ -142,13 +142,6 @@ TCP_KEEPALIVE_INTERVAL_SEC="${G2RAY_TCP_KEEPALIVE_INTERVAL:-15}"
 TCP_KEEPALIVE_IDLE_SEC="${G2RAY_TCP_KEEPALIVE_IDLE:-30}"
 [[ "$TCP_KEEPALIVE_INTERVAL_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_INTERVAL_SEC=15
 [[ "$TCP_KEEPALIVE_IDLE_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_IDLE_SEC=30
-# XHTTP client keepalive baked into exported links via the `extra` (xmux)
-# parameter. hKeepAlivePeriod sends HTTP/2 PINGs from the client so GitHub's
-# edge does not idle-close the session (the root cause of "app stops loading
-# until reopened"). xmux also consolidates streams, so fewer sessions can go
-# stale. Disable with G2RAY_XHTTP_KEEPALIVE=0 if a client cannot import the link.
-XHTTP_LINK_KEEPALIVE_SEC="${G2RAY_XHTTP_KEEPALIVE_SEC:-30}"
-[[ "$XHTTP_LINK_KEEPALIVE_SEC" =~ ^[0-9]+$ ]] || XHTTP_LINK_KEEPALIVE_SEC=30
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
@@ -2575,15 +2568,6 @@ url_encode_query_value() {
     printf '%s' "$encoded"
 }
 
-xhttp_link_keepalive_enabled() {
-    local value
-    value=$(printf '%s' "${G2RAY_XHTTP_KEEPALIVE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    case "$value" in
-        0|false|no|off|disabled) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
 xhttp_extra_json_valid() {
     local value="${1:-}"
     [[ -n "$value" ]] || return 1
@@ -2609,19 +2593,15 @@ generate_link_for_address() {
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     encoded_path=$(url_encode_query_value "$path")
-    # The XHTTP `extra` object. G2RAY_XHTTP_EXTRA_JSON lets you supply the whole
-    # thing verbatim (e.g. extra xmux/scMaxEachPostBytes fields) for experiments;
-    # otherwise we emit just the xmux keepalive.
+    # Keep exported links broadly compatible: omit XHTTP `extra` unless the user
+    # explicitly supplies a complete, valid object for a known-compatible client.
     local extra_json=""
     if [[ -n "${G2RAY_XHTTP_EXTRA_JSON:-}" ]]; then
         if xhttp_extra_json_valid "$G2RAY_XHTTP_EXTRA_JSON"; then
             extra_json="$G2RAY_XHTTP_EXTRA_JSON"
         else
-            log_event WARN "xhttp_extra_json invalid action=use_default_keepalive"
+            log_event WARN "xhttp_extra_json invalid action=omit_extra"
         fi
-    fi
-    if [[ -z "$extra_json" ]] && xhttp_link_keepalive_enabled && [[ "${XHTTP_LINK_KEEPALIVE_SEC:-0}" =~ ^[0-9]+$ ]] && (( XHTTP_LINK_KEEPALIVE_SEC > 0 )); then
-        extra_json="{\"xmux\":{\"hKeepAlivePeriod\":${XHTTP_LINK_KEEPALIVE_SEC}}}"
     fi
     [[ -n "$extra_json" ]] && extra_param="&extra=$(url_encode_query_value "$extra_json")"
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=packet-up%s#G2rayXCodeLeafy|%s' \

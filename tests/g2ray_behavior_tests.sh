@@ -64,7 +64,7 @@ reset_runtime_paths() {
     DNS_CACHE_TTL_SEC=300
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_KEEPALIVE G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -1026,6 +1026,10 @@ test_custom_xhttp_extra_json_is_validated() {
     printf '{}\n' > "$CONFIG_FILE"
 
     local link
+    link="$(generate_link_for_address "20.0.0.1" "-ip1")"
+    [[ "$link" != *"&extra="* ]] \
+        || fail "default generated link unexpectedly contains an XHTTP extra parameter: $link"
+
     G2RAY_XHTTP_EXTRA_JSON='{"xmux":{"hKeepAlivePeriod":15,"hMaxRequestTimes":600}}'
     link="$(generate_link_for_address "20.0.0.1" "-ip1")"
     [[ "$link" == *"hMaxRequestTimes"* || "$link" == *"hMaxRequestTimes%22%3A600"* ]] \
@@ -1035,9 +1039,9 @@ test_custom_xhttp_extra_json_is_validated() {
     link="$(generate_link_for_address "20.0.0.1" "-ip1")"
     [[ "$link" != *"extra=not-json"* ]] \
         || fail "invalid custom XHTTP extra JSON was exported verbatim"
-    [[ "$link" == *"hKeepAlivePeriod"* || "$link" == *"hKeepAlivePeriod%22%3A30"* ]] \
-        || fail "invalid custom XHTTP extra JSON did not fall back to default keepalive: $link"
-    pass "custom XHTTP extra JSON is validated"
+    [[ "$link" != *"&extra="* ]] \
+        || fail "invalid custom XHTTP extra JSON unexpectedly added a default extra parameter: $link"
+    pass "custom XHTTP extra JSON is opt-in and validated"
 }
 
 test_config_metadata_sanitizes_invalid_max_fallback_links() {
