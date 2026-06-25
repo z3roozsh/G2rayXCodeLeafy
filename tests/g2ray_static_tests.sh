@@ -429,6 +429,13 @@ test_websocket_fallback_is_advanced_opt_in() {
         || fail 'script cannot generate WebSocket fallback links'
     grep_fixed 'generate_ws_front_link()' "$SCRIPT" \
         || fail 'script cannot generate Cloudflare WebSocket front links'
+    grep_fixed 'generate_ws_link_variants_for_address()' "$SCRIPT" \
+        || fail 'script cannot generate h2/h1/blank WebSocket ALPN variants'
+    grep_fixed 'ws_alpn_query_param()' "$SCRIPT" \
+        || fail 'script does not centralize WebSocket ALPN query generation'
+    if grep_fixed 'alpn=h2,http/1.1' "$SCRIPT"; then
+        fail 'WebSocket links still export the old mixed ALPN value instead of separate variants'
+    fi
     grep_fixed 'type=ws' "$SCRIPT" \
         || fail 'WebSocket fallback links do not use type=ws'
     grep_fixed 'ensure_codespace_port_public_for_port "$WS_PORT"' "$SCRIPT" \
@@ -1386,6 +1393,10 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README does not document latency focus mode'
     grep_fixed 'G2RAY_LATENCY_FOCUS=1' "$README" \
         || fail 'README does not document the latency focus environment flag'
+    grep_fixed 'applies the `low_latency` profile' "$README" \
+        || fail 'README does not state that latency focus applies the real low_latency profile'
+    grep_fixed 'applies the `low_overhead` profile' "$README" \
+        || fail 'README does not state that low-overhead applies the real low_overhead profile'
     grep_fixed 'wake attempts' "$WORKER_README" \
         || fail 'Worker README overstates or omits alert trigger scope'
     grep_fixed 'next_action_code' "$WORKER_README" \

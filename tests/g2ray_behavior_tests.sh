@@ -39,6 +39,9 @@ reset_runtime_paths() {
     WS_FALLBACK_FILE="$DATA_DIR/ws_fallback_mode"
     WS_FALLBACK_DISABLED_FILE="$DATA_DIR/ws_fallback_mode_disabled"
     WS_FRONT_DOMAIN_FILE="$DATA_DIR/ws_front_domain.txt"
+    LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
+    LATENCY_FOCUS_PREV_PROFILE_FILE="$DATA_DIR/latency_focus_previous_profile.txt"
+    PERFORMANCE_PROFILE_FILE="$DATA_DIR/performance_profile.txt"
     DOMAIN_LINK_EXPORT_FILE="$DATA_DIR/export_domain_link.txt"
     SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
     CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
@@ -67,7 +70,8 @@ reset_runtime_paths() {
     DNS_CACHE_TTL_SEC=300
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
+    PERFORMANCE_PROFILE=balanced
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -1099,6 +1103,47 @@ test_websocket_fallback_is_advanced_opt_in() {
     pass "WebSocket fallback links are advanced opt-in"
 }
 
+test_websocket_fallback_exports_separate_alpn_variants() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    GITHUB_USER="tester"
+    G2RAY_EXPORT_DOMAIN_LINK=0
+    WS_MAX_FALLBACK_LINKS=1
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    local original_usable_fallback_ips
+    original_usable_fallback_ips="$(declare -f usable_fallback_ips)"
+    usable_fallback_ips() { printf '20.0.0.5\n'; }
+
+    enable_ws_fallback_mode
+
+    local h2 h1 blank links count
+    h2="$(generate_ws_link_for_address "20.0.0.5" "-ws-ip1-h2" "h2")"
+    h1="$(generate_ws_link_for_address "20.0.0.5" "-ws-ip1-h1" "h1")"
+    blank="$(generate_ws_link_for_address "20.0.0.5" "-ws-ip1-auto" "blank")"
+
+    [[ "$h2" == *"alpn=h2"* ]] || fail "WS h2 variant does not force h2 ALPN: $h2"
+    [[ "$h2" != *"http%2F1.1"* && "$h2" != *"h2,http"* ]] || fail "WS h2 variant still contains mixed ALPN: $h2"
+    [[ "$h1" == *"alpn=http%2F1.1"* ]] || fail "WS h1 variant does not force http/1.1 ALPN: $h1"
+    [[ "$h1" != *"alpn=h2"* && "$h1" != *"h2,http"* ]] || fail "WS h1 variant still contains h2 or mixed ALPN: $h1"
+    [[ "$blank" != *"alpn="* ]] || fail "WS blank variant should omit ALPN entirely: $blank"
+
+    links="$(generate_ws_links)"
+    count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
+    [[ "$count" == "3" ]] || fail "one WS route should export h2, h1, and blank ALPN variants, got $count: $links"
+    grep -Fq 'z3roozsh' <<< "$links" && fail "test leaked a real username into WS fixture links"
+    grep -Fq 'G2rayXCodeLeafy|tester-ws-ip1-h2' <<< "$links" || fail "WS h2 route variant label missing"
+    grep -Fq 'G2rayXCodeLeafy|tester-ws-ip1-h1' <<< "$links" || fail "WS h1 route variant label missing"
+    grep -Fq 'G2rayXCodeLeafy|tester-ws-ip1-auto' <<< "$links" || fail "WS blank route variant label missing"
+    if grep -Fq 'alpn=h2,http' <<< "$links"; then
+        fail "WS exports still include the old combined ALPN value"
+    fi
+    eval "$original_usable_fallback_ips"
+    pass "WebSocket fallback exports separate h2, h1, and blank ALPN variants"
+}
+
 test_websocket_fallback_persists_from_panel_state() {
     reset_runtime_paths
     CODESPACE_NAME="behavior-space"
@@ -1136,9 +1181,9 @@ test_websocket_front_domain_generates_cloudflare_link() {
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
     printf '{}\n' > "$CONFIG_FILE"
-    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
-2026-05-30T00:00:00Z	20.0.0.5	200	70	true
-EOF
+    local original_usable_fallback_ips
+    original_usable_fallback_ips="$(declare -f usable_fallback_ips)"
+    usable_fallback_ips() { printf '20.0.0.5\n'; }
 
     enable_ws_fallback_mode
     set_ws_front_domain "https://WS.Example.COM:443/path" \
@@ -1147,18 +1192,22 @@ EOF
         || fail "front domain was not normalized to hostname-only value"
 
     local front_link first_link
-    front_link="$(generate_ws_front_link)"
+    front_link="$(generate_ws_front_link "h1")"
     [[ "$front_link" == *"@ws.example.com:443"* ]] || fail "front link does not use front domain as address: $front_link"
     [[ "$front_link" == *"sni=ws.example.com"* ]] || fail "front link does not use front domain as SNI: $front_link"
     [[ "$front_link" == *"host=ws.example.com"* ]] || fail "front link does not use front domain as Host: $front_link"
+    [[ "$front_link" == *"alpn=http%2F1.1"* ]] || fail "front h1 link does not force http/1.1 ALPN: $front_link"
     [[ "$front_link" == *"type=ws"* ]] || fail "front link is not a WebSocket link: $front_link"
 
     first_link="$(generate_ws_links | awk 'NF && !seen {print; seen=1} END {exit 0}')"
-    [[ "$first_link" == "$front_link" ]] || fail "Cloudflare front link is not first WS fallback link"
+    [[ "$first_link" == "$(generate_ws_front_link "h2")" ]] || fail "Cloudflare front h2 link is not first WS fallback link"
+    [[ "$(generate_ws_links | awk 'NF {c++} END {print c+0}')" == "9" ]] \
+        || fail "front + one IP + domain should each export 3 WS ALPN variants"
 
     if set_ws_front_domain "bad host name"; then
         fail "invalid front domain with spaces was accepted"
     fi
+    eval "$original_usable_fallback_ips"
     pass "WebSocket front domain generates a Cloudflare-ready link"
 }
 
@@ -1354,6 +1403,43 @@ test_latency_focus_env_can_be_overridden_by_toggle() {
     unset G2RAY_LATENCY_FOCUS
     disable_latency_focus_mode
     pass "latency-focus mode can be explicitly toggled even when env default is enabled"
+}
+
+test_panel_modes_apply_real_performance_profiles() {
+    reset_runtime_paths
+    local calls_file="$TMP_ROOT/profile-reapply-calls.txt"
+    : > "$calls_file"
+    printf '{}\n' > "$CONFIG_FILE"
+    generate_config() {
+        printf 'profile=%s effective=%s preserve=%s\n' \
+            "$PERFORMANCE_PROFILE" "$(effective_performance_profile)" "${G2RAY_PRESERVE_UUID:-0}" >> "$calls_file"
+    }
+
+    set_performance_profile max_throughput
+    toggle_low_overhead_mode >/dev/null
+    low_overhead_enabled || fail "low-overhead toggle did not enable mode"
+    [[ "$PERFORMANCE_PROFILE" == "low_overhead" ]] || fail "low-overhead mode did not select the low_overhead profile"
+    grep -Fq 'effective=low_overhead preserve=1' "$calls_file" \
+        || fail "low-overhead toggle did not reapply the config with preserved UUID"
+
+    : > "$calls_file"
+    toggle_latency_focus_mode >/dev/null
+    latency_focus_enabled || fail "latency-focus toggle did not enable mode"
+    if low_overhead_enabled; then
+        fail "latency-focus mode should disable the conflicting low-overhead mode"
+    fi
+    [[ "$PERFORMANCE_PROFILE" == "low_latency" ]] || fail "latency-focus mode did not select the low_latency profile"
+    grep -Fq 'effective=low_latency preserve=1' "$calls_file" \
+        || fail "latency-focus toggle did not reapply the config with preserved UUID"
+
+    : > "$calls_file"
+    toggle_latency_focus_mode >/dev/null || true
+    latency_focus_enabled && fail "latency-focus toggle did not disable mode"
+    [[ "$PERFORMANCE_PROFILE" == "max_throughput" ]] || fail "latency-focus disable did not restore previous profile"
+    grep -Fq 'effective=max_throughput preserve=1' "$calls_file" \
+        || fail "latency-focus disable did not reapply the restored profile with preserved UUID"
+
+    pass "panel modes apply real performance profiles and preserve UUID"
 }
 
 test_performance_profile_settings_are_available() {
@@ -1865,6 +1951,7 @@ test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_generated_links_follow_configured_xhttp_path
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
+test_websocket_fallback_exports_separate_alpn_variants
 test_websocket_fallback_persists_from_panel_state
 test_websocket_front_domain_generates_cloudflare_link
 test_websocket_fallback_adds_config_and_public_port
@@ -1875,6 +1962,7 @@ test_low_overhead_env_can_be_overridden_by_toggle
 test_low_overhead_keeps_important_state_logs
 test_latency_focus_mode_suppresses_noncritical_logs
 test_latency_focus_env_can_be_overridden_by_toggle
+test_panel_modes_apply_real_performance_profiles
 test_performance_profile_settings_are_available
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state

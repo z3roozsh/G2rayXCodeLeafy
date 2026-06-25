@@ -75,8 +75,10 @@ BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
 LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
 LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
+LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
 LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
 LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
+LATENCY_FOCUS_PREV_PROFILE_FILE="$DATA_DIR/latency_focus_previous_profile.txt"
 WS_FALLBACK_FILE="$DATA_DIR/ws_fallback_mode"
 WS_FALLBACK_DISABLED_FILE="$DATA_DIR/ws_fallback_mode_disabled"
 WS_FRONT_DOMAIN_FILE="$DATA_DIR/ws_front_domain.txt"
@@ -185,16 +187,61 @@ low_overhead_enabled() {
     [[ "${G2RAY_LOW_OVERHEAD:-0}" == "1" ]]
 }
 
+save_previous_performance_profile() {
+    local file="$1" mode_profile="$2" current
+    current="${PERFORMANCE_PROFILE:-balanced}"
+    [[ -s "$file" ]] && return 0
+    [[ "$current" == "$mode_profile" ]] && return 0
+    _atomic_write "$file" "$current"
+    chmod 600 "$file" 2>/dev/null || true
+}
+
+restore_previous_performance_profile() {
+    local file="$1" previous
+    previous=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$file" 2>/dev/null || true)
+    if [[ -n "$previous" ]] && valid_performance_profile "$previous"; then
+        set_performance_profile "$previous" || true
+    else
+        set_performance_profile "balanced" || true
+    fi
+    rm -f "$file" 2>/dev/null || true
+}
+
+reapply_config_preserving_uuid_if_exists() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local _prev_preserve_set="${G2RAY_PRESERVE_UUID+x}" _prev_preserve="${G2RAY_PRESERVE_UUID:-}" _status
+    G2RAY_PRESERVE_UUID=1
+    if generate_config; then
+        _status=0
+    else
+        _status=$?
+    fi
+    if [[ "$_prev_preserve_set" == "x" ]]; then
+        G2RAY_PRESERVE_UUID="$_prev_preserve"
+    else
+        unset G2RAY_PRESERVE_UUID
+    fi
+    return "$_status"
+}
+
 enable_low_overhead_mode() {
+    if latency_focus_enabled; then
+        disable_latency_focus_mode
+    fi
     rm -f "$LOW_OVERHEAD_DISABLED_FILE" 2>/dev/null || true
     printf 'enabled\n' > "$LOW_OVERHEAD_FILE"
     chmod 600 "$LOW_OVERHEAD_FILE" 2>/dev/null || true
+    save_previous_performance_profile "$LOW_OVERHEAD_PREV_PROFILE_FILE" "low_overhead"
+    set_performance_profile "low_overhead" || true
+    reapply_config_preserving_uuid_if_exists
 }
 
 disable_low_overhead_mode() {
     rm -f "$LOW_OVERHEAD_FILE" 2>/dev/null || true
     printf 'disabled\n' > "$LOW_OVERHEAD_DISABLED_FILE"
     chmod 600 "$LOW_OVERHEAD_DISABLED_FILE" 2>/dev/null || true
+    restore_previous_performance_profile "$LOW_OVERHEAD_PREV_PROFILE_FILE"
+    reapply_config_preserving_uuid_if_exists
 }
 
 toggle_low_overhead_mode() {
@@ -208,7 +255,7 @@ toggle_low_overhead_mode() {
 
 low_overhead_summary() {
     if low_overhead_enabled; then
-        printf 'Enabled - background route refresh and INFO log chatter are reduced\n'
+        printf 'Enabled - applies low_overhead profile and reduces background route refresh / INFO log chatter\n'
     else
         printf 'Disabled - full monitoring and INFO logs are enabled\n'
     fi
@@ -221,15 +268,23 @@ latency_focus_enabled() {
 }
 
 enable_latency_focus_mode() {
+    if low_overhead_enabled; then
+        disable_low_overhead_mode
+    fi
     rm -f "$LATENCY_FOCUS_DISABLED_FILE" 2>/dev/null || true
     printf 'enabled\n' > "$LATENCY_FOCUS_FILE"
     chmod 600 "$LATENCY_FOCUS_FILE" 2>/dev/null || true
+    save_previous_performance_profile "$LATENCY_FOCUS_PREV_PROFILE_FILE" "low_latency"
+    set_performance_profile "low_latency" || true
+    reapply_config_preserving_uuid_if_exists
 }
 
 disable_latency_focus_mode() {
     rm -f "$LATENCY_FOCUS_FILE" 2>/dev/null || true
     printf 'disabled\n' > "$LATENCY_FOCUS_DISABLED_FILE"
     chmod 600 "$LATENCY_FOCUS_DISABLED_FILE" 2>/dev/null || true
+    restore_previous_performance_profile "$LATENCY_FOCUS_PREV_PROFILE_FILE"
+    reapply_config_preserving_uuid_if_exists
 }
 
 toggle_latency_focus_mode() {
@@ -243,9 +298,19 @@ toggle_latency_focus_mode() {
 
 latency_focus_summary() {
     if latency_focus_enabled; then
-        printf 'Enabled - keeps heartbeat/self-heal, suppresses noncritical logs, and minimizes background refreshes\n'
+        printf 'Enabled - applies low_latency profile, keeps heartbeat/self-heal, and minimizes noncritical background work\n'
     else
         printf 'Disabled - normal diagnostics, route refresh, and exports are enabled\n'
+    fi
+}
+
+effective_performance_profile() {
+    if latency_focus_enabled; then
+        printf 'low_latency'
+    elif low_overhead_enabled; then
+        printf 'low_overhead'
+    else
+        printf '%s' "${PERFORMANCE_PROFILE:-balanced}"
     fi
 }
 
@@ -2585,7 +2650,7 @@ generate_config() {
             sniffQuic) sniff_quic="$value" ;;
             loglevel) loglevel="$value" ;;
         esac
-    done < <(performance_profile_settings "$PERFORMANCE_PROFILE")
+    done < <(performance_profile_settings "$(effective_performance_profile)")
     profile_name="${profile_name:-balanced}"
     max_upload_size="${max_upload_size:-2000000}"
     max_concurrent_uploads="${max_concurrent_uploads:-16}"
@@ -2765,27 +2830,79 @@ generate_link_for_address() {
         "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
 }
 
+ws_alpn_query_param() {
+    local mode="${1:-h2}"
+    case "$mode" in
+        h2) printf '&alpn=h2' ;;
+        h1|http1|http/1.1) printf '&alpn=http%%2F1.1' ;;
+        blank|auto|none|'') printf '' ;;
+        *) printf '&alpn=h2' ;;
+    esac
+}
+
+ws_alpn_label_suffix() {
+    local mode="${1:-h2}"
+    case "$mode" in
+        h2) printf 'h2' ;;
+        h1|http1|http/1.1) printf 'h1' ;;
+        blank|auto|none|'') printf 'auto' ;;
+        *) printf 'h2' ;;
+    esac
+}
+
+ws_link_alpn_label() {
+    local link="$1"
+    if [[ "$link" == *"alpn=http%2F1.1"* ]]; then
+        printf 'h1.1'
+    elif [[ "$link" == *"alpn=h2"* ]]; then
+        printf 'h2'
+    else
+        printf 'blank ALPN'
+    fi
+}
+
 generate_ws_link_for_address() {
     ws_fallback_enabled || return 1
-    local address="$1" label_suffix="${2:-}" uuid path encoded_path
+    local address="$1" label_suffix="${2:-}" alpn_mode="${3:-h2}" uuid path encoded_path alpn_param
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(ws_path_value)
     encoded_path=$(url_encode_query_value "$path")
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2,http/1.1&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#G2rayXCodeLeafy|%s' \
-        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$WS_PORT_DOMAIN" "$WS_PORT_DOMAIN" "$encoded_path" "${GITHUB_USER:-User}${label_suffix}"
+    alpn_param=$(ws_alpn_query_param "$alpn_mode")
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome%s&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#G2rayXCodeLeafy|%s' \
+        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$WS_PORT_DOMAIN" "$alpn_param" "$WS_PORT_DOMAIN" "$encoded_path" "${GITHUB_USER:-User}${label_suffix}"
+}
+
+generate_ws_link_variants_for_address() {
+    local address="$1" base_label_suffix="${2:-}" mode suffix printed=false
+    for mode in h2 h1 blank; do
+        suffix=$(ws_alpn_label_suffix "$mode")
+        [[ "$printed" == true ]] && printf '\n'
+        generate_ws_link_for_address "$address" "${base_label_suffix}-${suffix}" "$mode"
+        printed=true
+    done
 }
 
 generate_ws_front_link() {
     ws_fallback_enabled || return 1
-    local front_domain uuid path encoded_path
+    local alpn_mode="${1:-h2}" front_domain uuid path encoded_path alpn_param
     front_domain=$(ws_front_domain_value) || return 1
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(ws_path_value)
     encoded_path=$(url_encode_query_value "$path")
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2,http/1.1&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#G2rayXCodeLeafy|%s' \
-        "$uuid" "$front_domain" "$CODESPACES_EDGE_PORT" "$front_domain" "$front_domain" "$encoded_path" "${GITHUB_USER:-User}-ws-front"
+    alpn_param=$(ws_alpn_query_param "$alpn_mode")
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome%s&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#G2rayXCodeLeafy|%s' \
+        "$uuid" "$front_domain" "$CODESPACES_EDGE_PORT" "$front_domain" "$alpn_param" "$front_domain" "$encoded_path" "${GITHUB_USER:-User}-ws-front-$(ws_alpn_label_suffix "$alpn_mode")"
+}
+
+generate_ws_front_link_variants() {
+    local mode printed=false
+    for mode in h2 h1 blank; do
+        [[ "$printed" == true ]] && printf '\n'
+        generate_ws_front_link "$mode"
+        printed=true
+    done
 }
 
 generate_domain_link() {
@@ -2793,7 +2910,17 @@ generate_domain_link() {
 }
 
 generate_ws_domain_link() {
-    generate_ws_link_for_address "$WS_PORT_DOMAIN" "-ws-domain"
+    local mode="${1:-h2}"
+    generate_ws_link_for_address "$WS_PORT_DOMAIN" "-ws-domain-$(ws_alpn_label_suffix "$mode")" "$mode"
+}
+
+generate_ws_domain_link_variants() {
+    local mode printed=false
+    for mode in h2 h1 blank; do
+        [[ "$printed" == true ]] && printf '\n'
+        generate_ws_domain_link "$mode"
+        printed=true
+    done
 }
 
 route_monitor_max_candidates() {
@@ -3599,24 +3726,24 @@ generate_ip_links() {
 
 generate_ws_links() {
     ws_fallback_enabled || return 0
-    local address index=1 printed=false max_links front_link
+    local address index=1 printed=false max_links front_links
     max_links=$(safe_ws_fallback_links)
-    front_link=$(generate_ws_front_link 2>/dev/null || true)
-    if [[ -n "$front_link" ]]; then
-        printf '%s' "$front_link"
+    front_links=$(generate_ws_front_link_variants 2>/dev/null || true)
+    if [[ -n "$front_links" ]]; then
+        printf '%s' "$front_links"
         printed=true
     fi
     while IFS= read -r address; do
         [[ -n "$address" ]] || continue
         (( index > max_links )) && break
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_link_for_address "$address" "-ws-ip${index}"
+        generate_ws_link_variants_for_address "$address" "-ws-ip${index}"
         printed=true
         index=$(( index + 1 ))
     done < <(usable_fallback_ips)
     if domain_link_export_enabled; then
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_domain_link || true
+        generate_ws_domain_link_variants || true
     fi
 }
 
@@ -3650,7 +3777,8 @@ write_config_metadata() {
   "mobile_config_file": "$(json_escape "$MOBILE_CONFIG_FILE")",
   "subscription_file": "$(json_escape "$SUBSCRIPTION_FILE")",
   "subscription_scope": "local_codespace_only",
-  "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
+  "performance_profile": "$(json_escape "$(effective_performance_profile)")",
+  "saved_performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "ws_fallback": $(ws_fallback_enabled && printf true || printf false),
   "ws_port": ${WS_PORT},
   "ws_domain": "$(json_escape "$WS_PORT_DOMAIN")",
@@ -4007,7 +4135,7 @@ show_diagnostics() {
     echo -e "  ${DIM}These files persist across panel screens and are rotated by size.${NC}"
 
     echo -e "\n  ${WHITE}${B}Runtime Tuning${NC}"
-    echo -e "  Performance profile : ${WHITE}${PERFORMANCE_PROFILE}${NC}"
+    echo -e "  Performance profile : ${WHITE}$(effective_performance_profile)${NC} ${DIM}(saved=${PERFORMANCE_PROFILE})${NC}"
     echo -e "  Low-overhead mode   : ${WHITE}$(low_overhead_summary)${NC}"
     echo -e "  Latency focus mode  : ${WHITE}$(latency_focus_summary)${NC}"
     echo -e "  Local subscription file : ${WHITE}${SUBSCRIPTION_FILE}${NC}"
@@ -4401,7 +4529,8 @@ print_doctor_json() {
   "waker_configured": $([[ -n "$waker_url" ]] && printf true || printf false),
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
-  "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
+  "performance_profile": "$(json_escape "$(effective_performance_profile)")",
+  "saved_performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "log_file": "$(json_escape "$LOG_FILE")",
   "structured_log_file": "$(json_escape "$STRUCTURED_LOG_FILE")",
   "diagnostic_log_file": "$(json_escape "$DIAGNOSTIC_LOG_FILE")"
@@ -4492,8 +4621,10 @@ bench_rebind_runtime_paths() {
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
+    LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
     LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
     LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
+    LATENCY_FOCUS_PREV_PROFILE_FILE="$DATA_DIR/latency_focus_previous_profile.txt"
     WS_FALLBACK_FILE="$DATA_DIR/ws_fallback_mode"
     WS_FALLBACK_DISABLED_FILE="$DATA_DIR/ws_fallback_mode_disabled"
     WS_FRONT_DOMAIN_FILE="$DATA_DIR/ws_front_domain.txt"
@@ -4504,6 +4635,7 @@ bench_rebind_runtime_paths() {
     ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
     PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
     QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
+    PERFORMANCE_PROFILE_FILE="$DATA_DIR/performance_profile.txt"
     XRAY_PID_FILE="$DATA_DIR/xray.pid"
     SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
     SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
@@ -4609,7 +4741,10 @@ fi
 if [[ "${1:-}" == "--profile" || "${1:-}" == "profile" ]]; then
     case "${2:-}" in
         ""|status|show|current)
-            printf 'current_profile=%s\n' "$PERFORMANCE_PROFILE"
+            printf 'effective_profile=%s\n' "$(effective_performance_profile)"
+            printf 'saved_profile=%s\n' "$PERFORMANCE_PROFILE"
+            printf 'low_overhead=%s\n' "$(low_overhead_enabled && printf enabled || printf disabled)"
+            printf 'latency_focus=%s\n' "$(latency_focus_enabled && printf enabled || printf disabled)"
             printf 'available=balanced,low_latency,streaming,unstable_mobile,low_overhead,max_throughput\n'
             exit 0
             ;;
@@ -4847,10 +4982,11 @@ while true; do
                 _WS_FRONT_VALUE=$(ws_front_domain_value 2>/dev/null || true)
                 while IFS= read -r _LINK; do
                     [[ -n "$_LINK" ]] || continue
+                    _WS_ALPN_LABEL=$(ws_link_alpn_label "$_LINK")
                     if [[ -n "$_WS_FRONT_VALUE" && "$_LINK" == vless://*@"$_WS_FRONT_VALUE":* ]]; then
-                        _CONFIG_LABELS+=("Cloudflare WebSocket front link")
+                        _CONFIG_LABELS+=("Cloudflare WebSocket front link (${_WS_ALPN_LABEL})")
                     else
-                        _CONFIG_LABELS+=("Advanced WebSocket fallback link $((${#_CONFIG_LABELS[@]} + 1))")
+                        _CONFIG_LABELS+=("Advanced WebSocket fallback link $((${#_CONFIG_LABELS[@]} + 1)) (${_WS_ALPN_LABEL})")
                     fi
                     _CONFIG_LINKS+=("$_LINK")
                 done < <(printf '%s\n' "$_WS_LINKS" | awk 'NF')
@@ -4993,10 +5129,11 @@ while true; do
         18)
             if toggle_low_overhead_mode; then
                 echo -e "\n  ${GREEN}Low-overhead mode enabled.${NC}"
-                echo -e "  ${DIM}Background route refresh and INFO logs are reduced.${NC}"
+                echo -e "  ${DIM}Applied the low_overhead Xray profile, reduced nonessential background refreshes, and kept the same UUID.${NC}"
+                echo -e "  ${DIM}This can improve stability on weak Codespace resources, but may reduce peak throughput.${NC}"
             else
                 echo -e "\n  ${WHITE}Low-overhead mode disabled.${NC}"
-                echo -e "  ${DIM}Full background monitoring is restored.${NC}"
+                echo -e "  ${DIM}Restored the previous performance profile and normal background monitoring.${NC}"
             fi
             sleep 2
             ;;
@@ -5027,11 +5164,11 @@ while true; do
         49)
             if toggle_latency_focus_mode; then
                 echo -e "\n  ${GREEN}Latency focus mode enabled.${NC}"
-                echo -e "  ${DIM}Heartbeat and self-heal stay on; noncritical logs, route scans, exports, and remote messages are minimized.${NC}"
-                echo -e "  ${DIM}Use this only while actively testing latency. Disable it before collecting support logs.${NC}"
+                echo -e "  ${DIM}Applied the low_latency Xray profile, kept the same UUID, and minimized noncritical background work.${NC}"
+                echo -e "  ${DIM}This aims to reduce queueing/idle stalls; it cannot fix ISP packet loss by itself.${NC}"
             else
                 echo -e "\n  ${WHITE}Latency focus mode disabled.${NC}"
-                echo -e "  ${DIM}Normal diagnostics, route scans, exports, and logs are restored.${NC}"
+                echo -e "  ${DIM}Restored the previous performance profile, normal route scans, exports, and logs.${NC}"
             fi
             sleep 3
             ;;
