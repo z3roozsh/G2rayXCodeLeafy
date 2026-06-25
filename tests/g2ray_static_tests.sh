@@ -400,6 +400,30 @@ test_generated_links_include_domain_and_ip_variants() {
     pass 'generated links include domain and multiple IP variants'
 }
 
+test_websocket_fallback_is_advanced_opt_in() {
+    grep_fixed 'G2RAY_ENABLE_WS_FALLBACK' "$SCRIPT" \
+        || fail 'WebSocket fallback is not guarded by an explicit advanced opt-in'
+    grep_fixed 'WS_PORT="${G2RAY_WS_PORT:-8443}"' "$SCRIPT" \
+        || fail 'WebSocket fallback does not have a stable default port'
+    grep_fixed 'ws_fallback_enabled()' "$SCRIPT" \
+        || fail 'script does not centralize WebSocket fallback enablement'
+    grep_fixed '"network": "ws"' "$SCRIPT" \
+        || fail 'generated config cannot add a WebSocket inbound'
+    grep_fixed '"wsSettings": { "path": "$(json_escape "$ws_path")" }' "$SCRIPT" \
+        || fail 'WebSocket fallback path is not explicit in generated config'
+    grep_fixed 'generate_ws_link_for_address()' "$SCRIPT" \
+        || fail 'script cannot generate WebSocket fallback links'
+    grep_fixed 'type=ws' "$SCRIPT" \
+        || fail 'WebSocket fallback links do not use type=ws'
+    grep_fixed 'ensure_codespace_port_public_for_port "$WS_PORT"' "$SCRIPT" \
+        || fail 'WebSocket fallback port is not explicitly exposed when enabled'
+    grep_fixed 'G2RAY_ENABLE_WS_FALLBACK=1' "$README" \
+        || fail 'README does not document the advanced WebSocket fallback opt-in'
+    grep_fixed 'XHTTP remains the recommended default' "$README" \
+        || fail 'README does not keep XHTTP as the recommended default'
+    pass 'WebSocket fallback is advanced opt-in'
+}
+
 test_terminal_branding_is_customized_red() {
     grep_fixed 'echo -e "${RED}${B}"' "$SCRIPT" \
         || fail 'logo banner is not rendered in red'
@@ -587,8 +611,12 @@ test_probe_and_gh_commands_are_bounded() {
         || fail 'gh helper does not bound GitHub CLI calls with timeout'
     grep_fixed 'run_gh codespace list --limit 1 --json name --jq' "$SCRIPT" \
         || fail 'codespace name detection still bypasses the bounded gh helper'
-    grep_fixed 'run_gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME"' "$SCRIPT" \
+    grep_fixed 'ensure_codespace_port_public_for_port()' "$SCRIPT" \
+        || fail 'port visibility does not use a reusable bounded helper'
+    grep_fixed 'run_gh codespace ports visibility "${port}:public" -c "$CODESPACE_NAME"' "$SCRIPT" \
         || fail 'port visibility still bypasses the bounded gh helper'
+    grep_fixed 'ensure_codespace_port_public_for_port "$XRAY_PORT"' "$SCRIPT" \
+        || fail 'primary XHTTP port visibility wrapper is missing'
     grep_fixed 'run_gh codespace ports -c "$CODESPACE_NAME"' "$SCRIPT" \
         || fail 'diagnostics port query still bypasses the bounded gh helper'
     pass 'curl probes and gh calls are bounded'
@@ -1102,7 +1130,7 @@ test_soft_recovery_and_route_memory_are_present() {
         || fail 'port visibility calls are not timestamp-throttled'
     grep_fixed 'PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"' "$SCRIPT" \
         || fail 'port visibility default TTL is too chatty for steady-state health checks'
-    grep_fixed 'PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${XRAY_PORT}' "$SCRIPT" \
+    grep_fixed 'PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${port}' "$SCRIPT" \
         || fail 'port visibility cache is not scoped by codespace and port'
     grep_fixed 'LAST_GOOD_ROUTE_FILE=' "$SCRIPT" \
         || fail 'last-good route is not persisted'
@@ -1498,6 +1526,11 @@ test_fallback_link_count_is_capped() {
         || fail 'README does not document the DNS candidate cache TTL'
     grep_fixed 'Default: `30`' "$README" \
         || fail 'README does not document 30 exported fallback links by default'
+    grep_fixed 'up to 30 usable IP fallback configs plus the domain config' "$README" \
+        || fail 'README prose does not match the 30 fallback-link default'
+    if grep_fixed 'up to 20 usable IP fallback configs' "$README"; then
+        fail 'README still contains stale 20 fallback-link wording'
+    fi
     grep_fixed 'Default: `40`, hard-capped at `64`' "$README" \
         || fail 'README does not document the widened bounded route scanner default'
     pass 'fallback link count is capped and documented'
@@ -1801,6 +1834,7 @@ test_tcp_fast_open_is_gated_and_outbound_only
 test_connection_keepalive_and_halfclose_are_tuned
 test_performance_profile_is_persistent_and_bench_is_isolated
 test_generated_links_include_domain_and_ip_variants
+test_websocket_fallback_is_advanced_opt_in
 test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
 test_xhttp_route_settling_is_observable

@@ -64,7 +64,7 @@ reset_runtime_paths() {
     DNS_CACHE_TTL_SEC=300
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -1044,6 +1044,66 @@ test_custom_xhttp_extra_json_is_validated() {
     pass "custom XHTTP extra JSON is opt-in and validated"
 }
 
+test_websocket_fallback_is_advanced_opt_in() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+
+    if ws_fallback_enabled; then
+        fail "WebSocket fallback is enabled by default"
+    fi
+    if generate_ws_link_for_address "20.0.0.1" "-ws1" >/dev/null 2>&1; then
+        fail "WebSocket fallback link was generated while fallback was disabled"
+    fi
+
+    G2RAY_ENABLE_WS_FALLBACK=1
+    local link
+    link="$(generate_ws_link_for_address "20.0.0.1" "-ws1")"
+    [[ "$link" == *"@20.0.0.1:443"* ]] || fail "WS IP fallback does not use public edge port 443: $link"
+    [[ "$link" == *"type=ws"* ]] || fail "WS fallback link does not use WebSocket transport: $link"
+    [[ "$link" == *"host=behavior-space-8443.app.github.dev"* ]] || fail "WS fallback link does not use WS port domain as Host: $link"
+    [[ "$link" == *"sni=behavior-space-8443.app.github.dev"* ]] || fail "WS fallback link does not use WS port domain as SNI: $link"
+    [[ "$link" == *"path=%2Fws"* ]] || fail "WS fallback link does not use /ws path: $link"
+    [[ "$link" == *"insecure=0&allowInsecure=0"* ]] || fail "WS fallback link is not strict TLS by default: $link"
+    pass "WebSocket fallback links are advanced opt-in"
+}
+
+test_websocket_fallback_adds_config_and_public_port() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        XRAY_PORT=443
+        WS_PORT=8443
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+        PERFORMANCE_PROFILE=balanced
+        G2RAY_ENABLE_WS_FALLBACK=1
+        uuidgen() { printf '11111111-2222-3333-4444-555555555555\n'; }
+        start_xray() { return 0; }
+        wait_for_port() { return 0; }
+        refresh_config_exports() { return 0; }
+        xhttp_probe_metrics() { printf '200 12 ready\n'; }
+        local ports_file="$TMP_ROOT/ws-public-ports.txt"
+        : > "$ports_file"
+        run_gh() {
+            printf '%s\n' "$*" >> "$ports_file"
+            return 0
+        }
+        generate_config >/dev/null
+        python -m json.tool "$CONFIG_FILE" >/dev/null || fail "generated WS fallback config is not valid JSON"
+        grep -Fq '"tag": "vless-ws"' "$CONFIG_FILE" || fail "WS fallback did not add vless-ws inbound"
+        grep -Fq '"network": "ws"' "$CONFIG_FILE" || fail "WS fallback inbound is not WebSocket"
+        grep -Fq '"path": "/ws"' "$CONFIG_FILE" || fail "WS fallback inbound does not use /ws path"
+        grep -Fq '443:public' "$ports_file" || fail "primary XHTTP port was not made public"
+        grep -Fq '8443:public' "$ports_file" || fail "WS fallback port was not made public"
+    )
+    pass "WebSocket fallback config and port exposure are opt-in"
+}
+
 test_config_metadata_sanitizes_invalid_max_fallback_links() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -1713,6 +1773,8 @@ test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_generated_links_follow_configured_xhttp_path
 test_custom_xhttp_extra_json_is_validated
+test_websocket_fallback_is_advanced_opt_in
+test_websocket_fallback_adds_config_and_public_port
 test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets
 test_low_overhead_mode_suppresses_info_logs

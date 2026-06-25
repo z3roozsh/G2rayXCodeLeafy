@@ -104,9 +104,15 @@ CODESPACE_SHARED_ENV_FILE="${G2RAY_CODESPACE_SHARED_ENV_FILE:-/workspaces/.codes
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
 [[ "$XRAY_PORT" =~ ^[0-9]+$ && "$XRAY_PORT" -gt 0 && "$XRAY_PORT" -le 65535 ]] || XRAY_PORT=443
+WS_PORT="${G2RAY_WS_PORT:-8443}"
+[[ "$WS_PORT" =~ ^[0-9]+$ && "$WS_PORT" -gt 0 && "$WS_PORT" -le 65535 ]] || WS_PORT=8443
+if [[ "$WS_PORT" == "$XRAY_PORT" ]]; then
+    [[ "$XRAY_PORT" == "8443" ]] && WS_PORT=8444 || WS_PORT=8443
+fi
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.69.79.91 20.85.77.48 20.120.56.11 20.125.70.28 20.90.66.7 20.103.221.187 20.207.70.99}"
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-30}"
+WS_MAX_FALLBACK_LINKS="${G2RAY_WS_MAX_FALLBACK_LINKS:-3}"
 ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-40}"
 DIAGNOSTIC_MAX_FALLBACK_PROBES="${G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES:-12}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
@@ -515,6 +521,33 @@ _detect_codespace_name() {
 
 CODESPACE_NAME=$(_detect_codespace_name)
 PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+WS_PORT_DOMAIN="${CODESPACE_NAME}-${WS_PORT}.app.github.dev"
+
+refresh_port_domains() {
+    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    WS_PORT_DOMAIN="${CODESPACE_NAME}-${WS_PORT}.app.github.dev"
+}
+
+ws_fallback_enabled() {
+    local value
+    value=$(printf '%s' "${G2RAY_ENABLE_WS_FALLBACK:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [[ "$value" == "1" || "$value" == "true" || "$value" == "on" || "$value" == "yes" || "$value" == "enabled" ]]
+}
+
+ws_fallback_configured() {
+    ws_fallback_enabled && return 0
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    grep -Fq '"tag": "vless-ws"' "$CONFIG_FILE" 2>/dev/null
+}
+
+ws_path_value() {
+    local path="${G2RAY_WS_PATH:-/ws}"
+    [[ "$path" == /* ]] || path="/${path}"
+    case "$path" in
+        *[[:space:]\"\'\\]*|'') path="/ws" ;;
+    esac
+    printf '%s' "$path"
+}
 
 xray_pid_matches() {
     local p="$1"
@@ -1215,7 +1248,7 @@ show_waker_recovery_guide() {
 setup_cloudflare_waker() {
     local wake_secret wake_fingerprint worker_url ready do_test
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
-    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    refresh_port_domains
     wake_secret=$(generate_wake_secret)
     wake_fingerprint=$(fingerprint_secret "$wake_secret")
 
@@ -1559,28 +1592,38 @@ write_epoch_stamp() {
     chmod 600 "$file" 2>/dev/null || true
 }
 
-ensure_codespace_port_public() {
-    local force="${1:-}" age stamp_file
-    stamp_file="${PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${XRAY_PORT}"
+ensure_codespace_port_public_for_port() {
+    local port="$1" force="${2:-}" age stamp_file
+    [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]] || return 1
+    stamp_file="${PORT_PUBLIC_STAMP_FILE}.${CODESPACE_NAME}.${port}"
     stamp_file=$(printf '%s' "$stamp_file" | tr -c 'A-Za-z0-9._/-' '_')
     age=$(stamp_age_sec "$stamp_file")
     if [[ "$force" != "force" && "$PORT_PUBLIC_TTL_SEC" =~ ^[0-9]+$ && "$age" -lt "$PORT_PUBLIC_TTL_SEC" ]]; then
-        log_event INFO "port_public cached_ok port=${XRAY_PORT} age_sec=${age} ttl=${PORT_PUBLIC_TTL_SEC}"
+        log_event INFO "port_public cached_ok port=${port} age_sec=${age} ttl=${PORT_PUBLIC_TTL_SEC}"
         return 0
     fi
     command -v gh >/dev/null 2>&1 || {
-        log_event WARN "port_public gh_missing port=${XRAY_PORT}"
+        log_event WARN "port_public gh_missing port=${port}"
         return 1
     }
     local output
-    if output=$(run_gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" </dev/null 2>&1); then
+    if output=$(run_gh codespace ports visibility "${port}:public" -c "$CODESPACE_NAME" </dev/null 2>&1); then
         write_epoch_stamp "$stamp_file"
-        log_event INFO "port_public ok port=${XRAY_PORT} forced=${force:-false}"
+        log_event INFO "port_public ok port=${port} forced=${force:-false}"
         return 0
     fi
     output=$(printf '%s' "$output" | tr '\r\n' '  ' | cut -c1-180)
-    log_event WARN "port_public failed port=${XRAY_PORT} detail=${output:-unknown}"
+    log_event WARN "port_public failed port=${port} detail=${output:-unknown}"
     return 1
+}
+
+ensure_codespace_port_public() {
+    ensure_codespace_port_public_for_port "$XRAY_PORT" "${1:-}"
+}
+
+ensure_optional_ws_port_public() {
+    ws_fallback_configured || return 0
+    ensure_codespace_port_public_for_port "$WS_PORT" "${1:-}"
 }
 
 repair_codespace_port_route() {
@@ -2057,7 +2100,7 @@ _background_tasks() {
             local n; n=$(_detect_codespace_name 2>/dev/null || true)
             if [[ -n "$n" && "$n" != "unknown-codespace" ]]; then
                 CODESPACE_NAME="$n"
-                PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+                refresh_port_domains
             fi
         fi
         [[ -f "$CONFIG_FILE" ]] || continue
@@ -2391,6 +2434,8 @@ check_port_visibility() {
         echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
         return 1
     fi
+    ensure_optional_ws_port_public >/dev/null 2>&1 \
+        || log_event WARN "check_port_visibility ws_port_public_failed port=${WS_PORT}"
 }
 
 performance_profile_settings() {
@@ -2479,6 +2524,27 @@ generate_config() {
         tfo_state="on"
     fi
     direct_sockopt=", \"streamSettings\": { \"sockopt\": { ${sockopt_inner} } }"
+    local ws_inbound_json="" ws_path
+    if ws_fallback_enabled; then
+        ws_path=$(ws_path_value)
+        ws_inbound_json=$(cat << JSONEOF
+,
+    {
+      "tag": "vless-ws", "port": ${WS_PORT}, "listen": "0.0.0.0", "protocol": "vless",
+      "settings": {
+        "clients": [ { "id": "${uuid}", "flow": "", "level": 0, "email": "user@G2rayXCodeLeafy-ws" } ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws", "security": "none",
+        "wsSettings": { "path": "$(json_escape "$ws_path")" },
+        "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
+      },
+      "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
+    }
+JSONEOF
+)
+    fi
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
     log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} tcp_fast_open=${tfo_state}"
     cat > "$CONFIG_FILE" << JSONEOF
@@ -2511,7 +2577,7 @@ generate_config() {
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
-    },
+    }${ws_inbound_json},
     { "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" }
   ],
   "outbounds": [
@@ -2542,6 +2608,14 @@ JSONEOF
     else
         log_event WARN "generate_config port_public_failed port=${XRAY_PORT}"
         echo -e "  ${YELLOW}⚠ Could not set Codespaces port ${XRAY_PORT} public. Check the PORTS tab.${NC}"
+    fi
+    if ws_fallback_enabled; then
+        if ensure_optional_ws_port_public; then
+            log_event INFO "generate_config ws_port_public port=${WS_PORT}"
+        else
+            log_event WARN "generate_config ws_port_public_failed port=${WS_PORT}"
+            echo -e "  ${YELLOW}⚠ Could not set optional WebSocket port ${WS_PORT} public. Check the PORTS tab.${NC}"
+        fi
     fi
     refresh_config_exports >/dev/null 2>&1 || true
     local _boot_code _boot_ms _boot_reason
@@ -2608,8 +2682,23 @@ generate_link_for_address() {
         "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
 }
 
+generate_ws_link_for_address() {
+    ws_fallback_enabled || return 1
+    local address="$1" label_suffix="${2:-}" uuid path encoded_path
+    uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
+    [[ -z "$uuid" ]] && { printf ''; return 1; }
+    path=$(ws_path_value)
+    encoded_path=$(url_encode_query_value "$path")
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2,http/1.1&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#G2rayXCodeLeafy|%s' \
+        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$WS_PORT_DOMAIN" "$WS_PORT_DOMAIN" "$encoded_path" "${GITHUB_USER:-User}${label_suffix}"
+}
+
 generate_domain_link() {
     generate_link_for_address "$PORT_DOMAIN"
+}
+
+generate_ws_domain_link() {
+    generate_ws_link_for_address "$WS_PORT_DOMAIN" "-ws-domain"
 }
 
 route_monitor_max_candidates() {
@@ -3219,6 +3308,13 @@ safe_max_fallback_links() {
     printf '%s' "$max"
 }
 
+safe_ws_fallback_links() {
+    local max="${1:-$WS_MAX_FALLBACK_LINKS}"
+    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=3
+    (( max > 10 )) && max=10
+    printf '%s' "$max"
+}
+
 usable_fallback_ips() {
     local ip ip_probe ip_ms reason count=0 max_links candidates usable probe_cap min_probe_cap probed=0 emitted=""
     local cached_routes=() cache_ready=true
@@ -3312,15 +3408,36 @@ generate_ip_links() {
     done < <(usable_fallback_ips)
 }
 
+generate_ws_links() {
+    ws_fallback_enabled || return 0
+    local address index=1 printed=false max_links
+    max_links=$(safe_ws_fallback_links)
+    while IFS= read -r address; do
+        [[ -n "$address" ]] || continue
+        (( index > max_links )) && break
+        [[ "$printed" == true ]] && printf '\n'
+        generate_ws_link_for_address "$address" "-ws-ip${index}"
+        printed=true
+        index=$(( index + 1 ))
+    done < <(usable_fallback_ips)
+    if domain_link_export_enabled; then
+        [[ "$printed" == true ]] && printf '\n'
+        generate_ws_domain_link || true
+    fi
+}
+
 generate_ordered_links() {
-    local domain_link ip_links
+    local domain_link ip_links ws_links
     ip_links=$(generate_ip_links || true)
     printf '%s\n' "$ip_links" | awk 'NF'
-    domain_link_export_enabled || return 0
-    domain_link=$(generate_domain_link || true)
-    if [[ -n "$domain_link" ]] && ! printf '%s\n' "$ip_links" | grep -Fxq "$domain_link"; then
-        printf '%s\n' "$domain_link"
+    if domain_link_export_enabled; then
+        domain_link=$(generate_domain_link || true)
+        if [[ -n "$domain_link" ]] && ! printf '%s\n' "$ip_links" | grep -Fxq "$domain_link"; then
+            printf '%s\n' "$domain_link"
+        fi
     fi
+    ws_links=$(generate_ws_links || true)
+    printf '%s\n' "$ws_links" | awk 'NF'
 }
 
 write_config_metadata() {
@@ -3340,6 +3457,9 @@ write_config_metadata() {
   "subscription_file": "$(json_escape "$SUBSCRIPTION_FILE")",
   "subscription_scope": "local_codespace_only",
   "performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
+  "ws_fallback": $(ws_fallback_enabled && printf true || printf false),
+  "ws_port": ${WS_PORT},
+  "ws_domain": "$(json_escape "$WS_PORT_DOMAIN")",
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
   "domain_link_exported": $(domain_link_export_enabled && printf true || printf false)
@@ -3581,6 +3701,11 @@ show_diagnostics() {
             IFS=$'\t' read -r cfg_network cfg_security cfg_path cfg_mode cfg_uuid <<< "$cfg_line"
             echo -e "  Config    : ${WHITE}${cfg_network}/${cfg_security}${NC} ${DIM}path=${cfg_path} mode=${cfg_mode} uuid_hash=$(fingerprint_secret "$cfg_uuid")${NC}"
         fi
+        if ws_fallback_configured; then
+            local ws_cfg_path="-"
+            ws_cfg_path=$(jq -r '.inbounds[]? | select(.tag=="vless-ws") | .streamSettings.wsSettings.path // "-"' "$CONFIG_FILE" 2>/dev/null | head -1)
+            echo -e "  WS Fallback: ${WHITE}configured${NC} ${DIM}port=${WS_PORT} domain=${WS_PORT_DOMAIN} path=${ws_cfg_path:-/ws}${NC}"
+        fi
     fi
     if [[ -f "$CONFIG_FILE" ]]; then
         local tfo_cfg="off" tfo_kernel tfo_kernel_note="unknown"
@@ -3707,7 +3832,7 @@ _recover_now_impl() {
 
     echo -ne "  ${DIM}|-${NC} Detect Identity   : "
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
-    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    refresh_port_domains
     log_event INFO "recover_now identity codespace=${CODESPACE_NAME} domain=${PORT_DOMAIN}"
     [[ "$CODESPACE_NAME" == "unknown-codespace" ]] \
         && echo -e "${RED}Failed${NC}" \
@@ -3749,6 +3874,8 @@ _recover_now_impl() {
 
     echo -ne "  ${DIM}|-${NC} Expose Tunnel     : "
     if ensure_codespace_port_public force >/dev/null 2>&1; then
+        ensure_optional_ws_port_public force >/dev/null 2>&1 \
+            || log_event WARN "recover_now ws_port_public_failed port=${WS_PORT}"
         echo -e "${GREEN}Done${NC}"
     else
         expose_failed=true
@@ -3887,7 +4014,7 @@ _force_reconnect_impl() {
 
     echo -ne "  ${DIM}├─${NC} Detect Identity   : "
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
-    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    refresh_port_domains
     log_event INFO "force_reconnect identity codespace=${CODESPACE_NAME} domain=${PORT_DOMAIN}"
     [[ "$CODESPACE_NAME" == "unknown-codespace" ]] \
         && echo -e "${RED}Failed${NC}" \
@@ -3917,6 +4044,8 @@ _force_reconnect_impl() {
 
     echo -ne "  ${DIM}├─${NC} Expose Tunnel     : "
     if ensure_codespace_port_public force >/dev/null 2>&1; then
+        ensure_optional_ws_port_public force >/dev/null 2>&1 \
+            || log_event WARN "force_reconnect ws_port_public_failed port=${WS_PORT}"
         log_event INFO "force_reconnect expose_tunnel ok port=${XRAY_PORT}"
         echo -e "${GREEN}Done${NC}"
     else
@@ -3976,13 +4105,15 @@ _ensure_runtime_ready_impl() {
     [[ -f "$CONFIG_FILE" ]] || return 0
 
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
-    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+    refresh_port_domains
 
     if xray_listener_ready; then
         read -r xcode xms _probe_reason < <(xhttp_probe_metrics external)
         if xhttp_status_usable "$xcode"; then
             ensure_codespace_port_public >/dev/null 2>&1 \
                 || log_event WARN "runtime_ready reason=${reason} port_public_failed port=${XRAY_PORT}"
+            ensure_optional_ws_port_public >/dev/null 2>&1 \
+                || log_event WARN "runtime_ready reason=${reason} ws_port_public_failed port=${WS_PORT}"
             reset_route_bad_count
             reset_edge_bad_count
             log_event INFO "runtime_ready reason=${reason} engine=running xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=skip_reconnect"
@@ -4005,6 +4136,8 @@ _ensure_runtime_ready_impl() {
     if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
         ensure_codespace_port_public >/dev/null 2>&1 \
             || log_event WARN "runtime_ready reason=${reason} port_public_failed port=${XRAY_PORT}"
+        ensure_optional_ws_port_public >/dev/null 2>&1 \
+            || log_event WARN "runtime_ready reason=${reason} ws_port_public_failed port=${WS_PORT}"
         read -r xcode xms _probe_reason < <(xhttp_probe_metrics external)
         if ! xhttp_status_usable "$xcode"; then
             log_event WARN "runtime_ready reason=${reason} started_route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
@@ -4188,6 +4321,7 @@ bench_json_impl() {
         ROUTE_HEALTH_TTL_SEC=3600
         CODESPACE_NAME="bench-space"
         PORT_DOMAIN="bench-space-443.app.github.dev"
+        WS_PORT_DOMAIN="bench-space-8443.app.github.dev"
         log_event() { return 0; }
         xhttp_probe_metrics() { printf '200 1 ready\n'; }
         ensure_codespace_port_public() { return 0; }
@@ -4487,6 +4621,14 @@ while true; do
                     _CONFIG_LABELS+=("Domain link (try only if app.github.dev is allowed)")
                 fi
                 _CONFIG_LINKS+=("$_VLESS_DOMAIN")
+            fi
+            if ws_fallback_enabled; then
+                _WS_LINKS=$(generate_ws_links) || _WS_LINKS=""
+                while IFS= read -r _LINK; do
+                    [[ -n "$_LINK" ]] || continue
+                    _CONFIG_LABELS+=("Advanced WebSocket fallback link $((${#_CONFIG_LABELS[@]} + 1))")
+                    _CONFIG_LINKS+=("$_LINK")
+                done < <(printf '%s\n' "$_WS_LINKS" | awk 'NF')
             fi
             _VLESS_PRIMARY="${_CONFIG_LINKS[0]:-}"
             [[ -z "$_VLESS_PRIMARY" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
