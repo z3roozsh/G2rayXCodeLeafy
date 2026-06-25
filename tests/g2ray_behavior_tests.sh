@@ -36,6 +36,9 @@ reset_runtime_paths() {
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
     LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
     LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
+    WS_FALLBACK_FILE="$DATA_DIR/ws_fallback_mode"
+    WS_FALLBACK_DISABLED_FILE="$DATA_DIR/ws_fallback_mode_disabled"
+    WS_FRONT_DOMAIN_FILE="$DATA_DIR/ws_front_domain.txt"
     DOMAIN_LINK_EXPORT_FILE="$DATA_DIR/export_domain_link.txt"
     SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
     CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
@@ -813,6 +816,30 @@ EOF
     pass "usable fallback exports fill partial fresh cache with live-probed routes"
 }
 
+test_usable_fallback_ips_preserves_cached_routes_when_all_live_probes_are_unusable() {
+    reset_runtime_paths
+    ROUTE_HEALTH_TTL_SEC=300
+    MAX_FALLBACK_LINKS=3
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+2026-05-30T00:00:00Z	20.0.0.6	200	80	true
+EOF
+    resolve_domain_ips() {
+        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7
+    }
+    xhttp_probe_metrics() {
+        printf '404 50 route_settling_404\n'
+    }
+
+    mapfile -t routes < <(usable_fallback_ips)
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] \
+        || fail "usable_fallback_ips did not preserve cached routes during temporary 404: ${routes[*]:-none}"
+    grep -Fq 'fallback_route_filter no-usable-probes action=cached-stale' "$LOG_FILE" \
+        || fail "temporary all-probe failure did not log cached-stale export preservation"
+    pass "usable fallback exports preserve cached routes during temporary route settling"
+}
+
 test_usable_fallback_ips_caps_live_probe_fallback() {
     reset_runtime_paths
     MAX_FALLBACK_LINKS=1
@@ -1070,6 +1097,69 @@ test_websocket_fallback_is_advanced_opt_in() {
     [[ "$link" == *"path=%2Fws"* ]] || fail "WS fallback link does not use /ws path: $link"
     [[ "$link" == *"insecure=0&allowInsecure=0"* ]] || fail "WS fallback link is not strict TLS by default: $link"
     pass "WebSocket fallback links are advanced opt-in"
+}
+
+test_websocket_fallback_persists_from_panel_state() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+
+    enable_ws_fallback_mode
+    unset G2RAY_ENABLE_WS_FALLBACK
+    ws_fallback_enabled || fail "saved panel WS preference did not enable fallback"
+
+    local link
+    link="$(generate_ws_link_for_address "20.0.0.1" "-ws1")"
+    [[ "$link" == *"type=ws"* ]] || fail "saved panel WS preference did not allow WS link generation: $link"
+
+    disable_ws_fallback_mode
+    if ws_fallback_enabled; then
+        fail "disabled panel WS preference did not disable fallback"
+    fi
+
+    G2RAY_ENABLE_WS_FALLBACK=1
+    if ws_fallback_enabled; then
+        fail "explicit disabled panel WS preference should override environment default"
+    fi
+    pass "WebSocket fallback persists from panel state"
+}
+
+test_websocket_front_domain_generates_cloudflare_link() {
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+EOF
+
+    enable_ws_fallback_mode
+    set_ws_front_domain "https://WS.Example.COM:443/path" \
+        || fail "valid front domain with scheme/port/path was not normalized and saved"
+    [[ "$(ws_front_domain_value)" == "ws.example.com" ]] \
+        || fail "front domain was not normalized to hostname-only value"
+
+    local front_link first_link
+    front_link="$(generate_ws_front_link)"
+    [[ "$front_link" == *"@ws.example.com:443"* ]] || fail "front link does not use front domain as address: $front_link"
+    [[ "$front_link" == *"sni=ws.example.com"* ]] || fail "front link does not use front domain as SNI: $front_link"
+    [[ "$front_link" == *"host=ws.example.com"* ]] || fail "front link does not use front domain as Host: $front_link"
+    [[ "$front_link" == *"type=ws"* ]] || fail "front link is not a WebSocket link: $front_link"
+
+    first_link="$(generate_ws_links | awk 'NF && !seen {print; seen=1} END {exit 0}')"
+    [[ "$first_link" == "$front_link" ]] || fail "Cloudflare front link is not first WS fallback link"
+
+    if set_ws_front_domain "bad host name"; then
+        fail "invalid front domain with spaces was accepted"
+    fi
+    pass "WebSocket front domain generates a Cloudflare-ready link"
 }
 
 test_websocket_fallback_adds_config_and_public_port() {
@@ -1763,6 +1853,7 @@ test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
 test_usable_fallback_ips_revalidates_top_cached_route
 test_usable_fallback_ips_fills_partial_fresh_cache
+test_usable_fallback_ips_preserves_cached_routes_when_all_live_probes_are_unusable
 test_usable_fallback_ips_caps_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
@@ -1774,6 +1865,8 @@ test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_generated_links_follow_configured_xhttp_path
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
+test_websocket_fallback_persists_from_panel_state
+test_websocket_front_domain_generates_cloudflare_link
 test_websocket_fallback_adds_config_and_public_port
 test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets

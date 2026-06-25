@@ -77,6 +77,9 @@ LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
 LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
 LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
 LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
+WS_FALLBACK_FILE="$DATA_DIR/ws_fallback_mode"
+WS_FALLBACK_DISABLED_FILE="$DATA_DIR/ws_fallback_mode_disabled"
+WS_FRONT_DOMAIN_FILE="$DATA_DIR/ws_front_domain.txt"
 DOMAIN_LINK_EXPORT_FILE="$DATA_DIR/export_domain_link.txt"
 LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
 PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
@@ -530,14 +533,49 @@ refresh_port_domains() {
 
 ws_fallback_enabled() {
     local value
+    [[ -s "$WS_FALLBACK_DISABLED_FILE" ]] && return 1
+    [[ -s "$WS_FALLBACK_FILE" ]] && return 0
     value=$(printf '%s' "${G2RAY_ENABLE_WS_FALLBACK:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
     [[ "$value" == "1" || "$value" == "true" || "$value" == "on" || "$value" == "yes" || "$value" == "enabled" ]]
 }
 
-ws_fallback_configured() {
-    ws_fallback_enabled && return 0
+enable_ws_fallback_mode() {
+    rm -f "$WS_FALLBACK_DISABLED_FILE" 2>/dev/null || true
+    printf 'enabled\n' > "$WS_FALLBACK_FILE"
+    chmod 600 "$WS_FALLBACK_FILE" 2>/dev/null || true
+}
+
+disable_ws_fallback_mode() {
+    rm -f "$WS_FALLBACK_FILE" 2>/dev/null || true
+    printf 'disabled\n' > "$WS_FALLBACK_DISABLED_FILE"
+    chmod 600 "$WS_FALLBACK_DISABLED_FILE" 2>/dev/null || true
+}
+
+toggle_ws_fallback_mode() {
+    if ws_fallback_enabled; then
+        disable_ws_fallback_mode
+        return 1
+    fi
+    enable_ws_fallback_mode
+    return 0
+}
+
+ws_fallback_summary() {
+    if ws_fallback_enabled; then
+        printf 'Enabled - adds optional WebSocket configs on Codespaces port %s\n' "$WS_PORT"
+    else
+        printf 'Disabled - XHTTP remains the only generated transport\n'
+    fi
+}
+
+ws_fallback_in_config() {
     [[ -f "$CONFIG_FILE" ]] || return 1
     grep -Fq '"tag": "vless-ws"' "$CONFIG_FILE" 2>/dev/null
+}
+
+ws_fallback_configured() {
+    ws_fallback_enabled && return 0
+    ws_fallback_in_config
 }
 
 ws_path_value() {
@@ -547,6 +585,51 @@ ws_path_value() {
         *[[:space:]\"\'\\]*|'') path="/ws" ;;
     esac
     printf '%s' "$path"
+}
+
+normalize_hostname_value() {
+    local host="${1:-}"
+    host=$(printf '%s' "$host" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's#^[a-z][a-z0-9+.-]*://##; s#/.*$##; s/:[0-9]+$//; s/[[:space:]]//g; s/\.$//')
+    printf '%s' "$host"
+}
+
+valid_hostname_value() {
+    local host label
+    local -a host_labels
+    host=$(normalize_hostname_value "${1:-}")
+    [[ -n "$host" && ${#host} -le 253 ]] || return 1
+    [[ "$host" == *.* ]] || return 1
+    [[ "$host" =~ ^[a-z0-9.-]+$ ]] || return 1
+    [[ "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+    IFS='.' read -r -a host_labels <<< "$host"
+    for label in "${host_labels[@]}"; do
+        [[ -n "$label" && ${#label} -le 63 ]] || return 1
+        [[ "$label" != -* && "$label" != *- ]] || return 1
+    done
+}
+
+ws_front_domain_value() {
+    local host="${G2RAY_WS_FRONT_DOMAIN:-}"
+    if [[ -z "$host" && -f "$WS_FRONT_DOMAIN_FILE" ]]; then
+        host=$(awk 'NF {print; exit}' "$WS_FRONT_DOMAIN_FILE" 2>/dev/null || true)
+    fi
+    host=$(normalize_hostname_value "$host")
+    valid_hostname_value "$host" || return 1
+    printf '%s' "$host"
+}
+
+set_ws_front_domain() {
+    local host
+    host=$(normalize_hostname_value "${1:-}")
+    valid_hostname_value "$host" || return 1
+    _atomic_write "$WS_FRONT_DOMAIN_FILE" "$host"
+    chmod 600 "$WS_FRONT_DOMAIN_FILE" 2>/dev/null || true
+}
+
+clear_ws_front_domain() {
+    rm -f "$WS_FRONT_DOMAIN_FILE" 2>/dev/null || true
 }
 
 xray_pid_matches() {
@@ -2693,6 +2776,18 @@ generate_ws_link_for_address() {
         "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$WS_PORT_DOMAIN" "$WS_PORT_DOMAIN" "$encoded_path" "${GITHUB_USER:-User}${label_suffix}"
 }
 
+generate_ws_front_link() {
+    ws_fallback_enabled || return 1
+    local front_domain uuid path encoded_path
+    front_domain=$(ws_front_domain_value) || return 1
+    uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
+    [[ -z "$uuid" ]] && { printf ''; return 1; }
+    path=$(ws_path_value)
+    encoded_path=$(url_encode_query_value "$path")
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2,http/1.1&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#G2rayXCodeLeafy|%s' \
+        "$uuid" "$front_domain" "$CODESPACES_EDGE_PORT" "$front_domain" "$front_domain" "$encoded_path" "${GITHUB_USER:-User}-ws-front"
+}
+
 generate_domain_link() {
     generate_link_for_address "$PORT_DOMAIN"
 }
@@ -3301,6 +3396,86 @@ show_live_monitor() {
     done
 }
 
+show_ws_front_manager() {
+    local choice front input normalized ws_state prev_preserve
+    while true; do
+        front=$(ws_front_domain_value 2>/dev/null || true)
+        if ws_fallback_enabled; then
+            ws_state="${GREEN}Enabled${NC}"
+        else
+            ws_state="${DIM}Disabled${NC}"
+        fi
+        refresh_screen
+        echo -e "\n  ${RED}Cloudflare WebSocket Front${NC}\n"
+        echo -e "  WS fallback      : ${ws_state}"
+        echo -e "  Codespaces origin: ${WHITE}${WS_PORT_DOMAIN}${NC}"
+        echo -e "  Origin port      : ${WHITE}${WS_PORT}${NC}"
+        if [[ -n "$front" ]]; then
+            echo -e "  Front domain     : ${GREEN}${front}${NC}"
+        else
+            echo -e "  Front domain     : ${DIM}not set${NC}"
+        fi
+        echo ""
+        echo -e "  ${WHITE}${B}Cloudflare setup target${NC}"
+        echo -e "  ${DIM}DNS: create a proxied CNAME such as ws.yourdomain.com -> ${WS_PORT_DOMAIN}${NC}"
+        echo -e "  ${DIM}Origin Rule: for that hostname, override Host header to ${WS_PORT_DOMAIN}.${NC}"
+        echo -e "  ${DIM}Cloudflare should also use ${WS_PORT_DOMAIN} as origin SNI; verify in Origin Rules/TLS settings.${NC}"
+        echo ""
+        echo -e "  ${RED}1)${NC} Set Cloudflare WS front domain"
+        echo -e "  ${RED}2)${NC} Clear Cloudflare WS front domain"
+        echo -e "  ${RED}3)${NC} Toggle WebSocket Fallback"
+        echo -e "  ${RED}4)${NC} Regenerate Config With Same UUID"
+        echo -e "  ${RED}0)${NC} Return"
+        echo -ne "  ${RED}╰─❯${NC} "
+        read -r choice
+        case "$choice" in
+            1)
+                echo -ne "  Enter front domain (example: ws.example.com): "
+                read -r input
+                normalized=$(normalize_hostname_value "$input")
+                if set_ws_front_domain "$normalized"; then
+                    log_event INFO "ws_front_domain set domain=${normalized}"
+                    echo -e "  ${GREEN}Saved front domain: ${normalized}${NC}"
+                else
+                    echo -e "  ${RED}Invalid hostname. Use a real subdomain like ws.example.com.${NC}"
+                fi
+                sleep 2
+                ;;
+            2)
+                clear_ws_front_domain
+                log_event INFO "ws_front_domain cleared"
+                echo -e "  ${WHITE}Cloudflare WS front domain cleared.${NC}"
+                sleep 2
+                ;;
+            3)
+                if toggle_ws_fallback_mode; then
+                    echo -e "  ${GREEN}WebSocket fallback enabled.${NC}"
+                else
+                    echo -e "  ${WHITE}WebSocket fallback disabled.${NC}"
+                fi
+                sleep 2
+                ;;
+            4)
+                if [[ -f "$CONFIG_FILE" ]]; then
+                    prev_preserve="${G2RAY_PRESERVE_UUID+x}:${G2RAY_PRESERVE_UUID:-}"
+                    G2RAY_PRESERVE_UUID=1
+                    generate_config
+                    case "$prev_preserve" in
+                        x:*) G2RAY_PRESERVE_UUID="${prev_preserve#x:}" ;;
+                        *) unset G2RAY_PRESERVE_UUID ;;
+                    esac
+                    echo -e "  ${GREEN}Config regenerated with existing UUID.${NC}"
+                else
+                    echo -e "  ${YELLOW}No config exists yet. Use option 2 from the main panel first.${NC}"
+                fi
+                echo -ne "  ${DIM}Press Enter to continue...${NC}"; read -r
+                ;;
+            0) return 0 ;;
+            *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 safe_max_fallback_links() {
     local max="${1:-$MAX_FALLBACK_LINKS}"
     [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=20
@@ -3385,6 +3560,20 @@ usable_fallback_ips() {
         (( count >= max_links )) && return 0
     done <<< "$candidates"
     if [[ "${usable:-false}" != true ]]; then
+        if ((${#cached_routes[@]})); then
+            local stale_count=0
+            for ip in "${cached_routes[@]}"; do
+                [[ -n "$ip" ]] || continue
+                candidate_blacklisted "$ip" && continue
+                printf '%s\n' "$ip"
+                stale_count=$((stale_count + 1))
+                (( stale_count >= max_links )) && break
+            done
+            if (( stale_count > 0 )); then
+                log_event WARN "fallback_route_filter no-usable-probes action=cached-stale count=${stale_count}"
+                return 0
+            fi
+        fi
         log_event WARN "fallback_route_filter no-usable-probes action=domain-only"
     fi
 }
@@ -3410,8 +3599,13 @@ generate_ip_links() {
 
 generate_ws_links() {
     ws_fallback_enabled || return 0
-    local address index=1 printed=false max_links
+    local address index=1 printed=false max_links front_link
     max_links=$(safe_ws_fallback_links)
+    front_link=$(generate_ws_front_link 2>/dev/null || true)
+    if [[ -n "$front_link" ]]; then
+        printf '%s' "$front_link"
+        printed=true
+    fi
     while IFS= read -r address; do
         [[ -n "$address" ]] || continue
         (( index > max_links )) && break
@@ -3460,6 +3654,7 @@ write_config_metadata() {
   "ws_fallback": $(ws_fallback_enabled && printf true || printf false),
   "ws_port": ${WS_PORT},
   "ws_domain": "$(json_escape "$WS_PORT_DOMAIN")",
+  "ws_front_domain": "$(json_escape "$(ws_front_domain_value 2>/dev/null || true)")",
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
   "domain_link_exported": $(domain_link_export_enabled && printf true || printf false)
@@ -3651,6 +3846,9 @@ create_support_bundle() {
     copy_redacted_file "$MANUAL_ROUTE_CANDIDATES_FILE" "$tmp/state/manual_route_candidates.txt"
     copy_redacted_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$tmp/state/blacklisted_route_candidates.txt"
     copy_redacted_file "$DOMAIN_LINK_EXPORT_FILE" "$tmp/state/export_domain_link.txt"
+    copy_redacted_file "$WS_FALLBACK_FILE" "$tmp/state/ws_fallback_mode"
+    copy_redacted_file "$WS_FALLBACK_DISABLED_FILE" "$tmp/state/ws_fallback_mode_disabled"
+    copy_redacted_file "$WS_FRONT_DOMAIN_FILE" "$tmp/state/ws_front_domain.txt"
     copy_redacted_file "$WAKER_METADATA_FILE" "$tmp/state/waker_metadata.txt"
     route_candidate_health_summary | redact_support_text > "$tmp/runtime/route_candidates.txt" 2>/dev/null || true
     route_settling_history_summary | redact_support_text > "$tmp/runtime/route_settling_summary.txt" 2>/dev/null || true
@@ -3701,10 +3899,16 @@ show_diagnostics() {
             IFS=$'\t' read -r cfg_network cfg_security cfg_path cfg_mode cfg_uuid <<< "$cfg_line"
             echo -e "  Config    : ${WHITE}${cfg_network}/${cfg_security}${NC} ${DIM}path=${cfg_path} mode=${cfg_mode} uuid_hash=$(fingerprint_secret "$cfg_uuid")${NC}"
         fi
-        if ws_fallback_configured; then
+        if ws_fallback_in_config; then
             local ws_cfg_path="-"
             ws_cfg_path=$(jq -r '.inbounds[]? | select(.tag=="vless-ws") | .streamSettings.wsSettings.path // "-"' "$CONFIG_FILE" 2>/dev/null | head -1)
-            echo -e "  WS Fallback: ${WHITE}configured${NC} ${DIM}port=${WS_PORT} domain=${WS_PORT_DOMAIN} path=${ws_cfg_path:-/ws}${NC}"
+            if ws_fallback_enabled; then
+                echo -e "  WS Fallback: ${WHITE}enabled/configured${NC} ${DIM}port=${WS_PORT} domain=${WS_PORT_DOMAIN} path=${ws_cfg_path:-/ws}${NC}"
+            else
+                echo -e "  WS Fallback: ${YELLOW}present but panel-disabled${NC} ${DIM}regenerate config to remove port=${WS_PORT}${NC}"
+            fi
+        elif ws_fallback_enabled; then
+            echo -e "  WS Fallback: ${YELLOW}enabled, pending config regenerate${NC} ${DIM}port=${WS_PORT} domain=${WS_PORT_DOMAIN} path=$(ws_path_value)${NC}"
         fi
     fi
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -4290,6 +4494,9 @@ bench_rebind_runtime_paths() {
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
     LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
     LATENCY_FOCUS_DISABLED_FILE="$DATA_DIR/latency_focus_mode_disabled"
+    WS_FALLBACK_FILE="$DATA_DIR/ws_fallback_mode"
+    WS_FALLBACK_DISABLED_FILE="$DATA_DIR/ws_fallback_mode_disabled"
+    WS_FRONT_DOMAIN_FILE="$DATA_DIR/ws_front_domain.txt"
     LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
     PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
     MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -4555,6 +4762,17 @@ while true; do
     else
         _LATENCY_LABEL="${DIM}currently Disabled${NC}"
     fi
+    if ws_fallback_enabled; then
+        _WS_LABEL="${GREEN}currently Enabled${NC}"
+    else
+        _WS_LABEL="${DIM}currently Disabled${NC}"
+    fi
+    _WS_FRONT_VALUE=$(ws_front_domain_value 2>/dev/null || true)
+    if [[ -n "$_WS_FRONT_VALUE" ]]; then
+        _WS_FRONT_LABEL="${GREEN}${_WS_FRONT_VALUE}${NC}"
+    else
+        _WS_FRONT_LABEL="${DIM}not set${NC}"
+    fi
 
     echo -e "  ${WHITE}${B}Engine Status  :${NC} $(echo -e "$_STATUS")"
     echo -e "  ${WHITE}${B}Anti-Sleep Mode:${NC} $(echo -e "$_KA")\n"
@@ -4568,6 +4786,8 @@ while true; do
     echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
     echo -e "   ${DIM}Generated configs stay local; do not publish live links.${NC}"
     echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
+    echo -e "  ${RED}19)${NC} Toggle WebSocket Fallback ($(echo -e "$_WS_LABEL"))"
+    echo -e "  ${RED}20)${NC} Cloudflare WS Front ($(echo -e "$_WS_FRONT_LABEL"))"
     echo -e "  ${RED}49)${NC} Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
@@ -4624,9 +4844,14 @@ while true; do
             fi
             if ws_fallback_enabled; then
                 _WS_LINKS=$(generate_ws_links) || _WS_LINKS=""
+                _WS_FRONT_VALUE=$(ws_front_domain_value 2>/dev/null || true)
                 while IFS= read -r _LINK; do
                     [[ -n "$_LINK" ]] || continue
-                    _CONFIG_LABELS+=("Advanced WebSocket fallback link $((${#_CONFIG_LABELS[@]} + 1))")
+                    if [[ -n "$_WS_FRONT_VALUE" && "$_LINK" == vless://*@"$_WS_FRONT_VALUE":* ]]; then
+                        _CONFIG_LABELS+=("Cloudflare WebSocket front link")
+                    else
+                        _CONFIG_LABELS+=("Advanced WebSocket fallback link $((${#_CONFIG_LABELS[@]} + 1))")
+                    fi
                     _CONFIG_LINKS+=("$_LINK")
                 done < <(printf '%s\n' "$_WS_LINKS" | awk 'NF')
             fi
@@ -4775,6 +5000,30 @@ while true; do
             fi
             sleep 2
             ;;
+        19)
+            if toggle_ws_fallback_mode; then
+                echo -e "\n  ${GREEN}WebSocket fallback enabled.${NC}"
+                echo -e "  ${DIM}The panel will append advanced WS fallback links after the normal XHTTP links.${NC}"
+                echo -e "  ${DIM}XHTTP remains the recommended default; use WS only for compatibility testing.${NC}"
+            else
+                echo -e "\n  ${WHITE}WebSocket fallback disabled.${NC}"
+                echo -e "  ${DIM}Future generated configs will contain only the primary XHTTP inbound.${NC}"
+            fi
+            if [[ -f "$CONFIG_FILE" ]]; then
+                echo -e "  ${DIM}Applying transport change with the same UUID...${NC}"
+                _PREV_G2RAY_PRESERVE_UUID="${G2RAY_PRESERVE_UUID+x}:${G2RAY_PRESERVE_UUID:-}"
+                G2RAY_PRESERVE_UUID=1
+                generate_config
+                case "$_PREV_G2RAY_PRESERVE_UUID" in
+                    x:*) G2RAY_PRESERVE_UUID="${_PREV_G2RAY_PRESERVE_UUID#x:}" ;;
+                    *) unset G2RAY_PRESERVE_UUID ;;
+                esac
+            else
+                echo -e "  ${DIM}No config exists yet. Use option 2 to generate one with this setting.${NC}"
+            fi
+            echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+            ;;
+        20) show_ws_front_manager ;;
         49)
             if toggle_latency_focus_mode; then
                 echo -e "\n  ${GREEN}Latency focus mode enabled.${NC}"

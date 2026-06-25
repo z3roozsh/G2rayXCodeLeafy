@@ -403,6 +403,20 @@ test_generated_links_include_domain_and_ip_variants() {
 test_websocket_fallback_is_advanced_opt_in() {
     grep_fixed 'G2RAY_ENABLE_WS_FALLBACK' "$SCRIPT" \
         || fail 'WebSocket fallback is not guarded by an explicit advanced opt-in'
+    grep_fixed 'WS_FALLBACK_FILE=' "$SCRIPT" \
+        || fail 'WebSocket fallback preference is not persisted in panel state'
+    grep_fixed 'WS_FALLBACK_DISABLED_FILE=' "$SCRIPT" \
+        || fail 'WebSocket fallback disabled preference is not persisted'
+    grep_fixed 'WS_FRONT_DOMAIN_FILE=' "$SCRIPT" \
+        || fail 'Cloudflare WebSocket front domain is not persisted'
+    grep_fixed 'enable_ws_fallback_mode()' "$SCRIPT" \
+        || fail 'script cannot enable WebSocket fallback from the panel'
+    grep_fixed 'disable_ws_fallback_mode()' "$SCRIPT" \
+        || fail 'script cannot disable WebSocket fallback from the panel'
+    grep_fixed 'toggle_ws_fallback_mode()' "$SCRIPT" \
+        || fail 'script does not expose a reusable WebSocket fallback toggle'
+    grep_fixed 'ws_fallback_in_config()' "$SCRIPT" \
+        || fail 'script does not distinguish saved WS preference from generated config state'
     grep_fixed 'WS_PORT="${G2RAY_WS_PORT:-8443}"' "$SCRIPT" \
         || fail 'WebSocket fallback does not have a stable default port'
     grep_fixed 'ws_fallback_enabled()' "$SCRIPT" \
@@ -413,12 +427,26 @@ test_websocket_fallback_is_advanced_opt_in() {
         || fail 'WebSocket fallback path is not explicit in generated config'
     grep_fixed 'generate_ws_link_for_address()' "$SCRIPT" \
         || fail 'script cannot generate WebSocket fallback links'
+    grep_fixed 'generate_ws_front_link()' "$SCRIPT" \
+        || fail 'script cannot generate Cloudflare WebSocket front links'
     grep_fixed 'type=ws' "$SCRIPT" \
         || fail 'WebSocket fallback links do not use type=ws'
     grep_fixed 'ensure_codespace_port_public_for_port "$WS_PORT"' "$SCRIPT" \
         || fail 'WebSocket fallback port is not explicitly exposed when enabled'
-    grep_fixed 'G2RAY_ENABLE_WS_FALLBACK=1' "$README" \
-        || fail 'README does not document the advanced WebSocket fallback opt-in'
+    grep_fixed '19)${NC} Toggle WebSocket Fallback' "$SCRIPT" \
+        || fail 'main menu does not expose WebSocket fallback as a panel toggle'
+    grep_fixed '20)${NC} Cloudflare WS Front' "$SCRIPT" \
+        || fail 'main menu does not expose Cloudflare WS front management'
+    grep_fixed 'show_ws_front_manager()' "$SCRIPT" \
+        || fail 'script does not provide a Cloudflare WS front manager'
+    grep_fixed 'enabled, pending config regenerate' "$SCRIPT" \
+        || fail 'diagnostics do not explain when saved WS preference has not been applied to config'
+    grep_fixed '19) Toggle WebSocket Fallback' "$README" \
+        || fail 'README does not document the WebSocket fallback panel toggle'
+    grep_fixed '20) Cloudflare WS Front' "$README" \
+        || fail 'README does not document the Cloudflare WS front panel manager'
+    grep_fixed 'survives future panel sessions until you toggle it again' "$README" \
+        || fail 'README does not document persistent WebSocket fallback state'
     grep_fixed 'XHTTP remains the recommended default' "$README" \
         || fail 'README does not keep XHTTP as the recommended default'
     pass 'WebSocket fallback is advanced opt-in'
@@ -1181,8 +1209,10 @@ test_route_export_and_reconnect_edges_are_hardened() {
     if grep_fixed 'fallback_route_filter no-usable-probes action=export-candidates' "$SCRIPT"; then
         fail 'fallback exports still emit candidates after all route probes failed'
     fi
+    grep_fixed 'fallback_route_filter no-usable-probes action=cached-stale' "$SCRIPT" \
+        || fail 'fallback exports do not preserve cached IP routes during temporary route settling'
     grep_fixed 'fallback_route_filter no-usable-probes action=domain-only' "$SCRIPT" \
-        || fail 'fallback exports do not fall back to the domain link only when IP probes fail'
+        || fail 'fallback exports do not fall back to the domain link when no cached IP route is available'
     awk '
         /generate_config\(\)/ { in_fn=1 }
         in_fn && index($0, "refresh_config_exports >/dev/null 2>&1 || true") { saw=1 }
