@@ -73,6 +73,7 @@ ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
 DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
 LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
 LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
 LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
@@ -100,6 +101,9 @@ LOG_DIR="${G2RAY_LOG_DIR:-$BASE_DIR/logs}"
 LOG_FILE="$LOG_DIR/g2ray.log"
 STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
 DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
+LOG_ROTATE_STAMP_FILE="$DATA_DIR/log_rotate_last"
+STRUCTURED_LOG_ROTATE_STAMP_FILE="$DATA_DIR/structured_log_rotate_last"
+DIAGNOSTIC_LOG_ROTATE_STAMP_FILE="$DATA_DIR/diagnostic_log_rotate_last"
 QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
@@ -129,12 +133,18 @@ ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
 DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
 ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
+ROUTE_STATS_MAX_AGE_SEC="${G2RAY_ROUTE_STATS_MAX_AGE_SEC:-604800}"
 ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-6}"
 ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
 LAST_GOOD_ROUTE_MAX_AGE_SEC="${G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC:-1800}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 RUNTIME_LOCK_WAIT_ATTEMPTS="${G2RAY_RUNTIME_LOCK_WAIT_ATTEMPTS:-900}"
+G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC="${G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC:-45}"
+G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC="${G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC:-20}"
+G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC="${G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC:-45}"
+G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC="${G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC:-45}"
+G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC="${G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC:-10}"
 # Profile resolution order: env var override, then the persisted preference
 # file (set via `g2ray.sh profile <name>`), then the balanced default. The file
 # makes the choice survive Codespace restarts and panels launched without the
@@ -176,9 +186,13 @@ touch "$DIAGNOSTIC_LOG_FILE" 2>/dev/null || true
 chmod 600 "$LOG_FILE" "$STRUCTURED_LOG_FILE" "$DIAGNOSTIC_LOG_FILE" "$SAVED_BYTES_FILE" "$SESSION_BYTES_FILE" "$TOTAL_UPTIME_FILE" "$SESSION_START_FILE" 2>/dev/null || true
 
 json_escape() {
-    printf '%s' "${1:-}" \
-        | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' \
-        | tr -d '\r\n'
+    local value="${1:-}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\r'/}
+    value=${value//$'\n'/}
+    printf '%s' "$value"
 }
 
 low_overhead_enabled() {
@@ -327,6 +341,78 @@ domain_link_export_enabled() {
     esac
 }
 
+valid_xhttp_mode() {
+    case "${1:-}" in
+        packet-up|stream-up|stream-one|auto) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+xhttp_mode_value() {
+    local value
+    value="${G2RAY_XHTTP_MODE:-}"
+    if [[ -z "$value" && -f "$XHTTP_MODE_FILE" ]]; then
+        value=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$XHTTP_MODE_FILE" 2>/dev/null || true)
+    fi
+    [[ -n "$value" ]] || value="packet-up"
+    if valid_xhttp_mode "$value"; then
+        printf '%s' "$value"
+    else
+        printf 'packet-up'
+    fi
+}
+
+set_xhttp_mode() {
+    local mode="${1:-}"
+    valid_xhttp_mode "$mode" || return 1
+    _atomic_write "$XHTTP_MODE_FILE" "$mode" || return 1
+    log_event INFO "xhttp_mode preference set mode=${mode}"
+    reapply_config_preserving_uuid_if_exists
+}
+
+xhttp_mode_summary() {
+    local mode
+    mode=$(xhttp_mode_value)
+    case "$mode" in
+        packet-up) printf 'packet-up (recommended compatibility default)' ;;
+        stream-up) printf 'stream-up (experimental streaming upload)' ;;
+        stream-one) printf 'stream-one (experimental single-stream mode)' ;;
+        auto) printf 'auto (client-selected mode)' ;;
+        *) printf 'packet-up (recommended compatibility default)' ;;
+    esac
+}
+
+show_xhttp_mode_manager() {
+    local choice mode
+    while true; do
+        refresh_screen
+        echo -e "  ${GREEN}XHTTP Mode${NC}\n"
+        echo -e "  Current : ${WHITE}$(xhttp_mode_summary)${NC}\n"
+        echo -e "  ${RED}1)${NC} packet-up  ${DIM}Best default behind GitHub/Codespaces HTTP edge${NC}"
+        echo -e "  ${RED}2)${NC} stream-up  ${DIM}Experimental; test for upload/browsing behavior${NC}"
+        echo -e "  ${RED}3)${NC} stream-one ${DIM}Experimental; most picky through reverse proxies${NC}"
+        echo -e "  ${RED}4)${NC} auto       ${DIM}Let client/core choose where supported${NC}"
+        echo -e "  ${RED}0)${NC} Return\n"
+        echo -ne "  ${GREEN}Select:${NC} "
+        read -r choice
+        case "$choice" in
+            1) mode="packet-up" ;;
+            2) mode="stream-up" ;;
+            3) mode="stream-one" ;;
+            4) mode="auto" ;;
+            0) return 0 ;;
+            *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1; continue ;;
+        esac
+        if set_xhttp_mode "$mode"; then
+            echo -e "\n  ${GREEN}XHTTP mode saved: ${mode}.${NC}"
+            echo -e "  ${DIM}Existing UUID is preserved; regenerate/view configs to copy matching links.${NC}"
+        else
+            echo -e "\n  ${RED}Could not save XHTTP mode.${NC}"
+        fi
+        echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+    done
+}
+
 route_export_revalidate_top_cached_enabled() {
     local value
     value=$(printf '%s' "${G2RAY_EXPORT_REVALIDATE_TOP_CACHED:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
@@ -363,11 +449,50 @@ tcp_fast_open_outbound_enabled() {
     (( (value & 1) == 1 ))
 }
 
+run_with_deadline() {
+    local seconds="${1:-30}" pid waited=0 status=0 status_file command_name
+    shift || return 1
+    [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=30
+    command_name="${1:-unknown}"
+    status_file=$(mktemp "${TMPDIR:-/tmp}/g2ray-deadline.XXXXXX") || { "$@"; return $?; }
+    rm -f "$status_file" 2>/dev/null || true
+    (
+        set +e
+        "$@"
+        printf '%s\n' "$?" > "$status_file" 2>/dev/null || true
+    ) &
+    pid=$!
+    while [[ ! -s "$status_file" ]]; do
+        if (( waited >= seconds )); then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rm -f "$status_file" 2>/dev/null || true
+            log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
+            return 124
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || status=$?
+            rm -f "$status_file" 2>/dev/null || true
+            return "$status"
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    status=$(cat "$status_file" 2>/dev/null || printf '1')
+    wait "$pid" 2>/dev/null || true
+    rm -f "$status_file" 2>/dev/null || true
+    [[ "$status" =~ ^[0-9]+$ ]] || status=1
+    return "$status"
+}
+
 log_structured_event() {
     local ts="$1" level="$2" msg="$3" event
-    event=$(printf '%s' "$msg" | awk '{print $1; exit}' | tr -cd 'A-Za-z0-9_.:-')
+    event="${msg%%[[:space:]]*}"
+    event="${event//[^A-Za-z0-9_.:-]/}"
     [[ -n "$event" ]] || event="event"
-    rotate_log_file "$STRUCTURED_LOG_FILE"
+    rotate_log_file_throttled "$STRUCTURED_LOG_FILE" "$STRUCTURED_LOG_ROTATE_STAMP_FILE"
     printf '{"ts":"%s","level":"%s","event":"%s","message":"%s"}\n' \
         "$(json_escape "$ts")" "$(json_escape "$level")" "$(json_escape "$event")" "$(json_escape "$msg")" \
         >> "$STRUCTURED_LOG_FILE" 2>/dev/null || true
@@ -393,7 +518,7 @@ log_event() {
         return 0
     fi
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
-    rotate_log_file "$LOG_FILE"
+    rotate_log_file_throttled "$LOG_FILE" "$LOG_ROTATE_STAMP_FILE"
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
     log_structured_event "$ts" "$level" "$msg"
 }
@@ -457,6 +582,31 @@ rotate_log_file() {
     mv -f "$file" "${file}.1" 2>/dev/null || true
     : > "$file" 2>/dev/null || true
     chmod 600 "$file" 2>/dev/null || true
+}
+
+rotate_log_file_throttled() {
+    local file="$1" stamp="$2" interval="${LOG_ROTATE_CHECK_INTERVAL_SEC:-60}" now last=""
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=60
+    printf -v now '%(%s)T' -1 2>/dev/null || now=$(date +%s 2>/dev/null || printf '0')
+    [[ "$now" =~ ^[0-9]+$ ]] || now=0
+    case "$stamp" in
+        "$LOG_ROTATE_STAMP_FILE") last="${_G2RAY_LOG_ROTATE_LAST:-}" ;;
+        "$STRUCTURED_LOG_ROTATE_STAMP_FILE") last="${_G2RAY_STRUCTURED_LOG_ROTATE_LAST:-}" ;;
+        "$DIAGNOSTIC_LOG_ROTATE_STAMP_FILE") last="${_G2RAY_DIAGNOSTIC_LOG_ROTATE_LAST:-}" ;;
+    esac
+    [[ -n "$last" ]] || last=$(cat "$stamp" 2>/dev/null || printf '0')
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if (( now > 0 && last > 0 && now - last < interval )); then
+        return 0
+    fi
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+    case "$stamp" in
+        "$LOG_ROTATE_STAMP_FILE") _G2RAY_LOG_ROTATE_LAST="$now" ;;
+        "$STRUCTURED_LOG_ROTATE_STAMP_FILE") _G2RAY_STRUCTURED_LOG_ROTATE_LAST="$now" ;;
+        "$DIAGNOSTIC_LOG_ROTATE_STAMP_FILE") _G2RAY_DIAGNOSTIC_LOG_ROTATE_LAST="$now" ;;
+    esac
+    chmod 600 "$stamp" 2>/dev/null || true
+    rotate_log_file "$file"
 }
 
 codespace_shared_github_token() {
@@ -794,10 +944,10 @@ resolve_dns_provider_ips_with_sources() {
     [[ -n "$domain" ]] || return 0
     tmpdir=$(mktemp -d "${DATA_DIR}/dns-resolve.XXXXXX" 2>/dev/null || mktemp -d)
     if command -v dig >/dev/null 2>&1; then
-        (dig +short "$domain" A 2>/dev/null | awk 'NF {print "dig\t" $0}' > "$tmpdir/dig") &
+        (timeout 4 dig +time=2 +tries=1 +short "$domain" A 2>/dev/null | awk 'NF {print "dig\t" $0}' > "$tmpdir/dig") &
         pids+=("$!")
     fi
-    (getent hosts "$domain" 2>/dev/null | awk '{print "getent\t" $1}' > "$tmpdir/getent") &
+    (timeout 4 getent hosts "$domain" 2>/dev/null | awk '{print "getent\t" $1}' > "$tmpdir/getent") &
     pids+=("$!")
     ({ json_dns_ips "https://dns.google/resolve?name=${domain}&type=A" || true; } | awk 'NF {print "dns_google\t" $0}' > "$tmpdir/dns_google") &
     pids+=("$!")
@@ -1231,10 +1381,10 @@ resolve_domain_ip() {
 
 _atomic_write() {
     local file="$1" content="$2" tmp
-    tmp=$(mktemp "${file}.XXXXXX")
-    printf '%s\n' "$content" > "$tmp"
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    printf '%s\n' "$content" > "$tmp" || { rm -f "$tmp" 2>/dev/null || true; return 1; }
     chmod 600 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$file"
+    mv -f "$tmp" "$file" || { rm -f "$tmp" 2>/dev/null || true; return 1; }
     chmod 600 "$file" 2>/dev/null || true
 }
 
@@ -1262,6 +1412,24 @@ generate_wake_secret() {
     fi
     echo "No cryptographically secure random source is available for WAKE_SECRET." >&2
     return 1
+}
+
+generate_uuid() {
+    local hex
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+        return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        hex=$(openssl rand -hex 16 2>/dev/null || true)
+    elif [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1; then
+        hex=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    else
+        hex=""
+    fi
+    [[ "$hex" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
+    hex=$(printf '%s' "$hex" | tr '[:upper:]' '[:lower:]')
+    printf '%s-%s-4%s-8%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" "${hex:17:3}" "${hex:20:12}"
 }
 
 normalize_waker_url() {
@@ -1684,14 +1852,11 @@ fetch_remote_message() {
 
 enable_anti_sleep() {
     tmux has-session -t g2ray_keepalive 2>/dev/null && return 0
-    cat > "$DATA_DIR/keepalive.sh" << 'EOF'
+cat > "$DATA_DIR/keepalive.sh" << 'EOF'
 #!/bin/bash
-i=0
 while true; do
-    i=$(( i+1 ))
-    printf "\r[G2ray] Keepalive tick: %d" "$i"
-    (( i % 60 == 0 )) && curl -s -m 4 https://github.com >/dev/null 2>&1
-    sleep 1
+    curl -s -m 4 https://github.com >/dev/null 2>&1 || true
+    sleep 60
 done
 EOF
     chmod +x "$DATA_DIR/keepalive.sh"
@@ -1860,15 +2025,37 @@ route_settling_history_summary() {
     tail -n 6 "$ROUTE_SETTLING_HISTORY_FILE" 2>/dev/null | awk -F '\t' 'NF >= 7 {printf "  %s %-22s %-7s HTTP %-3s wait=%ss attempts=%s\n", $1, $2, $3, $4, $6, $7}'
 }
 
+xray_stats_inbound_totals() {
+    awk '
+        /name[": ]/ {
+            name = $0
+            next
+        }
+        /value[": ]/ {
+            value = $0
+            gsub(/[^0-9.eE+-]/, " ", value)
+            count = split(value, parts, /[[:space:]]+/)
+            n = 0
+            for (i = 1; i <= count; i++) {
+                if (parts[i] ~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/) {
+                    n = parts[i] + 0
+                    break
+                }
+            }
+            if (name ~ /inbound/ && name ~ /downlink/) down += n
+            if (name ~ /inbound/ && name ~ /uplink/) up += n
+            next
+        }
+        END { printf "%.0f %.0f\n", down + 0, up + 0 }
+    '
+}
+
 save_xray_stats() {
     xray_running || return 0
     local stats sd su bd bu svd svu dd du
     stats=$(sudo timeout 3 "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null) || return 0
     [[ -z "$stats" ]] && return 0
-    sd=$(printf '%s' "$stats" | grep -A1 'downlink' | grep 'value' | \
-        grep -oE '[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?' | awk '{s+=$1}END{printf "%.0f",s+0}')
-    su=$(printf '%s' "$stats" | grep -A1 'uplink'   | grep 'value' | \
-        grep -oE '[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?' | awk '{s+=$1}END{printf "%.0f",s+0}')
+    read -r sd su < <(printf '%s\n' "$stats" | xray_stats_inbound_totals)
     sd=${sd:-0}; su=${su:-0}
     bd=$(jq -r '.down//0' "$SESSION_BYTES_FILE" 2>/dev/null || echo 0)
     bu=$(jq -r '.up//0'   "$SESSION_BYTES_FILE" 2>/dev/null || echo 0)
@@ -1891,10 +2078,7 @@ get_data_usage() {
     if xray_running; then
         stats=$(sudo timeout 3 "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null) || true
         if [[ -n "$stats" ]]; then
-            fd=$(printf '%s' "$stats" | grep -A1 'downlink' | grep 'value' | \
-                grep -oE '[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?' | awk '{s+=$1}END{printf "%.0f",s+0}')
-            fu=$(printf '%s' "$stats" | grep -A1 'uplink'   | grep 'value' | \
-                grep -oE '[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?' | awk '{s+=$1}END{printf "%.0f",s+0}')
+            read -r fd fu < <(printf '%s\n' "$stats" | xray_stats_inbound_totals)
             bd=$(jq -r '.down//0' "$SESSION_BYTES_FILE" 2>/dev/null || echo 0)
             bu=$(jq -r '.up//0'   "$SESSION_BYTES_FILE" 2>/dev/null || echo 0)
             sd=$(awk -v s="${fd:-0}" -v b="$bd" 'BEGIN{d=s-b; printf "%.0f",(d<0?0:d)}')
@@ -2034,14 +2218,17 @@ with_runtime_lock() {
 
 _stop_xray_impl() {
     save_xray_stats 2>/dev/null || true
-    local p owned_pids=()
+    local p _grace owned_pids=()
     mapfile -t owned_pids < <(owned_xray_pids | awk 'NF && !seen[$0]++ {print}')
     if ((${#owned_pids[@]})); then
         for p in "${owned_pids[@]}"; do
             if xray_pid_matches "$p" && sudo kill -0 "$p" 2>/dev/null; then
                 log_event INFO "stop_xray pid=${p}"
                 sudo kill "$p" >/dev/null 2>&1 || true
-                sleep 0.5
+                for _grace in 1 2 3 4 5 6 7 8 9 10; do
+                    sudo kill -0 "$p" 2>/dev/null || break
+                    sleep 0.2
+                done
                 if sudo kill -0 "$p" 2>/dev/null; then
                     sudo kill -9 "$p" >/dev/null 2>&1 || true
                     log_event WARN "stop_xray forced_kill pid=${p}"
@@ -2060,7 +2247,7 @@ _stop_xray_impl() {
         done
     fi
     rm -f "$XRAY_PID_FILE" 2>/dev/null || true
-    sleep 0.5
+    ((${#owned_pids[@]})) && sleep 0.2
 }
 
 stop_xray() {
@@ -2099,6 +2286,20 @@ upgrade_config_dns() {
     fi
 }
 
+xray_validate_config() {
+    local tmp
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    tmp=$(mktemp "${LOG_DIR}/xray-configtest.XXXXXX.log" 2>/dev/null || mktemp "/tmp/xray-configtest.XXXXXX.log") || return 1
+    if sudo timeout 10 "$XRAY_BIN" run -test -c "$CONFIG_FILE" >"$tmp" 2>&1; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 0
+    fi
+    log_event ERROR "start_xray config_test_failed log=${tmp}"
+    echo -e "  ${RED}âœ– Xray config validation failed. See:${NC} ${WHITE}${tmp}${NC}"
+    tail -n 8 "$tmp" 2>/dev/null | sed 's/^/  /' || true
+    return 1
+}
+
 _start_xray_impl() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_event WARN "start_xray missing_config path=${CONFIG_FILE}"
@@ -2107,14 +2308,17 @@ _start_xray_impl() {
     fi
     local launch_cmd pid
     log_event INFO "start_xray requested port=${XRAY_PORT} config=${CONFIG_FILE}"
-    launch_cmd=$(printf 'nohup %q run -c %q </dev/null >%q 2>&1 & printf "%%s\n" "$!"' \
+    launch_cmd=$(printf 'ulimit -n "${G2RAY_XRAY_FD_LIMIT:-65536}" 2>/dev/null || true; nohup %q run -c %q </dev/null >%q 2>&1 & printf "%%s\n" "$!"' \
         "$XRAY_BIN" "$CONFIG_FILE" "$LOG_DIR/xray.log")
+    upgrade_config_dns >/dev/null 2>&1 || true
+    if ! xray_validate_config; then
+        return 1
+    fi
     if ! stop_xray; then
         log_event ERROR "start_xray stop_previous_failed"
         echo -e "  ${RED}✖ Could not stop previous Xray process.${NC}"
         return 1
     fi
-    upgrade_config_dns >/dev/null 2>&1 || true
     reset_session_bytes_baseline
     pid=$(sudo bash -c "$launch_cmd" 2>/dev/null || true)
     if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
@@ -2228,11 +2432,11 @@ _background_tasks() {
     local tick=0 health_tick=0 export_tick=0 route_tick=0
     write_background_supervisor_heartbeat
     if [[ -f "$CONFIG_FILE" ]]; then
-        self_heal_once >/dev/null 2>&1 || true
+        run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         if ! latency_focus_enabled; then
-            refresh_route_candidate_health >/dev/null 2>&1 || true
-            refresh_config_exports >/dev/null 2>&1 || true
-            health_probe >/dev/null 2>&1 || true
+            run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
+            run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true
+            run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1 || true
         fi
     fi
     while true; do
@@ -2252,20 +2456,20 @@ _background_tasks() {
             fi
         fi
         [[ -f "$CONFIG_FILE" ]] || continue
-        self_heal_once >/dev/null 2>&1 || true
-        save_xray_stats    >/dev/null 2>&1 || true
+        run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
+        run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         if latency_focus_enabled; then
-            (( ++health_tick >= 15 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
+            (( ++health_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
             continue
         fi
-        (( ++health_tick >= 5 )) && { health_probe >/dev/null 2>&1; health_tick=0; }
+        (( ++health_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
         if low_overhead_enabled; then
-            (( ++route_tick >= 15 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
-            (( ++export_tick >= 15 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+            (( ++route_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+            (( ++export_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
         else
-            (( ++route_tick >= 5 )) && { refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
-            (( ++export_tick >= 5 )) && { refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+            (( ++route_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+            (( ++export_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
             (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
         fi
     done
@@ -2590,13 +2794,13 @@ performance_profile_settings() {
     local profile="${1:-$PERFORMANCE_PROFILE}"
     case "$profile" in
         low_latency|latency)
-            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=240\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
             ;;
         streaming|video)
             printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=true\nloglevel=warning\n'
             ;;
         unstable_mobile|mobile)
-            printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=900\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=180\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         low_overhead|minimal)
             printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
@@ -2605,7 +2809,7 @@ performance_profile_settings() {
             printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
             ;;
         *)
-            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=300\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
             ;;
     esac
 }
@@ -2633,10 +2837,13 @@ generate_config() {
     if [[ "${G2RAY_PRESERVE_UUID:-0}" == "1" && -s "$UUID_FILE" ]]; then
         :
     else
-        uuidgen > "$UUID_FILE"
+        generate_uuid > "$UUID_FILE" || {
+            echo -e "  ${RED}Could not generate a UUID for the config.${NC}"
+            return 1
+        }
     fi
     local uuid; uuid=$(cat "$UUID_FILE")
-    local profile_name max_upload_size max_concurrent_uploads handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value
+    local profile_name max_upload_size max_concurrent_uploads handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_mode
     while IFS='=' read -r key value; do
         case "$key" in
             name) profile_name="$value" ;;
@@ -2663,6 +2870,7 @@ generate_config() {
     loglevel="${loglevel:-warning}"
     sniff_dest='["http", "tls"]'
     [[ "$sniff_quic" == "true" ]] && sniff_dest='["http", "tls", "quic"]'
+    xhttp_mode=$(xhttp_mode_value)
     # Outbound socket options: TCP keepalive always (keep origin connections warm
     # and detect dead peers), plus TCP Fast Open when the kernel supports it.
     local direct_sockopt tfo_state="off" sockopt_inner
@@ -2694,7 +2902,7 @@ JSONEOF
 )
     fi
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
-    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} tcp_fast_open=${tfo_state}"
+    log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} xhttp_mode=${xhttp_mode} tcp_fast_open=${tfo_state}"
     cat > "$CONFIG_FILE" << JSONEOF
 {
   "log": { "loglevel": "${loglevel}", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
@@ -2721,7 +2929,7 @@ JSONEOF
       },
       "streamSettings": {
         "network": "xhttp", "security": "none",
-        "xhttpSettings": { "mode": "packet-up", "path": "/", "maxUploadSize": ${max_upload_size}, "maxConcurrentUploads": ${max_concurrent_uploads} },
+        "xhttpSettings": { "mode": "${xhttp_mode}", "path": "/", "maxUploadSize": ${max_upload_size}, "maxConcurrentUploads": ${max_concurrent_uploads} },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
@@ -2809,12 +3017,13 @@ xhttp_extra_json_valid() {
 }
 
 generate_link_for_address() {
-    local address="$1" label_suffix="${2:-}" uuid path encoded_path extra_param=""
+    local address="$1" label_suffix="${2:-}" uuid path encoded_path xhttp_mode extra_param=""
     uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     encoded_path=$(url_encode_query_value "$path")
+    xhttp_mode=$(xhttp_mode_value)
     # Keep exported links broadly compatible: omit XHTTP `extra` unless the user
     # explicitly supplies a complete, valid object for a known-compatible client.
     local extra_json=""
@@ -2826,8 +3035,8 @@ generate_link_for_address() {
         fi
     fi
     [[ -n "$extra_json" ]] && extra_param="&extra=$(url_encode_query_value "$extra_json")"
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=packet-up%s#G2rayXCodeLeafy|%s' \
-        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&host=%s&path=%s&mode=%s%s#G2rayXCodeLeafy|%s' \
+        "$uuid" "$address" "$CODESPACES_EDGE_PORT" "$PORT_DOMAIN" "$PORT_DOMAIN" "$encoded_path" "$(url_encode_query_value "$xhttp_mode")" "$extra_param" "${GITHUB_USER:-User}${label_suffix}"
 }
 
 ws_alpn_query_param() {
@@ -3005,18 +3214,23 @@ clear_route_candidate_cooldown() {
 }
 
 update_route_candidate_stats() {
-    local ip="$1" code="${2:-0}" ms="${3:-0}" source="${4:-probe}" reason="${5:-}" usable=false checked tmp
+    local ip="$1" code="${2:-0}" ms="${3:-0}" source="${4:-probe}" reason="${5:-}" usable=false checked tmp now_epoch stats_cutoff=""
     valid_ipv4 "$ip" || return 0
     [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
     [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
     [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$code")
     xhttp_status_usable "$code" && usable=true
     checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+    now_epoch=$(date -u +%s 2>/dev/null || printf '0')
+    if [[ "$ROUTE_STATS_MAX_AGE_SEC" =~ ^[0-9]+$ && "$ROUTE_STATS_MAX_AGE_SEC" -gt 0 && "$now_epoch" =~ ^[0-9]+$ && "$now_epoch" -gt "$ROUTE_STATS_MAX_AGE_SEC" ]]; then
+        stats_cutoff=$(date -u -d "@$((now_epoch - ROUTE_STATS_MAX_AGE_SEC))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+    fi
     mkdir -p "$DATA_DIR" 2>/dev/null || true
     [[ -f "$ROUTE_STATS_FILE" ]] || : > "$ROUTE_STATS_FILE"
     tmp=$(mktemp "$DATA_DIR/route_stats.XXXXXX") || return 1
     awk -F '\t' -v OFS='\t' \
-        -v target="$ip" -v code="$code" -v ms="$ms" -v usable="$usable" -v checked="$checked" -v source="$source" -v reason="$reason" '
+        -v target="$ip" -v code="$code" -v ms="$ms" -v usable="$usable" -v checked="$checked" -v source="$source" -v reason="$reason" \
+        -v cutoff="$stats_cutoff" '
         function emit(ip, samples, successes, failures, avg, min, max, last_ms, last_code, last_usable, last_checked, ewma, recent_failures, last_reason) {
             if (samples < 1) samples = 1
             printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\n",
@@ -3050,7 +3264,10 @@ update_route_candidate_stats() {
             emit(target, samples, successes, failures, avg, min, max, ms, code, usable, checked, ewma, recent_failures, reason)
             next
         }
-        NF >= 1 { print }
+        NF >= 1 {
+            if ($1 != target && cutoff != "" && NF >= 11 && $11 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && $11 < cutoff) next
+            print
+        }
         END {
             if (!found) {
                 samples = 1
@@ -3644,6 +3861,10 @@ usable_fallback_ips() {
                     [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]] \
                         && record_route_candidate_cooldown "$ip" "$reason"
                     log_event WARN "fallback_route_cache_stale ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
+                    if [[ "$reason" != "route_settling_404" && ${#cached_routes[@]} -gt 1 ]]; then
+                        cached_routes=("${cached_routes[@]:1}")
+                        cache_ready=true
+                    fi
                 fi
             fi
             if [[ "$cache_ready" == true ]]; then
@@ -3974,6 +4195,7 @@ create_support_bundle() {
     copy_redacted_file "$MANUAL_ROUTE_CANDIDATES_FILE" "$tmp/state/manual_route_candidates.txt"
     copy_redacted_file "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$tmp/state/blacklisted_route_candidates.txt"
     copy_redacted_file "$DOMAIN_LINK_EXPORT_FILE" "$tmp/state/export_domain_link.txt"
+    copy_redacted_file "$XHTTP_MODE_FILE" "$tmp/state/xhttp_mode.txt"
     copy_redacted_file "$WS_FALLBACK_FILE" "$tmp/state/ws_fallback_mode"
     copy_redacted_file "$WS_FALLBACK_DISABLED_FILE" "$tmp/state/ws_fallback_mode_disabled"
     copy_redacted_file "$WS_FRONT_DOMAIN_FILE" "$tmp/state/ws_front_domain.txt"
@@ -4529,6 +4751,7 @@ print_doctor_json() {
   "waker_configured": $([[ -n "$waker_url" ]] && printf true || printf false),
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
+  "xhttp_mode": "$(json_escape "$(xhttp_mode_value)")",
   "performance_profile": "$(json_escape "$(effective_performance_profile)")",
   "saved_performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "log_file": "$(json_escape "$LOG_FILE")",
@@ -4561,6 +4784,7 @@ bench_budget_ms() {
         export_generation) bench_budget_value "${G2RAY_BENCH_BUDGET_EXPORT_MS:-10000}" 10000 ;;
         doctor_json) bench_budget_value "${G2RAY_BENCH_BUDGET_DOCTOR_MS:-6000}" 6000 ;;
         recover_json_contract) bench_budget_value "${G2RAY_BENCH_BUDGET_RECOVER_JSON_MS:-6000}" 6000 ;;
+        log_event_cost) bench_budget_value "${G2RAY_BENCH_BUDGET_LOG_EVENT_MS:-8000}" 8000 ;;
         *) bench_budget_value "${G2RAY_BENCH_BUDGET_DEFAULT_MS:-1000}" 1000 ;;
     esac
 }
@@ -4619,6 +4843,7 @@ bench_rebind_runtime_paths() {
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+    XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
     LOW_OVERHEAD_PREV_PROFILE_FILE="$DATA_DIR/low_overhead_previous_profile.txt"
@@ -4645,6 +4870,9 @@ bench_rebind_runtime_paths() {
     LOG_FILE="$LOG_DIR/g2ray.log"
     STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
+    LOG_ROTATE_STAMP_FILE="$DATA_DIR/log_rotate_last"
+    STRUCTURED_LOG_ROTATE_STAMP_FILE="$DATA_DIR/structured_log_rotate_last"
+    DIAGNOSTIC_LOG_ROTATE_STAMP_FILE="$DATA_DIR/diagnostic_log_rotate_last"
     QR_DIR="$DATA_DIR/qr"
     MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
     SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
@@ -4677,7 +4905,8 @@ bench_json_impl() {
         'route_ordering|cached_usable_fallback_ips >/dev/null || true' \
         'export_generation|refresh_config_exports' \
         'doctor_json|print_doctor_json' \
-        'recover_json_contract|recover_now_json || true'
+        'recover_json_contract|recover_now_json || true' \
+        'log_event_cost|for _i in $(seq 1 50); do log_structured_event "2026-01-01T00:00:00Z" INFO "bench_event iteration=${_i}"; done'
     do
         local name="${spec%%|*}" cmd="${spec#*|}"
         case_json=$(bench_case_json "$name" "$cmd")
@@ -4902,6 +5131,7 @@ while true; do
     else
         _WS_LABEL="${DIM}currently Disabled${NC}"
     fi
+    _XHTTP_MODE_LABEL="${WHITE}$(xhttp_mode_value)${NC}"
     _WS_FRONT_VALUE=$(ws_front_domain_value 2>/dev/null || true)
     if [[ -n "$_WS_FRONT_VALUE" ]]; then
         _WS_FRONT_LABEL="${GREEN}${_WS_FRONT_VALUE}${NC}"
@@ -4923,6 +5153,7 @@ while true; do
     echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
     echo -e "  ${RED}19)${NC} Toggle WebSocket Fallback ($(echo -e "$_WS_LABEL"))"
     echo -e "  ${RED}20)${NC} Cloudflare WS Front ($(echo -e "$_WS_FRONT_LABEL"))"
+    echo -e "  ${RED}21)${NC} XHTTP Mode ($(echo -e "$_XHTTP_MODE_LABEL"))"
     echo -e "  ${RED}49)${NC} Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))"
     echo ""
     echo -e "  ${WHITE}${B}● ANALYTICS & TOOLS${NC}"
@@ -5161,6 +5392,7 @@ while true; do
             echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
             ;;
         20) show_ws_front_manager ;;
+        21) show_xhttp_mode_manager ;;
         49)
             if toggle_latency_focus_mode; then
                 echo -e "\n  ${GREEN}Latency focus mode enabled.${NC}"

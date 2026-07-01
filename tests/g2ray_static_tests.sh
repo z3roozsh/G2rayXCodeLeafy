@@ -114,6 +114,35 @@ test_background_tasks_require_config() {
     pass 'background tasks skip Xray start until config exists'
 }
 
+test_recovery_hot_paths_are_bounded_and_validated() {
+    grep_fixed 'run_with_deadline()' "$SCRIPT" \
+        || fail 'script does not provide a reusable per-task deadline wrapper'
+    grep_fixed 'run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once' "$SCRIPT" \
+        || fail 'background self-heal is not deadline bounded'
+    grep_fixed 'run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health' "$SCRIPT" \
+        || fail 'background route refresh is not deadline bounded'
+    grep_fixed 'xray_validate_config()' "$SCRIPT" \
+        || fail 'start_xray has no config-validation helper'
+    grep_fixed 'run -test -c' "$SCRIPT" \
+        || fail 'Xray config is not preflight-tested before launch'
+    grep_fixed 'ulimit -n "${G2RAY_XRAY_FD_LIMIT:-65536}"' "$SCRIPT" \
+        || fail 'Xray launch does not raise the file-descriptor ceiling'
+    grep_fixed 'for _grace in 1 2 3 4 5 6 7 8 9 10' "$SCRIPT" \
+        || fail 'stop_xray does not poll for graceful exit before SIGKILL'
+    grep_fixed 'timeout 4 dig +time=2 +tries=1' "$SCRIPT" \
+        || fail 'dig-based DNS discovery has no explicit timeout'
+    grep_fixed 'timeout 4 getent hosts' "$SCRIPT" \
+        || fail 'getent DNS discovery has no explicit timeout'
+    grep_fixed 'ROUTE_STATS_MAX_AGE_SEC=' "$SCRIPT" \
+        || fail 'route stats do not have a retention setting'
+    grep_fixed 'log_event_cost|' "$SCRIPT" \
+        || fail 'benchmark suite does not cover logging overhead'
+    if grep_fixed 'Keepalive tick:' "$SCRIPT"; then
+        fail 'anti-sleep keepalive still wakes every second for a display-only tick'
+    fi
+    pass 'recovery hot paths are bounded and startup is preflight-validated'
+}
+
 test_port_visibility_failures_are_handled() {
     if grep -Eq '^[[:space:]]*ensure_codespace_port_public[[:space:]]*>/dev/null 2>&1[[:space:]]*$' "$SCRIPT"; then
         fail 'bare ensure_codespace_port_public call can exit under set -e without a user-facing message'
@@ -1862,6 +1891,7 @@ test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
 test_background_tasks_require_config
+test_recovery_hot_paths_are_bounded_and_validated
 test_port_visibility_failures_are_handled
 test_self_update_is_opt_in
 test_exit_trap_preserves_failures

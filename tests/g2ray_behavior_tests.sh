@@ -32,6 +32,7 @@ reset_runtime_paths() {
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+    XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
     LOW_OVERHEAD_DISABLED_FILE="$DATA_DIR/low_overhead_mode_disabled"
     LATENCY_FOCUS_FILE="$DATA_DIR/latency_focus_mode"
@@ -52,6 +53,10 @@ reset_runtime_paths() {
     ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
     PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
     RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
+    SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
+    SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
+    TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_seconds"
+    SESSION_START_FILE="$DATA_DIR/session_start_epoch"
     LOG_FILE="$LOG_DIR/g2ray.log"
     STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
@@ -64,6 +69,10 @@ reset_runtime_paths() {
     : > "$DIAGNOSTIC_LOG_FILE"
     LOG_MAX_BYTES=1048576
     LOG_ROTATE_KEEP=3
+    printf '{"down":0,"up":0}\n' > "$SAVED_BYTES_FILE"
+    printf '{"down":0,"up":0}\n' > "$SESSION_BYTES_FILE"
+    printf '0\n' > "$TOTAL_UPTIME_FILE"
+    date +%s > "$SESSION_START_FILE"
     MAX_FALLBACK_LINKS=20
     ROUTE_MONITOR_MAX_CANDIDATES=24
     ROUTE_HEALTH_TTL_SEC=300
@@ -71,7 +80,7 @@ reset_runtime_paths() {
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
     PERFORMANCE_PROFILE=balanced
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -361,6 +370,65 @@ test_route_candidate_stats_track_average_and_success_rate() {
     route_candidate_health_summary | grep -Fq 'avg=200ms success=2/3' \
         || fail "route candidate summary does not show average latency and success ratio"
     pass "route candidate stats track rolling average and reliability"
+}
+
+test_xray_stats_use_inbound_counters_only() {
+    reset_runtime_paths
+    local fake_xray="$TMP_ROOT/fake-xray-stats"
+    cat > "$fake_xray" <<'SH'
+#!/usr/bin/env bash
+cat <<'EOF'
+stat: <
+  name: "inbound>>>vless-in>>>traffic>>>downlink"
+  value: 1000
+>
+stat: <
+  name: "inbound>>>vless-ws>>>traffic>>>downlink"
+  value: 500
+>
+stat: <
+  name: "user>>>user@G2rayXCodeLeafy>>>traffic>>>downlink"
+  value: 1500
+>
+stat: <
+  name: "inbound>>>vless-in>>>traffic>>>uplink"
+  value: 200
+>
+stat: <
+  name: "inbound>>>vless-ws>>>traffic>>>uplink"
+  value: 100
+>
+stat: <
+  name: "user>>>user@G2rayXCodeLeafy>>>traffic>>>uplink"
+  value: 300
+>
+EOF
+SH
+    chmod +x "$fake_xray"
+    XRAY_BIN="$fake_xray"
+    xray_running() { return 0; }
+    sudo() { "$@"; }
+
+    save_xray_stats || fail "save_xray_stats failed with mocked stats"
+    local saved_down saved_up usage
+    saved_down=$(grep -oE '"down":[0-9]+' "$SAVED_BYTES_FILE" | grep -oE '[0-9]+' | head -1)
+    saved_up=$(grep -oE '"up":[0-9]+' "$SAVED_BYTES_FILE" | grep -oE '[0-9]+' | head -1)
+    [[ "$saved_down" == "1500" && "$saved_up" == "300" ]] \
+        || fail "stats should count inbound counters once, got down=$saved_down up=$saved_up"
+
+    usage=$(get_data_usage)
+    [[ "$usage" == "1500 300" ]] || fail "data usage should count inbound counters once, got: $usage"
+    pass "traffic accounting uses inbound counters without user double-counting"
+}
+
+test_atomic_write_handles_mktemp_failure() {
+    reset_runtime_paths
+    local missing_parent="$DATA_DIR/missing-parent/value.txt"
+    if _atomic_write "$missing_parent" "content" 2>/dev/null; then
+        fail "_atomic_write reported success when mktemp could not create a temporary file"
+    fi
+    [[ ! -e "$missing_parent" ]] || fail "_atomic_write created target despite temporary-file failure"
+    pass "atomic write handles temporary-file creation failure"
 }
 
 test_route_health_records_source_reason_and_recent_average() {
@@ -1049,6 +1117,34 @@ JSON
     pass "generated links follow configured XHTTP path"
 }
 
+test_xhttp_mode_is_persistent_and_link_consistent() {
+    reset_runtime_paths
+    BASE_DIR="$TMP_ROOT"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    GITHUB_USER="tester"
+    XRAY_PORT=443
+    CODESPACES_EDGE_PORT=443
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    start_xray() { return 0; }
+    wait_for_port() { return 0; }
+    ensure_codespace_port_public() { return 0; }
+    refresh_config_exports() { return 0; }
+    xhttp_probe_metrics() { printf '200 1 ready\n'; }
+
+    set_xhttp_mode "stream-up" >/dev/null || fail "set_xhttp_mode did not accept stream-up"
+    [[ "$(xhttp_mode_value)" == "stream-up" ]] || fail "xhttp mode was not persisted"
+    generate_config >/dev/null || fail "generate_config failed with stream-up mode"
+    grep -Fq '"mode": "stream-up"' "$CONFIG_FILE" || fail "server config did not use persistent XHTTP mode"
+    local link
+    link="$(generate_link_for_address "20.0.0.1" "-ip1")"
+    [[ "$link" == *"mode=stream-up"* ]] || fail "generated link did not match persistent XHTTP mode: $link"
+
+    if set_xhttp_mode "invalid-mode" >/dev/null 2>&1; then
+        fail "set_xhttp_mode accepted an invalid mode"
+    fi
+    pass "XHTTP mode persists and exported links match server config"
+}
+
 test_custom_xhttp_extra_json_is_validated() {
     reset_runtime_paths
     PORT_DOMAIN="behavior-space-443.app.github.dev"
@@ -1285,7 +1381,7 @@ assert data["ok"] is True
 assert data["mocked"] is True
 assert data["budgets_ok"] is True
 names = {case["name"] for case in data["cases"]}
-required = {"config_path_cache", "route_ordering", "export_generation", "doctor_json", "recover_json_contract"}
+required = {"config_path_cache", "route_ordering", "export_generation", "doctor_json", "recover_json_contract", "log_event_cost"}
 missing = required - names
 if missing:
     raise AssertionError(f"missing benchmark cases: {sorted(missing)}")
@@ -1450,7 +1546,11 @@ test_performance_profile_settings_are_available() {
     low_overhead="$(performance_profile_settings low_overhead)"
     grep -Fq 'maxConcurrentUploads=16' <<< "$balanced" || fail "balanced profile missing expected concurrency"
     grep -Fq 'maxConcurrentUploads=24' <<< "$low_latency" || fail "low_latency profile missing higher concurrency"
+    grep -Fq 'connIdle=240' <<< "$low_latency" || fail "low_latency profile should reap idle mobile connections faster"
     grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
+    local mobile; mobile="$(performance_profile_settings unstable_mobile)"
+    grep -Fq 'connIdle=180' <<< "$mobile" || fail "unstable_mobile profile should use shorter connIdle"
+    grep -Fq 'connIdle=300' <<< "$balanced" || fail "balanced profile should use moderate connIdle"
     local max_throughput; max_throughput="$(performance_profile_settings max_throughput)"
     grep -Fq 'name=max_throughput' <<< "$max_throughput" || fail "max_throughput profile is not selectable"
     grep -Fq 'maxConcurrentUploads=32' <<< "$max_throughput" || fail "max_throughput profile does not raise upload concurrency"
@@ -1917,6 +2017,8 @@ test_cached_route_order_uses_recent_weighted_score
 test_cached_route_order_does_not_overweight_tiny_reliability_delta
 test_last_good_route_decays_before_breaking_ties
 test_route_candidate_stats_track_average_and_success_rate
+test_xray_stats_use_inbound_counters_only
+test_atomic_write_handles_mktemp_failure
 test_route_health_records_source_reason_and_recent_average
 test_route_failure_reason_classifier
 test_edge_origin_errors_enter_candidate_cooldown
@@ -1949,6 +2051,7 @@ test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_generated_links_follow_configured_xhttp_path
+test_xhttp_mode_is_persistent_and_link_consistent
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
 test_websocket_fallback_exports_separate_alpn_variants
