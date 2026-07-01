@@ -143,6 +143,74 @@ test_recovery_hot_paths_are_bounded_and_validated() {
     pass 'recovery hot paths are bounded and startup is preflight-validated'
 }
 
+test_latency_focus_keeps_slow_route_export_refresh() {
+    grep_fixed 'latency_focus_enabled' "$SCRIPT" \
+        || fail 'latency focus helper is missing'
+    awk '
+        /if latency_focus_enabled; then/ { in_branch=1; saw_route=0; saw_export=0; next }
+        in_branch && /run_with_deadline "\$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health/ { saw_route=1 }
+        in_branch && /run_with_deadline "\$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports/ { saw_export=1 }
+        in_branch && /continue/ {
+            if (saw_route && saw_export) found=1
+            in_branch=0
+        }
+        END { exit found ? 0 : 1 }
+    ' "$SCRIPT" || fail 'latency focus mode still skips route health/export refresh forever'
+    pass 'latency focus keeps a slow route/export refresh cadence'
+}
+
+test_interactive_route_refreshes_are_bounded() {
+    grep_fixed 'G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC=' "$SCRIPT" \
+        || fail 'interactive route refresh timeout is not configurable'
+    grep_fixed 'route_candidate_refresh_with_feedback()' "$SCRIPT" \
+        || fail 'route candidate manager has no bounded foreground refresh helper'
+    grep_fixed 'run_with_deadline "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health' "$SCRIPT" \
+        || fail 'foreground route refresh is not deadline bounded'
+    if awk '
+        /show_route_candidate_manager\(\)/ { in_fn=1; next }
+        in_fn && /^}/ { in_fn=0 }
+        in_fn && /^[[:space:]]*refresh_route_candidate_health[[:space:]]*>\/dev\/null/ { bad=1 }
+        END { exit bad ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail 'route candidate manager still calls blocking route refresh directly'
+    fi
+    if awk '
+        /show_live_monitor\(\)/ { in_fn=1; next }
+        in_fn && /^}/ { in_fn=0 }
+        in_fn && /^[[:space:]]*refresh_route_candidate_health[[:space:]]*>\/dev\/null/ { bad=1 }
+        END { exit bad ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail 'live monitor still calls blocking route refresh directly'
+    fi
+    pass 'interactive route refreshes are bounded and user-visible'
+}
+
+test_supervisor_handles_resume_and_stale_code() {
+    grep_fixed 'force_public_runtime_ports()' "$SCRIPT" \
+        || fail 'supervisor has no lifecycle public-port reassertion helper'
+    grep_fixed 'force_public_runtime_ports "supervisor_start"' "$SCRIPT" \
+        || fail 'background supervisor does not force public ports on startup/resume'
+    grep_fixed 'supervisor_reexec_if_stale()' "$SCRIPT" \
+        || fail 'background supervisor cannot re-exec when the script changes on disk'
+    grep_fixed 'bash -n "$BASE_DIR/g2ray.sh"' "$SCRIPT" \
+        || fail 'supervisor stale-code re-exec does not syntax-check the on-disk script first'
+    grep_fixed 'supervisor_reexec_if_stale' "$SCRIPT" \
+        || fail 'background loop does not periodically check for stale code'
+    pass 'supervisor reasserts ports on resume and can pick up script updates'
+}
+
+test_stale_temp_sweep_is_present() {
+    grep_fixed 'sweep_stale_temp_files()' "$SCRIPT" \
+        || fail 'script has no stale temp-file sweeper'
+    grep_fixed 'route_probe.??????' "$SCRIPT" \
+        || fail 'stale sweeper does not cover route probe temp files'
+    grep_fixed 'dns-resolve.??????' "$SCRIPT" \
+        || fail 'stale sweeper does not cover DNS temp directories'
+    grep_fixed 'sweep_stale_temp_files' "$SCRIPT" \
+        || fail 'stale temp-file sweeper is never invoked'
+    pass 'stale temp artifacts are swept on startup'
+}
+
 test_port_visibility_failures_are_handled() {
     if grep -Eq '^[[:space:]]*ensure_codespace_port_public[[:space:]]*>/dev/null 2>&1[[:space:]]*$' "$SCRIPT"; then
         fail 'bare ensure_codespace_port_public call can exit under set -e without a user-facing message'
@@ -1127,8 +1195,8 @@ test_route_candidate_manager_and_live_monitor_are_present() {
     awk '
         /if pin_route_candidate "\$ip"; then/ {in_pin=1; next}
         in_pin && /else/ {in_pin=0}
-        in_pin && /refresh_route_candidate_health >\/dev\/null 2>&1 \|\| true/ {saw_refresh=1}
-        in_pin && /refresh_config_exports >\/dev\/null 2>&1 \|\| true/ && saw_refresh {saw_export_after_refresh=1}
+        in_pin && /route_candidate_refresh_with_feedback \|\| true/ {saw_refresh=1}
+        in_pin && /route_candidate_export_with_feedback \|\| true/ && saw_refresh {saw_export_after_refresh=1}
         END {exit !(saw_refresh && saw_export_after_refresh)}
     ' "$SCRIPT" || fail 'pinning a preferred route does not refresh route health before exports'
     grep_fixed 'append_unique_route "$BLACKLISTED_ROUTE_CANDIDATES_FILE" "$ip" || return 1' "$SCRIPT" \
@@ -1892,6 +1960,10 @@ test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
 test_background_tasks_require_config
 test_recovery_hot_paths_are_bounded_and_validated
+test_latency_focus_keeps_slow_route_export_refresh
+test_interactive_route_refreshes_are_bounded
+test_supervisor_handles_resume_and_stale_code
+test_stale_temp_sweep_is_present
 test_port_visibility_failures_are_handled
 test_self_update_is_opt_in
 test_exit_trap_preserves_failures

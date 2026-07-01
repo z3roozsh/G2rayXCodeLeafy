@@ -62,6 +62,11 @@ reset_runtime_paths() {
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     XRAY_PID_FILE="$DATA_DIR/xray.pid"
+    BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
+    BG_TASKS_VERSION_FILE="$DATA_DIR/bg_tasks.version"
+    BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
+    BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
+    BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
     rm -rf "$DATA_DIR" "$LOG_DIR"
     mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
     : > "$LOG_FILE"
@@ -270,6 +275,67 @@ test_port_visibility_cache_is_scoped_by_codespace_and_port() {
     calls=$(wc -l < "$calls_file" | tr -d ' ')
     [[ "$calls" -eq 3 ]] || fail "expected port-public cache to be scoped by codespace and port, got $calls calls"
     pass "port visibility cache is scoped by codespace and port"
+}
+
+test_lifecycle_port_publish_forces_visibility_cache() {
+    (
+        reset_runtime_paths
+        local calls_file="$TMP_ROOT/forced-port-publish.txt"
+        : > "$calls_file"
+        ensure_codespace_port_public() {
+            printf 'main:%s\n' "${1:-}" >> "$calls_file"
+            return 0
+        }
+        ensure_optional_ws_port_public() {
+            printf 'ws:%s\n' "${1:-}" >> "$calls_file"
+            return 0
+        }
+
+        force_public_runtime_ports "behavior_test" >/dev/null \
+            || fail "lifecycle forced public-port publish returned failure"
+        grep -Fxq 'main:force' "$calls_file" \
+            || fail "main XHTTP port was not force-published across lifecycle boundary"
+        grep -Fxq 'ws:force' "$calls_file" \
+            || fail "optional WS port helper was not force-called across lifecycle boundary"
+    )
+    pass "lifecycle port publish bypasses the visibility cache"
+}
+
+test_background_start_reports_lock_failure_without_live_supervisor() {
+    (
+        reset_runtime_paths
+        acquire_bg_tasks_lock() { return 1; }
+        bg_tasks_running() { return 1; }
+        background_supervisor_heartbeat_running() { return 1; }
+        legacy_bg_tasks_running() { return 1; }
+
+        if start_background_tasks; then
+            fail "background startup reported success even though lock was busy and no supervisor was live"
+        fi
+    )
+    pass "background startup reports lock-busy failure when no live supervisor is confirmed"
+}
+
+test_stale_temp_sweep_removes_only_old_owned_artifacts() {
+    reset_runtime_paths
+    local old_probe="$DATA_DIR/route_probe.ABC123"
+    local fresh_probe="$DATA_DIR/route_probe.DEF456"
+    local old_dns="$DATA_DIR/dns-resolve.ABC123"
+    local unrelated="$DATA_DIR/keep.txt"
+    printf 'old\n' > "$old_probe"
+    printf 'fresh\n' > "$fresh_probe"
+    printf 'keep\n' > "$unrelated"
+    mkdir -p "$old_dns"
+    printf 'old dns\n' > "$old_dns/result"
+    touch -d '20 minutes ago' "$old_probe" "$old_dns" 2>/dev/null \
+        || fail "test environment cannot age temp artifacts"
+
+    sweep_stale_temp_files
+    [[ ! -e "$old_probe" ]] || fail "old route probe temp file was not swept"
+    [[ ! -e "$old_dns" ]] || fail "old DNS temp directory was not swept"
+    [[ -e "$fresh_probe" ]] || fail "fresh route probe temp file was swept"
+    [[ -e "$unrelated" ]] || fail "unrelated file was swept"
+    pass "stale temp sweep removes only old owned artifacts"
 }
 
 test_cached_route_order_uses_reliability_then_average_latency() {
@@ -2012,6 +2078,9 @@ test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
 test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_port_visibility_cache_is_scoped_by_codespace_and_port
+test_lifecycle_port_publish_forces_visibility_cache
+test_background_start_reports_lock_failure_without_live_supervisor
+test_stale_temp_sweep_removes_only_old_owned_artifacts
 test_cached_route_order_uses_reliability_then_average_latency
 test_cached_route_order_uses_recent_weighted_score
 test_cached_route_order_does_not_overweight_tiny_reliability_delta

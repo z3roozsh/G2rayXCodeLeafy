@@ -145,6 +145,11 @@ G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC="${G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC:-20}"
 G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC="${G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC:-45}"
 G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC="${G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC:-45}"
 G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC="${G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC:-10}"
+G2RAY_SUPERVISOR_VERSION_CHECK_TICKS="${G2RAY_SUPERVISOR_VERSION_CHECK_TICKS:-15}"
+G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS="${G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS:-15}"
+G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS="${G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS:-15}"
+G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC="${G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC:-45}"
+G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC="${G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC:-45}"
 # Profile resolution order: env var override, then the persisted preference
 # file (set via `g2ray.sh profile <name>`), then the balanced default. The file
 # makes the choice survive Codespace restarts and panels launched without the
@@ -172,6 +177,11 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
 [[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=6
 (( ROUTE_PROBE_CONCURRENCY > 16 )) && ROUTE_PROBE_CONCURRENCY=16
+[[ "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" =~ ^[0-9]+$ && "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" -ge 1 ]] || G2RAY_SUPERVISOR_VERSION_CHECK_TICKS=15
+[[ "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" -ge 1 ]] || G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS=15
+[[ "$G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS" -ge 1 ]] || G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS=15
+[[ "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" =~ ^[0-9]+$ && "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" -ge 1 ]] || G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC=45
+[[ "$G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC" =~ ^[0-9]+$ && "$G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC" -ge 1 ]] || G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC=45
 
 umask 077
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
@@ -521,6 +531,18 @@ log_event() {
     rotate_log_file_throttled "$LOG_FILE" "$LOG_ROTATE_STAMP_FILE"
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
     log_structured_event "$ts" "$level" "$msg"
+}
+
+sweep_stale_temp_files() {
+    [[ -d "$DATA_DIR" ]] || return 0
+    find "$DATA_DIR" -maxdepth 1 \
+        \( -name 'route_probe.??????' \
+           -o -name 'route_health.??????' \
+           -o -name 'route_cooldown.??????' \
+           -o -name 'route_stats.??????' \
+           -o -name 'dns-resolve.??????' \
+           -o -name 'support-bundle.??????' \) \
+        -mmin +10 -exec rm -rf -- {} + 2>/dev/null || true
 }
 
 write_boot_status() {
@@ -1939,6 +1961,21 @@ ensure_optional_ws_port_public() {
     ensure_codespace_port_public_for_port "$WS_PORT" "${1:-}"
 }
 
+force_public_runtime_ports() {
+    local reason="${1:-lifecycle}" failed=0
+    if ensure_codespace_port_public force >/dev/null 2>&1; then
+        log_event INFO "port_public lifecycle_forced reason=${reason} port=${XRAY_PORT}"
+    else
+        failed=1
+        log_event WARN "port_public lifecycle_force_failed reason=${reason} port=${XRAY_PORT}"
+    fi
+    if ! ensure_optional_ws_port_public force >/dev/null 2>&1; then
+        failed=1
+        log_event WARN "port_public lifecycle_force_failed reason=${reason} port=${WS_PORT}"
+    fi
+    return "$failed"
+}
+
 repair_codespace_port_route() {
     command -v gh >/dev/null 2>&1 || return 1
     log_event WARN "route_repair begin port=${XRAY_PORT} domain=${PORT_DOMAIN}"
@@ -2429,9 +2466,10 @@ self_heal_once() {
 
 _background_tasks() {
     set +e
-    local tick=0 health_tick=0 export_tick=0 route_tick=0
+    local tick=0 health_tick=0 export_tick=0 route_tick=0 version_tick=0
     write_background_supervisor_heartbeat
     if [[ -f "$CONFIG_FILE" ]]; then
+        force_public_runtime_ports "supervisor_start" >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         if ! latency_focus_enabled; then
             run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
@@ -2445,6 +2483,7 @@ _background_tasks() {
             log_event WARN "background supervisor_superseded pid=$$"
             exit 0
         fi
+        (( ++version_tick >= G2RAY_SUPERVISOR_VERSION_CHECK_TICKS )) && { version_tick=0; supervisor_reexec_if_stale || true; }
         write_background_supervisor_heartbeat
         rotate_log_file "$LOG_FILE"
         rotate_log_file "$LOG_DIR/xray-error.log"
@@ -2461,6 +2500,8 @@ _background_tasks() {
         save_session_uptime >/dev/null 2>&1 || true
         if latency_focus_enabled; then
             (( ++health_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
+            (( ++route_tick >= G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+            (( ++export_tick >= G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
             continue
         fi
         (( ++health_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
@@ -2511,7 +2552,12 @@ release_bg_tasks_lock() {
 start_background_tasks() {
     local token bg_pid
     if ! acquire_bg_tasks_lock; then
-        return 0
+        bg_pid=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+        if bg_tasks_running "$bg_pid" || background_supervisor_heartbeat_running "$bg_pid"; then
+            return 0
+        fi
+        log_event WARN "background supervisor_start_failed reason=lock_busy no_live_supervisor"
+        return 1
     fi
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
@@ -2553,6 +2599,17 @@ background_supervisor_version_matches() {
     expected=$(cat "$BG_TASKS_VERSION_FILE" 2>/dev/null || true)
     current=$(background_supervisor_version)
     [[ -n "$expected" && -n "$current" && "$expected" == "$current" ]]
+}
+
+supervisor_reexec_if_stale() {
+    background_supervisor_version_matches && return 0
+    if ! bash -n "$BASE_DIR/g2ray.sh" >/dev/null 2>&1; then
+        log_event ERROR "background supervisor_stale_code syntax_failed action=stay"
+        return 1
+    fi
+    background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
+    log_event WARN "background supervisor_stale_code action=reexec"
+    exec bash "$BASE_DIR/g2ray.sh" --background-supervisor
 }
 
 stop_background_tasks() {
@@ -3427,7 +3484,7 @@ refresh_route_candidate_health() {
             wait "${pids[$idx]}" 2>/dev/null || true
             f="${files[$idx]}"
             [[ -s "$f" ]] || { rm -f "$f"; continue; }
-            row=$(cat "$f" 2>/dev/null || true)
+            IFS= read -r row < "$f" 2>/dev/null || row=""
             rm -f "$f" 2>/dev/null || true
             IFS=$'\t' read -r _ip _source _code _ms _reason <<< "$row"
             valid_ipv4 "$_ip" || continue
@@ -3586,6 +3643,24 @@ route_candidate_health_summary() {
         done
 }
 
+route_candidate_refresh_with_feedback() {
+    echo -e "  ${DIM}Refreshing route probes (up to ${G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC}s)...${NC}"
+    if run_with_deadline "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1; then
+        return 0
+    fi
+    echo -e "  ${YELLOW}Route probe refresh timed out; keeping last-known route data.${NC}"
+    return 1
+}
+
+route_candidate_export_with_feedback() {
+    echo -e "  ${DIM}Refreshing local exports (up to ${G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC}s)...${NC}"
+    if run_with_deadline "$G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1; then
+        return 0
+    fi
+    echo -e "  ${YELLOW}Export refresh timed out or found no usable configs.${NC}"
+    return 1
+}
+
 show_route_candidate_manager() {
     local choice ip
     while true; do
@@ -3611,15 +3686,15 @@ show_route_candidate_manager() {
         read -r choice || return 0
         case "$choice" in
             1)
-                refresh_route_candidate_health >/dev/null 2>&1 || true
+                route_candidate_refresh_with_feedback || true
                 echo -e "  ${GREEN}Route probes refreshed.${NC}"; sleep 1
                 ;;
             2)
                 echo -ne "  ${GREEN}Manual IPv4:${NC} "
                 read -r ip || continue
                 if add_manual_route_candidate "$ip"; then
-                    refresh_route_candidate_health >/dev/null 2>&1 || true
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_refresh_with_feedback || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${GREEN}Added.${NC}"
                 else
                     echo -e "  ${RED}Invalid, duplicate, or blacklisted IPv4.${NC}"
@@ -3630,8 +3705,8 @@ show_route_candidate_manager() {
                 echo -ne "  ${GREEN}IPv4 to pin:${NC} "
                 read -r ip || continue
                 if pin_route_candidate "$ip"; then
-                    refresh_route_candidate_health >/dev/null 2>&1 || true
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_refresh_with_feedback || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${GREEN}Pinned preferred route.${NC}"
                 else
                     echo -e "  ${RED}Invalid or blacklisted IPv4.${NC}"
@@ -3642,7 +3717,7 @@ show_route_candidate_manager() {
                 echo -ne "  ${YELLOW}IPv4 to blacklist:${NC} "
                 read -r ip || continue
                 if blacklist_route_candidate "$ip"; then
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${YELLOW}Blacklisted.${NC}"
                 else
                     echo -e "  ${RED}Invalid IPv4.${NC}"
@@ -3653,7 +3728,7 @@ show_route_candidate_manager() {
                 echo -ne "  ${GREEN}Manual IPv4 to remove:${NC} "
                 read -r ip || continue
                 if remove_manual_route_candidate "$ip"; then
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${GREEN}Removed.${NC}"
                 else
                     echo -e "  ${RED}Invalid IPv4.${NC}"
@@ -3664,8 +3739,8 @@ show_route_candidate_manager() {
                 echo -ne "  ${GREEN}IPv4 to unblacklist:${NC} "
                 read -r ip || continue
                 if unblacklist_route_candidate "$ip"; then
-                    refresh_route_candidate_health >/dev/null 2>&1 || true
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_refresh_with_feedback || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${GREEN}Unblacklisted.${NC}"
                 else
                     echo -e "  ${RED}Invalid IPv4 or route is not blacklisted.${NC}"
@@ -3677,7 +3752,7 @@ show_route_candidate_manager() {
                 read -r ip || continue
                 if [[ "$ip" =~ ^[Yy]$ ]]; then
                     reset_route_candidate_cache
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${GREEN}Route health cache reset. Manual, pinned, and blacklisted routes were kept.${NC}"
                     sleep 1
                 fi
@@ -3687,14 +3762,14 @@ show_route_candidate_manager() {
                 read -r ip || continue
                 if [[ "$ip" =~ ^[Yy]$ ]]; then
                     reset_route_candidate_state
-                    refresh_config_exports >/dev/null 2>&1 || true
+                    route_candidate_export_with_feedback || true
                     echo -e "  ${GREEN}All route preferences and cached measurements reset.${NC}"
                     sleep 1
                 fi
                 ;;
             9)
-                refresh_route_candidate_health >/dev/null 2>&1 || true
-                refresh_config_exports >/dev/null 2>&1 || true
+                route_candidate_refresh_with_feedback || true
+                route_candidate_export_with_feedback || true
                 echo -e "  ${GREEN}Routes and exports refreshed.${NC}"; sleep 1
                 ;;
             0) return 0 ;;
@@ -3707,7 +3782,7 @@ show_live_monitor() {
     local choice tick=1 local_code local_ms edge_code edge_ms engine listener
     while true; do
         if [[ -f "$CONFIG_FILE" && $((tick % 6)) -eq 0 ]]; then
-            refresh_route_candidate_health >/dev/null 2>&1 || true
+            run_with_deadline "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
         fi
         read -r local_code local_ms _probe_reason < <(xhttp_probe_metrics local)
         read -r edge_code edge_ms _probe_reason < <(xhttp_probe_metrics external)
@@ -4946,6 +5021,8 @@ bench_json() {
 if [[ "${G2RAY_SOURCE_ONLY:-}" == "1" ]]; then
     return 0 2>/dev/null || exit 0
 fi
+
+sweep_stale_temp_files
 
 if [[ "${1:-}" == "--doctor-json" || "${1:-}" == "--status-json" || ( "${1:-}" == "doctor" && "${2:-}" == "--json" ) ]]; then
     print_doctor_json
