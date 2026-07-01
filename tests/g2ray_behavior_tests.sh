@@ -1176,6 +1176,32 @@ test_generate_config_keeps_previous_config_when_candidate_validation_fails() {
     pass "generate_config keeps previous config when candidate validation fails"
 }
 
+test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        uuidgen() { printf '44444444-5555-4666-8777-888888888888\n'; }
+        local candidate_seen="$TMP_ROOT/candidate-path.txt"
+        xray_validate_config_file() {
+            printf '%s\n' "$1" > "$candidate_seen"
+            return 1
+        }
+        start_xray() { fail "generate_config should not start after candidate validation failure"; }
+        refresh_config_exports() { fail "generate_config should not export after candidate validation failure"; }
+
+        if generate_config >/dev/null 2>&1; then
+            fail "generate_config succeeded despite forced candidate validation failure"
+        fi
+        local candidate
+        candidate=$(cat "$candidate_seen" 2>/dev/null || true)
+        [[ "$candidate" == *.json ]] || fail "candidate config path does not keep .json suffix for Xray format detection: $candidate"
+    )
+    pass "generate_config candidate file keeps .json suffix for Xray format detection"
+}
+
 test_generate_config_rolls_back_when_valid_candidate_cannot_start() {
     reset_runtime_paths
     (
@@ -2326,6 +2352,7 @@ test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
 test_generate_config_replaces_stale_no_config_boot_status
 test_generate_config_keeps_previous_config_when_candidate_validation_fails
+test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection
 test_generate_config_rolls_back_when_valid_candidate_cannot_start
 test_config_exports_write_local_only_metadata
 test_config_exports_are_stable_client_artifacts

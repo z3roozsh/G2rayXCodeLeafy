@@ -3043,7 +3043,7 @@ generate_config() {
         had_old_uuid=true
     fi
     if [[ -s "$CONFIG_FILE" ]]; then
-        previous_config=$(mktemp "${CONFIG_FILE}.previous.XXXXXX") || return 1
+        previous_config=$(mktemp "${CONFIG_FILE}.previous.XXXXXX.json") || return 1
         cp "$CONFIG_FILE" "$previous_config" || {
             rm -f "$previous_config" 2>/dev/null || true
             return 1
@@ -3110,7 +3110,7 @@ JSONEOF
     fi
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
     log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} xhttp_mode=${xhttp_mode} tcp_fast_open=${tfo_state}"
-    candidate_config=$(mktemp "${CONFIG_FILE}.candidate.XXXXXX") || {
+    candidate_config=$(mktemp "${CONFIG_FILE}.candidate.XXXXXX.json") || {
         rm -f "$previous_config" 2>/dev/null || true
         return 1
     }
@@ -3234,6 +3234,33 @@ JSONEOF
     else
         write_boot_status "needs_attention" "generate_config" "Config generated, but the external route is not usable yet." "${_boot_code:-0}" "${_boot_ms:-0}"
     fi
+}
+
+generate_config_with_feedback() {
+    if generate_config; then
+        return 0
+    fi
+    local rc=$?
+    log_event ERROR "generate_config interactive_failed rc=${rc}"
+    echo -e "  ${RED}Config generation failed. Previous config was kept if one existed.${NC}"
+    echo -e "  ${DIM}Use option 13) View Engine Logs or 14) Diagnostics for details.${NC}"
+    return "$rc"
+}
+
+generate_config_preserving_uuid_with_feedback() {
+    local prev_preserve_set="${G2RAY_PRESERVE_UUID+x}" prev_preserve="${G2RAY_PRESERVE_UUID:-}" status
+    G2RAY_PRESERVE_UUID=1
+    if generate_config_with_feedback; then
+        status=0
+    else
+        status=$?
+    fi
+    if [[ "$prev_preserve_set" == "x" ]]; then
+        G2RAY_PRESERVE_UUID="$prev_preserve"
+    else
+        unset G2RAY_PRESERVE_UUID
+    fi
+    return "$status"
 }
 
 url_encode_query_value() {
@@ -4070,14 +4097,11 @@ show_ws_front_manager() {
                 ;;
             4)
                 if [[ -f "$CONFIG_FILE" ]]; then
-                    prev_preserve="${G2RAY_PRESERVE_UUID+x}:${G2RAY_PRESERVE_UUID:-}"
-                    G2RAY_PRESERVE_UUID=1
-                    generate_config
-                    case "$prev_preserve" in
-                        x:*) G2RAY_PRESERVE_UUID="${prev_preserve#x:}" ;;
-                        *) unset G2RAY_PRESERVE_UUID ;;
-                    esac
-                    echo -e "  ${GREEN}Config regenerated with existing UUID.${NC}"
+                    if generate_config_preserving_uuid_with_feedback; then
+                        echo -e "  ${GREEN}Config regenerated with existing UUID.${NC}"
+                    else
+                        echo -e "  ${YELLOW}Config was not regenerated; previous config remains in place.${NC}"
+                    fi
                 else
                     echo -e "  ${YELLOW}No config exists yet. Use option 2 from the main panel first.${NC}"
                 fi
@@ -5425,12 +5449,16 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     echo -ne "  ${RED}╰─❯${NC} "
     read -r setup
     if [[ "$setup" == "1" ]]; then
-        generate_config
-        echo -e "\n  ${GREEN}✔ Setup complete!${NC}"
-        sleep 1
-        maybe_prompt_waker_setup
-        show_recovery_command_card
-        show_diagnostics
+        if generate_config_with_feedback; then
+            echo -e "\n  ${GREEN}✔ Setup complete!${NC}"
+            sleep 1
+            maybe_prompt_waker_setup
+            show_recovery_command_card
+            show_diagnostics
+        else
+            echo -e "\n  ${YELLOW}Setup did not complete. Check logs or diagnostics, then try option 2.${NC}"
+            sleep 2
+        fi
     else
         exit 0
     fi
@@ -5591,7 +5619,13 @@ while true; do
             echo -e "\n  ${YELLOW}⚠ Overwrite current config and restart engine?${NC}"
             echo -ne "  ${GREEN}╰─❯${NC} Proceed (y/n): "
             read -r _confirm
-            [[ "$_confirm" =~ ^[Yy]$ ]] && { generate_config; sleep 1; }
+            if [[ "$_confirm" =~ ^[Yy]$ ]]; then
+                if generate_config_with_feedback; then
+                    sleep 1
+                else
+                    sleep 2
+                fi
+            fi
             ;;
         3)
             if xray_running; then
@@ -5718,13 +5752,7 @@ while true; do
             fi
             if [[ -f "$CONFIG_FILE" ]]; then
                 echo -e "  ${DIM}Applying transport change with the same UUID...${NC}"
-                _PREV_G2RAY_PRESERVE_UUID="${G2RAY_PRESERVE_UUID+x}:${G2RAY_PRESERVE_UUID:-}"
-                G2RAY_PRESERVE_UUID=1
-                generate_config
-                case "$_PREV_G2RAY_PRESERVE_UUID" in
-                    x:*) G2RAY_PRESERVE_UUID="${_PREV_G2RAY_PRESERVE_UUID#x:}" ;;
-                    *) unset G2RAY_PRESERVE_UUID ;;
-                esac
+                generate_config_preserving_uuid_with_feedback || true
             else
                 echo -e "  ${DIM}No config exists yet. Use option 2 to generate one with this setting.${NC}"
             fi

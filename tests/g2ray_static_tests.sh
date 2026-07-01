@@ -1371,6 +1371,31 @@ test_route_export_and_reconnect_edges_are_hardened() {
     pass 'route export and reconnect edges are hardened'
 }
 
+test_interactive_config_generation_failures_are_guarded() {
+    grep_fixed 'generate_config_with_feedback()' "$SCRIPT" \
+        || fail 'panel has no guarded interactive config-generation helper'
+    grep_fixed 'generate_config_preserving_uuid_with_feedback()' "$SCRIPT" \
+        || fail 'panel has no guarded same-UUID config regeneration helper'
+    grep_fixed 'candidate_config=$(mktemp "${CONFIG_FILE}.candidate.XXXXXX.json")' "$SCRIPT" \
+        || fail 'candidate config temp file does not keep a .json suffix for Xray format detection'
+    awk '
+        /Overwrite current config and restart engine/ { in_option=1; next }
+        in_option && /^[[:space:]]*;;/ { exit }
+        in_option && /generate_config_with_feedback/ { found=1 }
+        END { exit found ? 0 : 1 }
+    ' "$SCRIPT" \
+        || fail 'main menu option 2 can still exit the panel when config generation fails'
+    if awk '
+        /Overwrite current config and restart engine/ { in_option=1; next }
+        in_option && /^[[:space:]]*;;/ { exit }
+        in_option && /generate_config; sleep/ { bad=1 }
+        END { exit bad ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail 'main menu option 2 still calls generate_config directly under set -e'
+    fi
+    pass 'interactive config-generation failures are guarded'
+}
+
 test_panel_guides_cloudflare_waker_setup() {
     grep_fixed 'WAKER_METADATA_FILE=' "$SCRIPT" \
         || fail 'panel does not persist non-sensitive waker metadata'
@@ -2032,6 +2057,7 @@ test_route_candidate_manager_and_live_monitor_are_present
 test_first_run_recovery_card_is_present
 test_soft_recovery_and_route_memory_are_present
 test_route_export_and_reconnect_edges_are_hardened
+test_interactive_config_generation_failures_are_guarded
 test_panel_guides_cloudflare_waker_setup
 test_diagnostics_show_external_waker_state
 test_docs_cover_panel_waker_setup
