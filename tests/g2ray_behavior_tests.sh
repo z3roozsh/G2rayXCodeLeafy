@@ -61,6 +61,9 @@ reset_runtime_paths() {
     STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
     LOG_CODE_VERSION_FILE="$DATA_DIR/log_code_version"
+    EXPORT_INPUT_HASH_FILE="$DATA_DIR/export_input.hash"
+    ACTIVE_TRAFFIC_STAMP_FILE="$DATA_DIR/active_traffic_last"
+    ROUTE_REPAIR_STAMP_FILE="$DATA_DIR/route_repair_last"
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     XRAY_PID_FILE="$DATA_DIR/xray.pid"
     BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
@@ -86,7 +89,7 @@ reset_runtime_paths() {
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
     PERFORMANCE_PROFILE=balanced
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED G2RAY_PORT_FORWARDING_DOMAIN GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -161,6 +164,21 @@ test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated() {
             || fail "headless detection used '$detected' instead of local waker metadata"
     )
     pass "codespace detection uses local metadata when gh is unauthenticated"
+}
+
+test_port_domains_use_codespaces_forwarding_domain_env() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME="custom-domain-space"
+        GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN="ports.example.test"
+        refresh_port_domains
+
+        [[ "$PORT_DOMAIN" == "custom-domain-space-443.ports.example.test" ]] \
+            || fail "PORT_DOMAIN ignored GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN: $PORT_DOMAIN"
+        [[ "$WS_PORT_DOMAIN" == "custom-domain-space-8443.ports.example.test" ]] \
+            || fail "WS_PORT_DOMAIN ignored GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN: $WS_PORT_DOMAIN"
+    )
+    pass "port domains use Codespaces forwarding-domain environment"
 }
 
 test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated() {
@@ -527,6 +545,33 @@ SH
     usage=$(get_data_usage)
     [[ "$usage" == "1500 300" ]] || fail "data usage should count inbound counters once, got: $usage"
     pass "traffic accounting uses inbound counters without user double-counting"
+}
+
+test_save_xray_stats_marks_active_traffic_when_counters_increase() {
+    reset_runtime_paths
+    xray_running() { return 0; }
+    sudo() {
+        cat <<'JSON'
+{
+  "stat": [
+    {
+      "name": "inbound>>>vless-in>>>traffic>>>downlink",
+      "value": 1200
+    },
+    {
+      "name": "inbound>>>vless-in>>>traffic>>>uplink",
+      "value": 300
+    }
+  ]
+}
+JSON
+    }
+
+    save_xray_stats >/dev/null || fail "save_xray_stats failed"
+    [[ -s "$ACTIVE_TRAFFIC_STAMP_FILE" ]] || fail "active traffic stamp was not written"
+    active_tunnel_recent || fail "active_tunnel_recent did not recognize fresh traffic"
+    unset -f sudo xray_running
+    pass "active traffic is marked when Xray counters increase"
 }
 
 test_atomic_write_handles_mktemp_failure() {
@@ -1097,6 +1142,7 @@ test_generate_config_replaces_stale_no_config_boot_status() {
         wait_for_port() { return 0; }
         ensure_codespace_port_public() { return 0; }
         refresh_config_exports() { return 0; }
+        xray_validate_config_file() { return 0; }
         xhttp_probe_metrics() { printf '200 12 ready\n'; }
         generate_config >/dev/null
         python -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "generated boot status is not valid JSON"
@@ -1105,6 +1151,53 @@ test_generate_config_replaces_stale_no_config_boot_status() {
         ! boot_status_summary | grep -Fq 'no_config' || fail "diagnostics would still show stale no_config boot status"
     )
     pass "generate_config replaces stale no-config boot status"
+}
+
+test_generate_config_keeps_previous_config_when_candidate_validation_fails() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        printf 'old-uuid\n' > "$UUID_FILE"
+        printf '{"old":true}\n' > "$CONFIG_FILE"
+        uuidgen() { printf '22222222-3333-4444-8555-666666666666\n'; }
+        xray_validate_config_file() { return 1; }
+        start_xray() { fail "generate_config should not start Xray after invalid candidate"; }
+        refresh_config_exports() { fail "generate_config should not refresh exports after invalid candidate"; }
+
+        if generate_config >/dev/null 2>&1; then
+            fail "generate_config succeeded despite invalid candidate config"
+        fi
+        grep -Fq '"old":true' "$CONFIG_FILE" || fail "invalid candidate replaced previous config"
+        grep -Fxq 'old-uuid' "$UUID_FILE" || fail "invalid candidate replaced previous UUID"
+    )
+    pass "generate_config keeps previous config when candidate validation fails"
+}
+
+test_generate_config_rolls_back_when_valid_candidate_cannot_start() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        printf 'old-uuid\n' > "$UUID_FILE"
+        printf '{"old":true}\n' > "$CONFIG_FILE"
+        uuidgen() { printf '33333333-4444-4555-8666-777777777777\n'; }
+        xray_validate_config_file() { return 0; }
+        start_xray() { return 1; }
+        wait_for_port() { return 1; }
+        refresh_config_exports() { fail "generate_config should not refresh exports after failed start"; }
+
+        if generate_config >/dev/null 2>&1; then
+            fail "generate_config succeeded despite failed engine start"
+        fi
+        grep -Fq '"old":true' "$CONFIG_FILE" || fail "failed start did not restore previous config"
+        grep -Fxq 'old-uuid' "$UUID_FILE" || fail "failed start did not restore previous UUID"
+    )
+    pass "generate_config rolls back when a valid candidate cannot start"
 }
 
 test_config_exports_write_local_only_metadata() {
@@ -1189,6 +1282,57 @@ test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available() {
     pass "disabled domain export clears stale config artifacts when no IP fallback is available"
 }
 
+test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports() {
+    reset_runtime_paths
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf 'enabled\n' > "$WS_FALLBACK_FILE"
+    local calls_file="$TMP_ROOT/usable-fallback-calls.txt"
+    : > "$calls_file"
+    usable_fallback_ips() {
+        printf 'call\n' >> "$calls_file"
+        printf '20.0.0.1\n20.0.0.2\n'
+    }
+
+    local links calls
+    links="$(generate_ordered_links)"
+    calls=$(wc -l < "$calls_file" | tr -d ' ')
+    [[ "$calls" -eq 1 ]] || fail "usable_fallback_ips was called $calls times for one ordered export"
+    [[ "$links" == *"@20.0.0.1:443"* && "$links" == *"-ws-ip1"* ]] \
+        || fail "ordered links did not include both XHTTP and WS fallback links from the shared list"
+    pass "ordered exports reuse one fallback route list for XHTTP and WS"
+}
+
+test_refresh_config_exports_if_changed_skips_unchanged_inputs() {
+    reset_runtime_paths
+    BASE_DIR="$TMP_ROOT"
+    MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
+    SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
+    CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    printf '2026-01-01T00:00:00Z\t20.0.0.1\t200\t10\ttrue\tcache\tready\n' > "$ROUTE_HEALTH_FILE"
+    local calls_file="$TMP_ROOT/export-calls.txt"
+    : > "$calls_file"
+    generate_ordered_links() {
+        printf 'call\n' >> "$calls_file"
+        printf 'vless://example@20.0.0.1:443?encryption=none#one\n'
+    }
+
+    refresh_config_exports_if_changed >/dev/null || fail "first export refresh failed"
+    refresh_config_exports_if_changed >/dev/null || fail "unchanged export refresh failed"
+    local calls
+    calls=$(wc -l < "$calls_file" | tr -d ' ')
+    [[ "$calls" -eq 1 ]] || fail "unchanged export inputs regenerated links $calls times"
+    grep -Fq 'config_exports unchanged' "$LOG_FILE" || fail "unchanged export refresh was not logged"
+    pass "unchanged export inputs skip regeneration"
+}
+
 test_generated_links_follow_configured_xhttp_path() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -1237,6 +1381,7 @@ test_xhttp_mode_is_persistent_and_link_consistent() {
     wait_for_port() { return 0; }
     ensure_codespace_port_public() { return 0; }
     refresh_config_exports() { return 0; }
+    xray_validate_config_file() { return 0; }
     xhttp_probe_metrics() { printf '200 1 ready\n'; }
 
     set_xhttp_mode "stream-up" >/dev/null || fail "set_xhttp_mode did not accept stream-up"
@@ -1429,6 +1574,7 @@ test_websocket_fallback_adds_config_and_public_port() {
         start_xray() { return 0; }
         wait_for_port() { return 0; }
         refresh_config_exports() { return 0; }
+        xray_validate_config_file() { return 0; }
         xhttp_probe_metrics() { printf '200 12 ready\n'; }
         local ports_file="$TMP_ROOT/ws-public-ports.txt"
         : > "$ports_file"
@@ -1778,6 +1924,24 @@ test_recover_now_success_clears_nonfatal_port_public_failure() {
     pass "recover now returns success when route recovers despite nonfatal port-public failure"
 }
 
+test_route_repair_attempts_are_cooldown_limited() {
+    reset_runtime_paths
+    ROUTE_REPAIR_COOLDOWN_SEC=300
+    local calls_file="$TMP_ROOT/route-repair-calls.txt"
+    : > "$calls_file"
+    route_repair_cooldown_active && fail "route repair cooldown should be inactive before first attempt"
+    mark_route_repair_attempt
+    route_repair_cooldown_active || fail "route repair cooldown should be active immediately after marking"
+    if mark_route_repair_attempt_if_allowed; then
+        fail "mark_route_repair_attempt_if_allowed allowed a second repair during cooldown"
+    fi
+    printf 'blocked\n' >> "$calls_file"
+    # Simulate a stale mark and verify another attempt can be recorded.
+    printf '%s\n' "$(( $(date +%s) - 600 ))" > "$ROUTE_REPAIR_STAMP_FILE"
+    mark_route_repair_attempt_if_allowed || fail "route repair mark failed after cooldown expired"
+    pass "route repair attempts are cooldown limited"
+}
+
 test_recover_now_stops_after_engine_start_failure() {
     (
         reset_runtime_paths
@@ -2117,6 +2281,7 @@ test_support_bundle_marks_unreadable_optional_logs() {
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
+test_port_domains_use_codespaces_forwarding_domain_env
 test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated
 test_runtime_lock_serializes_operations_and_allows_reentry
 test_stop_xray_succeeds_when_engine_is_already_stopped
@@ -2131,6 +2296,7 @@ test_cached_route_order_does_not_overweight_tiny_reliability_delta
 test_last_good_route_decays_before_breaking_ties
 test_route_candidate_stats_track_average_and_success_rate
 test_xray_stats_use_inbound_counters_only
+test_save_xray_stats_marks_active_traffic_when_counters_increase
 test_atomic_write_handles_mktemp_failure
 test_route_health_records_source_reason_and_recent_average
 test_route_failure_reason_classifier
@@ -2159,10 +2325,14 @@ test_usable_fallback_ips_caps_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
 test_generate_config_replaces_stale_no_config_boot_status
+test_generate_config_keeps_previous_config_when_candidate_validation_fails
+test_generate_config_rolls_back_when_valid_candidate_cannot_start
 test_config_exports_write_local_only_metadata
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
+test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports
+test_refresh_config_exports_if_changed_skips_unchanged_inputs
 test_generated_links_follow_configured_xhttp_path
 test_xhttp_mode_is_persistent_and_link_consistent
 test_custom_xhttp_extra_json_is_validated
@@ -2186,6 +2356,7 @@ test_doctor_json_sanitizes_invalid_port
 test_route_wait_requires_stable_usable_probes
 test_route_wait_rejects_transient_single_success
 test_recover_now_success_clears_nonfatal_port_public_failure
+test_route_repair_attempts_are_cooldown_limited
 test_recover_now_stops_after_engine_start_failure
 test_recover_now_json_reports_ready_contract
 test_recover_now_json_reports_settling_contract

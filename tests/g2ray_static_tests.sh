@@ -84,8 +84,12 @@ test_background_tasks_uses_owned_pid_file() {
         || fail 'background supervisor does not persist an ownership token'
     grep_fixed 'G2RAY_BG_TASK_TOKEN=' "$SCRIPT" \
         || fail 'background supervisor process is not tagged with an ownership token'
-    grep_fixed 'G2RAY_BG_TASK_TOKEN="$token" nohup bash "$BASE_DIR/g2ray.sh" --background-supervisor' "$SCRIPT" \
-        || fail 'background supervisor is not launched as a detached script mode with its ownership token'
+    grep_fixed 'SCRIPT_PATH=' "$SCRIPT" \
+        || fail 'script does not track its actual running path'
+    grep_fixed 'G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor' "$SCRIPT" \
+        || fail 'background supervisor is not launched from the actual running script path'
+    grep_fixed 'exec bash "$SCRIPT_PATH" --background-supervisor' "$SCRIPT" \
+        || fail 'stale supervisor reexec does not use the actual running script path'
     grep_fixed 'if [[ "${1:-}" == "--background-supervisor" ]]; then' "$SCRIPT" \
         || fail 'script has no dedicated background supervisor entrypoint'
     if grep_fixed '_background_tasks </dev/null >/dev/null 2>&1 &' "$SCRIPT"; then
@@ -101,6 +105,30 @@ test_background_tasks_uses_owned_pid_file() {
         fail 'background supervisor ownership still matches any process whose args contain g2ray.sh'
     fi
     pass 'background supervisor validates PID ownership'
+}
+
+test_control_plane_optimizations_are_present() {
+    grep_fixed 'PORT_FORWARDING_DOMAIN=' "$SCRIPT" \
+        || fail 'script does not honor the Codespaces port-forwarding domain suffix'
+    grep_fixed 'GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN' "$SCRIPT" \
+        || fail 'script does not read GitHub Codespaces forwarding-domain environment'
+    grep_fixed 'LOCAL_PROBE_TIMEOUT_SEC=' "$SCRIPT" \
+        || fail 'local XHTTP probe timeout is not separately configurable'
+    grep_fixed 'EXTERNAL_PROBE_TIMEOUT_SEC=' "$SCRIPT" \
+        || fail 'external XHTTP probe timeout is not separately configurable'
+    grep_fixed 'refresh_config_exports_if_changed()' "$SCRIPT" \
+        || fail 'background exports are not cache-gated by unchanged inputs'
+    grep_fixed 'run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed' "$SCRIPT" \
+        || fail 'background supervisor still regenerates exports without an unchanged-input guard'
+    grep_fixed 'active_tunnel_recent()' "$SCRIPT" \
+        || fail 'script has no active-traffic detector for suppressing heavy background work'
+    grep_fixed 'if active_tunnel_recent; then' "$SCRIPT" \
+        || fail 'background supervisor does not suppress heavy work during active traffic'
+    grep_fixed 'ROUTE_REPAIR_COOLDOWN_SEC=' "$SCRIPT" \
+        || fail 'route repair attempts do not have a cooldown'
+    grep_fixed 'mark_route_repair_attempt_if_allowed' "$SCRIPT" \
+        || fail 'route repair path does not mark/skip attempts through a cooldown helper'
+    pass 'control-plane optimizations are present'
 }
 
 test_background_tasks_require_config() {
@@ -192,7 +220,7 @@ test_supervisor_handles_resume_and_stale_code() {
         || fail 'background supervisor does not force public ports on startup/resume'
     grep_fixed 'supervisor_reexec_if_stale()' "$SCRIPT" \
         || fail 'background supervisor cannot re-exec when the script changes on disk'
-    grep_fixed 'bash -n "$BASE_DIR/g2ray.sh"' "$SCRIPT" \
+    grep_fixed 'bash -n "$SCRIPT_PATH"' "$SCRIPT" \
         || fail 'supervisor stale-code re-exec does not syntax-check the on-disk script first'
     grep_fixed 'supervisor_reexec_if_stale' "$SCRIPT" \
         || fail 'background loop does not periodically check for stale code'
@@ -1570,8 +1598,10 @@ test_exports_filter_unusable_fallback_routes() {
         || fail 'fallback export filtering does not probe each IP route'
     grep_fixed 'xhttp_status_usable "$ip_probe"' "$SCRIPT" \
         || fail 'fallback export filtering does not require usable XHTTP status'
-    grep_fixed 'done < <(usable_fallback_ips)' "$SCRIPT" \
-        || fail 'generate_ip_links still exports raw fallback candidates'
+    grep_fixed 'generate_ip_links_from_list "$(usable_fallback_ips || true)"' "$SCRIPT" \
+        || fail 'generate_ip_links does not use the filtered fallback route list'
+    grep_fixed 'ip_links=$(generate_ip_links_from_list "$fallback_ips" || true)' "$SCRIPT" \
+        || fail 'ordered exports do not reuse a shared filtered fallback route list'
     grep_fixed 'address=$(usable_fallback_ips | head -1 || true)' "$SCRIPT" \
         || fail 'recommended IP link does not prefer a usable fallback route'
     grep_fixed '[[ " $emitted " == *" $ip "* ]] && continue' "$SCRIPT" \
@@ -1958,6 +1988,7 @@ test_menu_loop_and_link_output_are_tidy() {
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
+test_control_plane_optimizations_are_present
 test_background_tasks_require_config
 test_recovery_hot_paths_are_bounded_and_validated
 test_latency_focus_keeps_slow_route_export_refresh

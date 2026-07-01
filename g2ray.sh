@@ -4,6 +4,8 @@ set -euo pipefail
 
 readonly G2RAY_ID="G2ray Panel v1.4.3"
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s/%s' "$BASE_DIR" "$(basename "${BASH_SOURCE[0]}")")"
+SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
 
 detect_project_repo_default() {
     local remote url slug upstream_ref upstream_remote
@@ -90,11 +92,13 @@ MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
 BLACKLISTED_ROUTE_CANDIDATES_FILE="$DATA_DIR/blacklisted_route_candidates.txt"
 ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
 PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
+ROUTE_REPAIR_STAMP_FILE="$DATA_DIR/route_repair_last"
 QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
 PERFORMANCE_PROFILE_FILE="$DATA_DIR/performance_profile.txt"
 XRAY_PID_FILE="$DATA_DIR/xray.pid"
 SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
 SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
+ACTIVE_TRAFFIC_STAMP_FILE="$DATA_DIR/active_traffic_last"
 TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
 SESSION_START_FILE="$DATA_DIR/session_start.txt"
 LOG_DIR="${G2RAY_LOG_DIR:-$BASE_DIR/logs}"
@@ -109,6 +113,7 @@ QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+EXPORT_INPUT_HASH_FILE="$DATA_DIR/export_input.hash"
 CODESPACE_ENV_JSON_FILE="${G2RAY_CODESPACE_ENV_JSON_FILE:-/workspaces/.codespaces/shared/environment-variables.json}"
 CODESPACE_SHARED_ENV_FILE="${G2RAY_CODESPACE_SHARED_ENV_FILE:-/workspaces/.codespaces/shared/.env}"
 XRAY_BIN="/usr/local/bin/xray"
@@ -120,6 +125,12 @@ if [[ "$WS_PORT" == "$XRAY_PORT" ]]; then
     [[ "$XRAY_PORT" == "8443" ]] && WS_PORT=8444 || WS_PORT=8443
 fi
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
+PORT_FORWARDING_DOMAIN="${G2RAY_PORT_FORWARDING_DOMAIN:-${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}}"
+PORT_FORWARDING_DOMAIN="${PORT_FORWARDING_DOMAIN#https://}"
+PORT_FORWARDING_DOMAIN="${PORT_FORWARDING_DOMAIN#http://}"
+PORT_FORWARDING_DOMAIN="${PORT_FORWARDING_DOMAIN%%/*}"
+PORT_FORWARDING_DOMAIN="${PORT_FORWARDING_DOMAIN#.}"
+[[ "$PORT_FORWARDING_DOMAIN" =~ ^[A-Za-z0-9.-]+$ && "$PORT_FORWARDING_DOMAIN" == *.* ]] || PORT_FORWARDING_DOMAIN="app.github.dev"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.69.79.91 20.85.77.48 20.120.56.11 20.125.70.28 20.90.66.7 20.103.221.187 20.207.70.99}"
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-30}"
 WS_MAX_FALLBACK_LINKS="${G2RAY_WS_MAX_FALLBACK_LINKS:-3}"
@@ -134,10 +145,15 @@ ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
 DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
 ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
+ROUTE_REPAIR_COOLDOWN_SEC="${G2RAY_ROUTE_REPAIR_COOLDOWN_SEC:-180}"
 ROUTE_STATS_MAX_AGE_SEC="${G2RAY_ROUTE_STATS_MAX_AGE_SEC:-604800}"
 ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-6}"
 ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
+LOCAL_PROBE_TIMEOUT_SEC="${G2RAY_LOCAL_PROBE_TIMEOUT_SEC:-1}"
+EXTERNAL_PROBE_TIMEOUT_SEC="${G2RAY_EXTERNAL_PROBE_TIMEOUT_SEC:-5}"
+CONNECT_TIMEOUT_SEC="${G2RAY_CONNECT_TIMEOUT_SEC:-2}"
+ACTIVE_TRAFFIC_WINDOW_SEC="${G2RAY_ACTIVE_TRAFFIC_WINDOW_SEC:-180}"
 LAST_GOOD_ROUTE_MAX_AGE_SEC="${G2RAY_LAST_GOOD_ROUTE_MAX_AGE_SEC:-1800}"
 WAKER_TEST_TIMEOUT_SEC="${G2RAY_WAKER_TEST_TIMEOUT_SEC:-180}"
 RUNTIME_LOCK_WAIT_ATTEMPTS="${G2RAY_RUNTIME_LOCK_WAIT_ATTEMPTS:-900}"
@@ -178,6 +194,11 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
 [[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=6
 (( ROUTE_PROBE_CONCURRENCY > 16 )) && ROUTE_PROBE_CONCURRENCY=16
+[[ "$ROUTE_REPAIR_COOLDOWN_SEC" =~ ^[0-9]+$ ]] || ROUTE_REPAIR_COOLDOWN_SEC=180
+[[ "$LOCAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$LOCAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || LOCAL_PROBE_TIMEOUT_SEC=1
+[[ "$EXTERNAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$EXTERNAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || EXTERNAL_PROBE_TIMEOUT_SEC=5
+[[ "$CONNECT_TIMEOUT_SEC" =~ ^[0-9]+$ && "$CONNECT_TIMEOUT_SEC" -ge 1 ]] || CONNECT_TIMEOUT_SEC=2
+[[ "$ACTIVE_TRAFFIC_WINDOW_SEC" =~ ^[0-9]+$ ]] || ACTIVE_TRAFFIC_WINDOW_SEC=180
 [[ "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" =~ ^[0-9]+$ && "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" -ge 1 ]] || G2RAY_SUPERVISOR_VERSION_CHECK_TICKS=15
 [[ "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" -ge 1 ]] || G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS=15
 [[ "$G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS" -ge 1 ]] || G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS=15
@@ -699,7 +720,7 @@ file_fingerprint() {
 script_code_version() {
     local git_head script_hash
     git_head=$(git -C "$BASE_DIR" rev-parse --verify HEAD 2>/dev/null || true)
-    script_hash=$(file_fingerprint "$BASE_DIR/g2ray.sh" 2>/dev/null || true)
+    script_hash=$(file_fingerprint "$SCRIPT_PATH" 2>/dev/null || true)
     if [[ -n "$git_head" ]]; then
         printf '%s-%s\n' "$git_head" "${script_hash:0:12}"
         return 0
@@ -802,12 +823,24 @@ _detect_codespace_name() {
 }
 
 CODESPACE_NAME=$(_detect_codespace_name)
-PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
-WS_PORT_DOMAIN="${CODESPACE_NAME}-${WS_PORT}.app.github.dev"
+port_forwarding_domain_value() {
+    local domain="${G2RAY_PORT_FORWARDING_DOMAIN:-${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-$PORT_FORWARDING_DOMAIN}}"
+    domain="${domain#https://}"
+    domain="${domain#http://}"
+    domain="${domain%%/*}"
+    domain="${domain#.}"
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" == *.* ]] || domain="app.github.dev"
+    printf '%s' "$domain"
+}
+
+PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.$(port_forwarding_domain_value)"
+WS_PORT_DOMAIN="${CODESPACE_NAME}-${WS_PORT}.$(port_forwarding_domain_value)"
 
 refresh_port_domains() {
-    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
-    WS_PORT_DOMAIN="${CODESPACE_NAME}-${WS_PORT}.app.github.dev"
+    local domain
+    domain=$(port_forwarding_domain_value)
+    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.${domain}"
+    WS_PORT_DOMAIN="${CODESPACE_NAME}-${WS_PORT}.${domain}"
 }
 
 ws_fallback_enabled() {
@@ -1059,20 +1092,26 @@ xhttp_config_path() {
 }
 
 xhttp_probe_metrics() {
-    local target="${1:-external}" address="${2:-}" path url raw code elapsed ms curl_rc=0 error_hint="" reason
+    local target="${1:-external}" address="${2:-}" path url raw code elapsed ms curl_rc=0 error_hint="" reason timeout_sec
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     case "$target" in
-        local) url="http://127.0.0.1:${XRAY_PORT}${path}" ;;
-        *)     url="https://${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}${path}" ;;
+        local)
+            url="http://127.0.0.1:${XRAY_PORT}${path}"
+            timeout_sec="$LOCAL_PROBE_TIMEOUT_SEC"
+            ;;
+        *)
+            url="https://${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}${path}"
+            timeout_sec="$EXTERNAL_PROBE_TIMEOUT_SEC"
+            ;;
     esac
     if [[ "$target" == "local" || -z "$address" ]]; then
-        raw=$(curl -sS -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
+        raw=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT_SEC" -m "$timeout_sec" -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
             curl_rc=$?
             raw="0 0"
         }
     else
-        raw=$(curl -sS -m 5 --resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}" \
+        raw=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT_SEC" -m "$timeout_sec" --resolve "${PORT_DOMAIN}:${CODESPACES_EDGE_PORT}:${address}" \
             -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null) || {
             curl_rc=$?
             raw="0 0"
@@ -1969,6 +2008,39 @@ write_epoch_stamp() {
     chmod 600 "$file" 2>/dev/null || true
 }
 
+mark_active_traffic() {
+    write_epoch_stamp "$ACTIVE_TRAFFIC_STAMP_FILE" >/dev/null 2>&1 || true
+}
+
+active_tunnel_recent() {
+    local age window="$ACTIVE_TRAFFIC_WINDOW_SEC"
+    [[ "$window" =~ ^[0-9]+$ ]] || window=180
+    age=$(stamp_age_sec "$ACTIVE_TRAFFIC_STAMP_FILE")
+    [[ "$age" =~ ^[0-9]+$ ]] || age=999999999
+    (( age <= window ))
+}
+
+route_repair_cooldown_active() {
+    local age cooldown="$ROUTE_REPAIR_COOLDOWN_SEC"
+    [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=180
+    (( cooldown > 0 )) || return 1
+    age=$(stamp_age_sec "$ROUTE_REPAIR_STAMP_FILE")
+    [[ "$age" =~ ^[0-9]+$ ]] || age=999999999
+    (( age < cooldown ))
+}
+
+mark_route_repair_attempt() {
+    write_epoch_stamp "$ROUTE_REPAIR_STAMP_FILE" >/dev/null 2>&1 || true
+}
+
+mark_route_repair_attempt_if_allowed() {
+    if route_repair_cooldown_active; then
+        return 1
+    fi
+    mark_route_repair_attempt
+    return 0
+}
+
 ensure_codespace_port_public_for_port() {
     local port="$1" force="${2:-}" age stamp_file
     [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]] || return 1
@@ -2140,6 +2212,9 @@ save_xray_stats() {
     bu=$(jq -r '.up//0'   "$SESSION_BYTES_FILE" 2>/dev/null || echo 0)
     dd=$(awk -v s="$sd" -v b="$bd" 'BEGIN{d=s-b; printf "%.0f",(d<0?0:d)}')
     du=$(awk -v s="$su" -v b="$bu" 'BEGIN{d=s-b; printf "%.0f",(d<0?0:d)}')
+    if [[ "$dd" =~ ^[0-9]+$ && "$du" =~ ^[0-9]+$ ]] && (( dd > 0 || du > 0 )); then
+        mark_active_traffic
+    fi
     svd=$(jq -r '.down//0' "$SAVED_BYTES_FILE" 2>/dev/null || echo 0)
     svu=$(jq -r '.up//0'   "$SAVED_BYTES_FILE" 2>/dev/null || echo 0)
     _atomic_write "$SAVED_BYTES_FILE" \
@@ -2366,18 +2441,27 @@ upgrade_config_dns() {
     fi
 }
 
-xray_validate_config() {
-    local tmp
-    [[ -f "$CONFIG_FILE" ]] || return 1
+xray_validate_config_file() {
+    local config_file="${1:-}" tmp
+    [[ -f "$config_file" ]] || return 1
+    if command -v jq >/dev/null 2>&1 && ! jq . "$config_file" >/dev/null 2>&1; then
+        log_event ERROR "xray_config_json_invalid file=$(basename "$config_file")"
+        echo -e "  ${RED}âœ– Xray config JSON is invalid.${NC}"
+        return 1
+    fi
     tmp=$(mktemp "${LOG_DIR}/xray-configtest.XXXXXX.log" 2>/dev/null || mktemp "/tmp/xray-configtest.XXXXXX.log") || return 1
-    if sudo timeout 10 "$XRAY_BIN" run -test -c "$CONFIG_FILE" >"$tmp" 2>&1; then
+    if sudo timeout 10 "$XRAY_BIN" run -test -c "$config_file" >"$tmp" 2>&1; then
         rm -f "$tmp" 2>/dev/null || true
         return 0
     fi
-    log_event ERROR "start_xray config_test_failed log=${tmp}"
+    log_event ERROR "start_xray config_test_failed file=$(basename "$config_file") log=${tmp}"
     echo -e "  ${RED}âœ– Xray config validation failed. See:${NC} ${WHITE}${tmp}${NC}"
     tail -n 8 "$tmp" 2>/dev/null | sed 's/^/  /' || true
     return 1
+}
+
+xray_validate_config() {
+    xray_validate_config_file "$CONFIG_FILE"
 }
 
 _start_xray_impl() {
@@ -2501,8 +2585,12 @@ self_heal_once() {
     bad_count=$(increment_route_bad_count)
     log_event WARN "self_heal route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} bad_count=${bad_count} action=observe"
     if (( bad_count >= 2 )); then
-        log_event WARN "self_heal route_unusable action=repair port=${XRAY_PORT}"
-        repair_codespace_port_route >/dev/null 2>&1 || true
+        if mark_route_repair_attempt_if_allowed; then
+            log_event WARN "self_heal route_unusable action=repair port=${XRAY_PORT}"
+            repair_codespace_port_route >/dev/null 2>&1 || true
+        else
+            log_event WARN "self_heal route_unusable action=repair_cooldown port=${XRAY_PORT}"
+        fi
         reset_route_bad_count
     fi
 }
@@ -2516,7 +2604,7 @@ _background_tasks() {
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         if ! latency_focus_enabled; then
             run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
-            run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true
+            run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true
             run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1 || true
         fi
     fi
@@ -2541,19 +2629,22 @@ _background_tasks() {
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
+        if active_tunnel_recent; then
+            continue
+        fi
         if latency_focus_enabled; then
             (( ++health_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
             (( ++route_tick >= G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
-            (( ++export_tick >= G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+            (( ++export_tick >= G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true; export_tick=0; }
             continue
         fi
         (( ++health_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
         if low_overhead_enabled; then
             (( ++route_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
-            (( ++export_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+            (( ++export_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true; export_tick=0; }
         else
             (( ++route_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
-            (( ++export_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports >/dev/null 2>&1 || true; export_tick=0; }
+            (( ++export_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true; export_tick=0; }
             (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
         fi
     done
@@ -2618,7 +2709,7 @@ start_background_tasks() {
     fi
     token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
     printf '%s\n' "$token" > "$BG_TASKS_TOKEN_FILE"
-    G2RAY_BG_TASK_TOKEN="$token" nohup bash "$BASE_DIR/g2ray.sh" --background-supervisor </dev/null >/dev/null 2>&1 &
+    G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor </dev/null >/dev/null 2>&1 &
     bg_pid=$!
     printf '%s\n' "$bg_pid" > "$BG_TASKS_PID"
     background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
@@ -2629,9 +2720,9 @@ start_background_tasks() {
 
 background_supervisor_version() {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$BASE_DIR/g2ray.sh" 2>/dev/null | awk '{print $1}'
+        sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}'
     elif command -v md5sum >/dev/null 2>&1; then
-        md5sum "$BASE_DIR/g2ray.sh" 2>/dev/null | awk '{print $1}'
+        md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}'
     elif command -v git >/dev/null 2>&1; then
         git -C "$BASE_DIR" rev-parse HEAD 2>/dev/null || true
     fi
@@ -2646,13 +2737,13 @@ background_supervisor_version_matches() {
 
 supervisor_reexec_if_stale() {
     background_supervisor_version_matches && return 0
-    if ! bash -n "$BASE_DIR/g2ray.sh" >/dev/null 2>&1; then
+    if ! bash -n "$SCRIPT_PATH" >/dev/null 2>&1; then
         log_event ERROR "background supervisor_stale_code syntax_failed action=stay"
         return 1
     fi
     background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
     log_event WARN "background supervisor_stale_code action=reexec"
-    exec bash "$BASE_DIR/g2ray.sh" --background-supervisor
+    exec bash "$SCRIPT_PATH" --background-supervisor
 }
 
 stop_background_tasks() {
@@ -2673,7 +2764,7 @@ legacy_bg_tasks_running() {
     kill -0 "$p" 2>/dev/null || return 1
     args=$(ps -p "$p" -o args= 2>/dev/null || true)
     tty=$(ps -p "$p" -o tty= 2>/dev/null | awk '{print $1}' || true)
-    [[ "$tty" == "?" && ( "$args" == *"$BASE_DIR/g2ray.sh"* || "$args" == *"g2ray.sh"* ) ]]
+    [[ "$tty" == "?" && "$args" == *"$SCRIPT_PATH"* ]]
 }
 
 bg_tasks_running() {
@@ -2934,15 +3025,31 @@ set_performance_profile() {
 generate_config() {
     # Keep the existing UUID when only re-applying a profile, so switching
     # profiles does not invalidate already-imported client links.
+    local uuid old_uuid="" had_old_uuid=false candidate_config="" previous_config="" had_previous_config=false
     if [[ "${G2RAY_PRESERVE_UUID:-0}" == "1" && -s "$UUID_FILE" ]]; then
-        :
+        uuid=$(cat "$UUID_FILE" 2>/dev/null || true)
     else
-        generate_uuid > "$UUID_FILE" || {
+        uuid=$(generate_uuid) || {
             echo -e "  ${RED}Could not generate a UUID for the config.${NC}"
             return 1
         }
     fi
-    local uuid; uuid=$(cat "$UUID_FILE")
+    [[ -n "$uuid" ]] || {
+        echo -e "  ${RED}Could not generate a UUID for the config.${NC}"
+        return 1
+    }
+    if [[ -s "$UUID_FILE" ]]; then
+        old_uuid=$(cat "$UUID_FILE" 2>/dev/null || true)
+        had_old_uuid=true
+    fi
+    if [[ -s "$CONFIG_FILE" ]]; then
+        previous_config=$(mktemp "${CONFIG_FILE}.previous.XXXXXX") || return 1
+        cp "$CONFIG_FILE" "$previous_config" || {
+            rm -f "$previous_config" 2>/dev/null || true
+            return 1
+        }
+        had_previous_config=true
+    fi
     local profile_name max_upload_size max_concurrent_uploads handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_mode
     while IFS='=' read -r key value; do
         case "$key" in
@@ -3003,7 +3110,11 @@ JSONEOF
     fi
     local uuid_hash; uuid_hash=$(fingerprint_secret "$uuid")
     log_event INFO "generate_config uuid_hash=${uuid_hash} port=${XRAY_PORT} domain=${PORT_DOMAIN} profile=${profile_name} xhttp_mode=${xhttp_mode} tcp_fast_open=${tfo_state}"
-    cat > "$CONFIG_FILE" << JSONEOF
+    candidate_config=$(mktemp "${CONFIG_FILE}.candidate.XXXXXX") || {
+        rm -f "$previous_config" 2>/dev/null || true
+        return 1
+    }
+    cat > "$candidate_config" << JSONEOF
 {
   "log": { "loglevel": "${loglevel}", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
   "stats": {},
@@ -3051,14 +3162,54 @@ JSONEOF
   }
 }
 JSONEOF
+    chmod 600 "$candidate_config" 2>/dev/null || true
+    if ! xray_validate_config_file "$candidate_config"; then
+        log_event ERROR "generate_config candidate_invalid action=keep_existing"
+        rm -f "$candidate_config" "$previous_config" 2>/dev/null || true
+        return 1
+    fi
+    if ! _atomic_write "$UUID_FILE" "$uuid"; then
+        rm -f "$candidate_config" "$previous_config" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv -f "$candidate_config" "$CONFIG_FILE"; then
+        if [[ "$had_old_uuid" == true ]]; then
+            _atomic_write "$UUID_FILE" "$old_uuid" >/dev/null 2>&1 || true
+        else
+            rm -f "$UUID_FILE" 2>/dev/null || true
+        fi
+        rm -f "$candidate_config" "$previous_config" 2>/dev/null || true
+        return 1
+    fi
     chmod 600 "$UUID_FILE" "$CONFIG_FILE" 2>/dev/null || true
+    local engine_started=false
     if start_xray && wait_for_port >/dev/null 2>&1; then
+        engine_started=true
         log_event INFO "generate_config engine_started port=${XRAY_PORT}"
         echo -e "  ${GREEN}✔ Engine started on port ${XRAY_PORT}.${NC}"
     else
         log_event WARN "generate_config engine_maybe_not_bound port=${XRAY_PORT}"
         echo -e "  ${YELLOW}⚠ Engine may not have bound to port ${XRAY_PORT}.${NC}"
     fi
+    if [[ "$engine_started" != true ]]; then
+        log_event ERROR "generate_config engine_start_failed port=${XRAY_PORT} action=rollback"
+        if [[ "$had_previous_config" == true && -s "$previous_config" ]]; then
+            cp "$previous_config" "$CONFIG_FILE" 2>/dev/null || true
+            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        else
+            rm -f "$CONFIG_FILE" 2>/dev/null || true
+        fi
+        if [[ "$had_old_uuid" == true ]]; then
+            _atomic_write "$UUID_FILE" "$old_uuid" >/dev/null 2>&1 || true
+            chmod 600 "$UUID_FILE" 2>/dev/null || true
+        else
+            rm -f "$UUID_FILE" 2>/dev/null || true
+        fi
+        rm -f "$previous_config" 2>/dev/null || true
+        echo -e "  ${YELLOW}Engine may not have bound to port ${XRAY_PORT}; previous config was restored.${NC}"
+        return 1
+    fi
+    rm -f "$previous_config" 2>/dev/null || true
     if ensure_codespace_port_public; then
         log_event INFO "generate_config port_public port=${XRAY_PORT}"
     else
@@ -4051,6 +4202,11 @@ generate_ip_link() {
 }
 
 generate_ip_links() {
+    generate_ip_links_from_list "$(usable_fallback_ips || true)"
+}
+
+generate_ip_links_from_list() {
+    local fallback_ips="${1:-}"
     local address index=1 printed=false max_links
     max_links=$(safe_max_fallback_links)
     while IFS= read -r address; do
@@ -4060,11 +4216,16 @@ generate_ip_links() {
         generate_link_for_address "$address" "-ip${index}"
         printed=true
         index=$(( index + 1 ))
-    done < <(usable_fallback_ips)
+    done <<< "$fallback_ips"
 }
 
 generate_ws_links() {
+    generate_ws_links_from_list "$(usable_fallback_ips || true)"
+}
+
+generate_ws_links_from_list() {
     ws_fallback_enabled || return 0
+    local fallback_ips="${1:-}"
     local address index=1 printed=false max_links front_links
     max_links=$(safe_ws_fallback_links)
     front_links=$(generate_ws_front_link_variants 2>/dev/null || true)
@@ -4079,7 +4240,7 @@ generate_ws_links() {
         generate_ws_link_variants_for_address "$address" "-ws-ip${index}"
         printed=true
         index=$(( index + 1 ))
-    done < <(usable_fallback_ips)
+    done <<< "$fallback_ips"
     if domain_link_export_enabled; then
         [[ "$printed" == true ]] && printf '\n'
         generate_ws_domain_link_variants || true
@@ -4087,8 +4248,9 @@ generate_ws_links() {
 }
 
 generate_ordered_links() {
-    local domain_link ip_links ws_links
-    ip_links=$(generate_ip_links || true)
+    local domain_link ip_links ws_links fallback_ips
+    fallback_ips=$(usable_fallback_ips || true)
+    ip_links=$(generate_ip_links_from_list "$fallback_ips" || true)
     printf '%s\n' "$ip_links" | awk 'NF'
     if domain_link_export_enabled; then
         domain_link=$(generate_domain_link || true)
@@ -4096,7 +4258,7 @@ generate_ordered_links() {
             printf '%s\n' "$domain_link"
         fi
     fi
-    ws_links=$(generate_ws_links || true)
+    ws_links=$(generate_ws_links_from_list "$fallback_ips" || true)
     printf '%s\n' "$ws_links" | awk 'NF'
 }
 
@@ -4151,12 +4313,64 @@ clear_config_exports() {
     log_event WARN "config_exports cleared reason=${reason}"
 }
 
+config_export_artifacts_present() {
+    [[ -s "$MOBILE_CONFIG_FILE" && -s "$CONFIG_META_FILE" ]] || return 1
+    if command -v base64 >/dev/null 2>&1; then
+        [[ -s "$SUBSCRIPTION_FILE" ]] || return 1
+    fi
+    return 0
+}
+
+export_input_hash() {
+    local input
+    input=$(
+        printf 'codespace=%s\n' "$CODESPACE_NAME"
+        printf 'port_domain=%s\n' "$PORT_DOMAIN"
+        printf 'ws_port_domain=%s\n' "$WS_PORT_DOMAIN"
+        printf 'xray_port=%s\n' "$XRAY_PORT"
+        printf 'edge_port=%s\n' "$CODESPACES_EDGE_PORT"
+        printf 'ws_port=%s\n' "$WS_PORT"
+        printf 'user=%s\n' "${GITHUB_USER:-}"
+        printf 'max_links=%s\n' "$(safe_max_fallback_links)"
+        printf 'ws_max_links=%s\n' "$(safe_ws_fallback_links)"
+        printf 'profile=%s\n' "$(effective_performance_profile)"
+        printf 'xhttp_mode=%s\n' "$(xhttp_mode_value)"
+        printf 'domain_export=%s\n' "$(domain_link_export_enabled && printf true || printf false)"
+        printf 'ws_enabled=%s\n' "$(ws_fallback_enabled && printf true || printf false)"
+        printf 'ws_front=%s\n' "$(ws_front_domain_value 2>/dev/null || true)"
+        printf 'config=%s\n' "$(file_fingerprint "$CONFIG_FILE" 2>/dev/null || true)"
+        printf 'uuid=%s\n' "$(file_fingerprint "$UUID_FILE" 2>/dev/null || true)"
+        printf 'route_health=%s\n' "$(file_fingerprint "$ROUTE_HEALTH_FILE" 2>/dev/null || true)"
+        printf 'route_stats=%s\n' "$(file_fingerprint "$ROUTE_STATS_FILE" 2>/dev/null || true)"
+        printf 'manual=%s\n' "$(file_fingerprint "$MANUAL_ROUTE_CANDIDATES_FILE" 2>/dev/null || true)"
+        printf 'blacklist=%s\n' "$(file_fingerprint "$BLACKLISTED_ROUTE_CANDIDATES_FILE" 2>/dev/null || true)"
+        printf 'pinned=%s\n' "$(file_fingerprint "$PINNED_ROUTE_FILE" 2>/dev/null || true)"
+        printf 'last_good=%s\n' "$(file_fingerprint "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true)"
+    )
+    fingerprint_secret "$input"
+}
+
 refresh_config_exports() {
     [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
     local link_array=()
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     ((${#link_array[@]})) || { clear_config_exports "no_exportable_links"; return 1; }
     write_config_exports_from_links "${link_array[@]}"
+}
+
+refresh_config_exports_if_changed() {
+    [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
+    local new_hash old_hash
+    new_hash=$(export_input_hash)
+    old_hash=$(cat "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true)
+    if [[ -n "$new_hash" && "$new_hash" == "$old_hash" ]] && config_export_artifacts_present; then
+        log_event INFO "config_exports unchanged hash=${new_hash}"
+        return 0
+    fi
+    refresh_config_exports || return 1
+    new_hash=$(export_input_hash)
+    _atomic_write "$EXPORT_INPUT_HASH_FILE" "$new_hash" >/dev/null 2>&1 || true
+    chmod 600 "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true
 }
 
 log_diagnostic_snapshot() {
@@ -4977,11 +5191,13 @@ bench_rebind_runtime_paths() {
     BLACKLISTED_ROUTE_CANDIDATES_FILE="$DATA_DIR/blacklisted_route_candidates.txt"
     ROUTE_SETTLING_HISTORY_FILE="$DATA_DIR/route_settling_history.tsv"
     PORT_PUBLIC_STAMP_FILE="$DATA_DIR/port_public_last"
+    ROUTE_REPAIR_STAMP_FILE="$DATA_DIR/route_repair_last"
     QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
     PERFORMANCE_PROFILE_FILE="$DATA_DIR/performance_profile.txt"
     XRAY_PID_FILE="$DATA_DIR/xray.pid"
     SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
     SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
+    ACTIVE_TRAFFIC_STAMP_FILE="$DATA_DIR/active_traffic_last"
     TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
     SESSION_START_FILE="$DATA_DIR/session_start.txt"
     LOG_DIR="$BASE_DIR/logs"
@@ -4996,6 +5212,7 @@ bench_rebind_runtime_paths() {
     MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
     SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
     CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    EXPORT_INPUT_HASH_FILE="$DATA_DIR/export_input.hash"
 }
 
 bench_json_impl() {
