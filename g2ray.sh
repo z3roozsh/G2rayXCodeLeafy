@@ -104,6 +104,7 @@ DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
 LOG_ROTATE_STAMP_FILE="$DATA_DIR/log_rotate_last"
 STRUCTURED_LOG_ROTATE_STAMP_FILE="$DATA_DIR/structured_log_rotate_last"
 DIAGNOSTIC_LOG_ROTATE_STAMP_FILE="$DATA_DIR/diagnostic_log_rotate_last"
+LOG_CODE_VERSION_FILE="$DATA_DIR/log_code_version"
 QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
@@ -693,6 +694,47 @@ file_fingerprint() {
     else
         cksum "$file" 2>/dev/null | awk '{print $1 ":" $2}'
     fi
+}
+
+script_code_version() {
+    local git_head script_hash
+    git_head=$(git -C "$BASE_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+    script_hash=$(file_fingerprint "$BASE_DIR/g2ray.sh" 2>/dev/null || true)
+    if [[ -n "$git_head" ]]; then
+        printf '%s-%s\n' "$git_head" "${script_hash:0:12}"
+        return 0
+    fi
+    printf '%s\n' "$script_hash"
+}
+
+reset_logs_on_code_change() {
+    local enabled current previous keep i file
+    enabled=$(printf '%s' "${G2RAY_RESET_LOGS_ON_CODE_CHANGE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$enabled" in
+        0|false|no|off|disabled) return 0 ;;
+    esac
+    current=$(script_code_version)
+    [[ -n "$current" ]] || return 0
+    previous=$(cat "$LOG_CODE_VERSION_FILE" 2>/dev/null || true)
+    [[ "$previous" == "$current" ]] && return 0
+
+    keep="$LOG_ROTATE_KEEP"
+    [[ "$keep" =~ ^[0-9]+$ && "$keep" -gt 0 ]] || keep=3
+    for file in "$LOG_FILE" "$STRUCTURED_LOG_FILE" "$DIAGNOSTIC_LOG_FILE" "$LOG_DIR/xray.log" "$LOG_DIR/xray-error.log"; do
+        : > "$file" 2>/dev/null || true
+        chmod 600 "$file" 2>/dev/null || true
+        for ((i=1; i<=keep; i++)); do
+            rm -f "${file}.${i}" 2>/dev/null || true
+        done
+    done
+    rm -f "$LOG_DIR"/xray-configtest.*.log 2>/dev/null || true
+    rm -f "$LOG_ROTATE_STAMP_FILE" "$STRUCTURED_LOG_ROTATE_STAMP_FILE" "$DIAGNOSTIC_LOG_ROTATE_STAMP_FILE" 2>/dev/null || true
+    printf '%s\n' "$current" > "$LOG_CODE_VERSION_FILE" 2>/dev/null || true
+    chmod 600 "$LOG_CODE_VERSION_FILE" 2>/dev/null || true
+    _G2RAY_LOG_ROTATE_LAST=""
+    _G2RAY_STRUCTURED_LOG_ROTATE_LAST=""
+    _G2RAY_DIAGNOSTIC_LOG_ROTATE_LAST=""
+    log_event INFO "logs reset_for_code_change previous_hash=${previous:-none} current_hash=${current:0:12}"
 }
 
 detect_codespace_name_from_json_file() {
@@ -2285,6 +2327,7 @@ _stop_xray_impl() {
     fi
     rm -f "$XRAY_PID_FILE" 2>/dev/null || true
     ((${#owned_pids[@]})) && sleep 0.2
+    return 0
 }
 
 stop_xray() {
@@ -4948,6 +4991,7 @@ bench_rebind_runtime_paths() {
     LOG_ROTATE_STAMP_FILE="$DATA_DIR/log_rotate_last"
     STRUCTURED_LOG_ROTATE_STAMP_FILE="$DATA_DIR/structured_log_rotate_last"
     DIAGNOSTIC_LOG_ROTATE_STAMP_FILE="$DATA_DIR/diagnostic_log_rotate_last"
+    LOG_CODE_VERSION_FILE="$DATA_DIR/log_code_version"
     QR_DIR="$DATA_DIR/qr"
     MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
     SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
@@ -5022,6 +5066,7 @@ if [[ "${G2RAY_SOURCE_ONLY:-}" == "1" ]]; then
     return 0 2>/dev/null || exit 0
 fi
 
+reset_logs_on_code_change
 sweep_stale_temp_files
 
 if [[ "${1:-}" == "--doctor-json" || "${1:-}" == "--status-json" || ( "${1:-}" == "doctor" && "${2:-}" == "--json" ) ]]; then

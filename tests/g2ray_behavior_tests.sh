@@ -60,6 +60,7 @@ reset_runtime_paths() {
     LOG_FILE="$LOG_DIR/g2ray.log"
     STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
+    LOG_CODE_VERSION_FILE="$DATA_DIR/log_code_version"
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     XRAY_PID_FILE="$DATA_DIR/xray.pid"
     BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
@@ -252,6 +253,17 @@ test_runtime_lock_serializes_operations_and_allows_reentry() {
     pass "runtime lock serializes operations and allows same-process reentry"
 }
 
+test_stop_xray_succeeds_when_engine_is_already_stopped() {
+    (
+        reset_runtime_paths
+        owned_xray_pids() { return 0; }
+        save_xray_stats() { return 0; }
+
+        stop_xray || fail "stop_xray returned failure when there was no owned Xray process"
+    )
+    pass "stop_xray succeeds when engine is already stopped"
+}
+
 test_port_visibility_cache_is_scoped_by_codespace_and_port() {
     reset_runtime_paths
     PORT_PUBLIC_TTL_SEC=300
@@ -336,6 +348,36 @@ test_stale_temp_sweep_removes_only_old_owned_artifacts() {
     [[ -e "$fresh_probe" ]] || fail "fresh route probe temp file was swept"
     [[ -e "$unrelated" ]] || fail "unrelated file was swept"
     pass "stale temp sweep removes only old owned artifacts"
+}
+
+test_logs_reset_when_script_code_changes() {
+    reset_runtime_paths
+    printf 'old app log\n' > "$LOG_FILE"
+    printf 'old app rotated\n' > "$LOG_FILE.1"
+    printf '{"old":true}\n' > "$STRUCTURED_LOG_FILE"
+    printf '{"old":true}\n' > "$STRUCTURED_LOG_FILE.1"
+    printf 'old diagnostics\n' > "$DIAGNOSTIC_LOG_FILE"
+    printf 'old diagnostics rotated\n' > "$DIAGNOSTIC_LOG_FILE.1"
+    printf 'old xray runtime\n' > "$LOG_DIR/xray.log"
+    printf 'old xray runtime rotated\n' > "$LOG_DIR/xray.log.1"
+    printf 'old xray error\n' > "$LOG_DIR/xray-error.log"
+    printf 'old config test\n' > "$LOG_DIR/xray-configtest.ABC123.log"
+    printf 'old-code-version\n' > "$LOG_CODE_VERSION_FILE"
+
+    reset_logs_on_code_change
+
+    grep -Fq 'logs reset_for_code_change' "$LOG_FILE" \
+        || fail "log reset did not leave a fresh code-change marker"
+    if grep -Fq 'old app log' "$LOG_FILE" \
+        || [[ -e "$LOG_FILE.1" ]] \
+        || [[ -e "$STRUCTURED_LOG_FILE.1" ]] \
+        || [[ -e "$DIAGNOSTIC_LOG_FILE.1" ]] \
+        || [[ -e "$LOG_DIR/xray.log.1" ]] \
+        || [[ -e "$LOG_DIR/xray-configtest.ABC123.log" ]]; then
+        fail "old logs or rotated/config-test logs were not cleared after code change"
+    fi
+    [[ -s "$LOG_CODE_VERSION_FILE" ]] || fail "log code-version marker was not updated"
+    pass "logs reset when script code changes"
 }
 
 test_cached_route_order_uses_reliability_then_average_latency() {
@@ -2077,10 +2119,12 @@ test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
 test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated
 test_runtime_lock_serializes_operations_and_allows_reentry
+test_stop_xray_succeeds_when_engine_is_already_stopped
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_lifecycle_port_publish_forces_visibility_cache
 test_background_start_reports_lock_failure_without_live_supervisor
 test_stale_temp_sweep_removes_only_old_owned_artifacts
+test_logs_reset_when_script_code_changes
 test_cached_route_order_uses_reliability_then_average_latency
 test_cached_route_order_uses_recent_weighted_score
 test_cached_route_order_does_not_overweight_tiny_reliability_delta
