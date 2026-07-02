@@ -953,6 +953,61 @@ test_dns_candidate_cache_reuses_fresh_provider_results() {
     pass "DNS candidate cache reuses fresh provider results"
 }
 
+test_wide_dns_discovery_queries_multiple_ecs_subnets() {
+    (
+        reset_runtime_paths
+        DEFAULT_FALLBACK_IPS=""
+        G2RAY_EXTRA_FALLBACK_IPS=""
+        DNS_CACHE_TTL_SEC=0
+        G2RAY_WIDE_DNS_DISCOVERY=1
+        G2RAY_WIDE_DNS_ECS_SUBNETS="1.1.1.0/24 8.8.8.0/24 invalid-subnet 999.1.1.0/24"
+        dig() { return 1; }
+        getent() { return 1; }
+        curl_remote_ip() { return 0; }
+        local calls_file="$TMP_ROOT/wide-dns-json-calls.txt"
+        : > "$calls_file"
+        json_dns_ips() {
+            printf '%s\n' "$1" >> "$calls_file"
+            case "$1" in
+                *'edns_client_subnet=1.1.1.0%2F24'*) printf '20.0.0.11\n' ;;
+                *'edns_client_subnet=8.8.8.0%2F24'*) printf '20.0.0.12\n' ;;
+                *'edns_client_subnet='*) printf '20.0.0.99\n' ;;
+                *'dns.google/resolve'*) printf '20.0.0.9\n' ;;
+                *'cloudflare-dns.com'*) printf '20.0.0.10\n' ;;
+            esac
+        }
+
+        mapfile -t rows < <(resolve_domain_ips_with_sources "behavior.example")
+        printf '%s\n' "${rows[@]}" | grep -Fxq $'dns_google_ecs_1_1_1_0_24\t20.0.0.11' \
+            || fail "wide DNS discovery did not include 1.1.1.0/24 ECS candidate: ${rows[*]:-none}"
+        printf '%s\n' "${rows[@]}" | grep -Fxq $'dns_google_ecs_8_8_8_0_24\t20.0.0.12' \
+            || fail "wide DNS discovery did not include 8.8.8.0/24 ECS candidate: ${rows[*]:-none}"
+        ! grep -Fq 'invalid-subnet' "$calls_file" \
+            || fail "wide DNS discovery queried invalid ECS subnet text"
+        ! grep -Fq '999.1.1.0' "$calls_file" \
+            || fail "wide DNS discovery queried invalid ECS subnet octets"
+    )
+    pass "wide DNS discovery queries multiple valid ECS subnets"
+}
+
+test_batch_manual_route_import_extracts_valid_unique_ipv4s() {
+    (
+        reset_runtime_paths
+        blacklist_route_candidate 20.0.0.8 || fail "blacklist setup failed"
+        local summary
+        summary="$(import_manual_route_candidates_from_text $'messy text 20.0.0.7 duplicate 20.0.0.7 invalid 999.1.1.1 blocked 20.0.0.8 next 20.0.0.9')"
+        grep -Fxq '20.0.0.7' "$MANUAL_ROUTE_CANDIDATES_FILE" \
+            || fail "batch import missed first valid IPv4"
+        grep -Fxq '20.0.0.9' "$MANUAL_ROUTE_CANDIDATES_FILE" \
+            || fail "batch import missed second valid IPv4"
+        ! grep -Fxq '20.0.0.8' "$MANUAL_ROUTE_CANDIDATES_FILE" \
+            || fail "batch import added a blacklisted route"
+        [[ "$summary" == *"added=2"* ]] || fail "batch import summary did not report two additions: $summary"
+        [[ "$summary" == *"skipped=1"* ]] || fail "batch import summary did not report skipped blacklisted route: $summary"
+    )
+    pass "batch manual route import extracts valid unique IPv4 candidates"
+}
+
 test_last_known_state_scans_full_current_log() {
     reset_runtime_paths
     for _i in $(seq 1 700); do
@@ -2377,6 +2432,8 @@ test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
 test_dns_candidate_cache_reuses_fresh_provider_results
+test_wide_dns_discovery_queries_multiple_ecs_subnets
+test_batch_manual_route_import_extracts_valid_unique_ipv4s
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
 test_usable_fallback_ips_revalidates_top_cached_route

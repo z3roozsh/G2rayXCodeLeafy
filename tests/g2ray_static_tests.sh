@@ -1734,6 +1734,16 @@ test_fallback_link_count_is_capped() {
     fi
     grep_fixed 'Default: `40`, hard-capped at `64`' "$README" \
         || fail 'README does not document the widened bounded route scanner default'
+    grep_fixed 'WIDE_DNS_DISCOVERY="${G2RAY_WIDE_DNS_DISCOVERY:-1}"' "$SCRIPT" \
+        || fail 'wide DNS discovery is not enabled by default'
+    grep_fixed 'G2RAY_WIDE_DNS_ECS_SUBNETS' "$SCRIPT" \
+        || fail 'wide DNS discovery has no configurable ECS subnet list'
+    grep_fixed 'import_manual_route_candidates_from_text()' "$SCRIPT" \
+        || fail 'route manager has no batch manual route import helper'
+    grep_fixed 'Batch Import Manual IPv4s' "$SCRIPT" \
+        || fail 'route manager does not expose batch manual route import in the panel'
+    grep_fixed 'G2RAY_WIDE_DNS_DISCOVERY' "$README" \
+        || fail 'README does not document wide DNS discovery'
     pass 'fallback link count is capped and documented'
 }
 

@@ -135,6 +135,9 @@ DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.69.79.91 20.85.77.48 20.1
 MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-30}"
 WS_MAX_FALLBACK_LINKS="${G2RAY_WS_MAX_FALLBACK_LINKS:-3}"
 ROUTE_MONITOR_MAX_CANDIDATES="${G2RAY_ROUTE_MONITOR_MAX_CANDIDATES:-40}"
+WIDE_DNS_DISCOVERY="${G2RAY_WIDE_DNS_DISCOVERY:-1}"
+WIDE_DNS_ECS_SUBNETS="${G2RAY_WIDE_DNS_ECS_SUBNETS:-0.0.0.0/0 1.1.1.0/24 8.8.8.0/24 9.9.9.0/24 208.67.222.0/24 94.140.14.0/24 185.228.168.0/24}"
+WIDE_DNS_MAX_ECS_SUBNETS="${G2RAY_WIDE_DNS_MAX_ECS_SUBNETS:-12}"
 DIAGNOSTIC_MAX_FALLBACK_PROBES="${G2RAY_DIAGNOSTIC_MAX_FALLBACK_PROBES:-12}"
 SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
@@ -452,6 +455,52 @@ route_export_revalidate_top_cached_enabled() {
         0|false|no|off|disabled) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+wide_dns_discovery_enabled() {
+    local value
+    value=$(printf '%s' "${G2RAY_WIDE_DNS_DISCOVERY:-${WIDE_DNS_DISCOVERY:-1}}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$value" in
+        0|false|no|off|disabled) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+valid_ipv4_cidr() {
+    local subnet="${1:-}" ip prefix
+    [[ "$subnet" == */* ]] || return 1
+    ip="${subnet%/*}"
+    prefix="${subnet##*/}"
+    valid_ipv4 "$ip" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$prefix >= 0 && 10#$prefix <= 32 ))
+}
+
+wide_dns_ecs_source_label() {
+    local subnet="${1:-}" label
+    label=$(printf '%s' "$subnet" | tr './-' '___' | tr -cd 'A-Za-z0-9_')
+    printf 'dns_google_ecs_%s\n' "$label"
+}
+
+wide_dns_ecs_url_value() {
+    local subnet="${1:-}"
+    printf '%s\n' "${subnet//\//%2F}"
+}
+
+wide_dns_ecs_subnets() {
+    local raw max count=0 subnet
+    raw="${G2RAY_WIDE_DNS_ECS_SUBNETS:-${WIDE_DNS_ECS_SUBNETS:-}}"
+    max="${G2RAY_WIDE_DNS_MAX_ECS_SUBNETS:-${WIDE_DNS_MAX_ECS_SUBNETS:-12}}"
+    [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=12
+    (( max > 24 )) && max=24
+    for subnet in $raw; do
+        subnet="${subnet//,/}"
+        subnet="${subnet//;/}"
+        valid_ipv4_cidr "$subnet" || continue
+        printf '%s\n' "$subnet"
+        count=$((count + 1))
+        (( count >= max )) && break
+    done
 }
 
 support_include_network_enabled() {
@@ -1052,8 +1101,18 @@ resolve_dns_provider_ips_with_sources() {
     pids+=("$!")
     ({ json_dns_ips "https://dns.quad9.net:5053/dns-query?name=${domain}&type=A" "accept: application/dns-json" || true; } | awk 'NF {print "dns_quad9\t" $0}' > "$tmpdir/dns_quad9") &
     pids+=("$!")
-    ({ json_dns_ips "https://dns.google/resolve?name=${domain}&type=A&edns_client_subnet=0.0.0.0/0" || true; } | awk 'NF {print "dns_google_ecs\t" $0}' > "$tmpdir/dns_google_ecs") &
-    pids+=("$!")
+    if wide_dns_discovery_enabled; then
+        local subnet source url_value safe_name
+        while IFS= read -r subnet; do
+            [[ -n "$subnet" ]] || continue
+            source=$(wide_dns_ecs_source_label "$subnet")
+            url_value=$(wide_dns_ecs_url_value "$subnet")
+            safe_name=$(printf '%s\n' "$source" | tr -cd 'A-Za-z0-9_')
+            ({ json_dns_ips "https://dns.google/resolve?name=${domain}&type=A&edns_client_subnet=${url_value}" || true; } \
+                | awk -v source="$source" 'NF {print source "\t" $0}' > "$tmpdir/${safe_name}") &
+            pids+=("$!")
+        done < <(wide_dns_ecs_subnets)
+    fi
     ({ curl_remote_ip "$domain" || true; } | awk 'NF {print "remote_http\t" $0}' > "$tmpdir/remote_http") &
     pids+=("$!")
     local pid
@@ -1349,6 +1408,32 @@ add_manual_route_candidate() {
     clear_route_candidate_cooldown "$ip"
     log_event INFO "route_candidate manual_added ip=${ip}"
     return 0
+}
+
+extract_ipv4_candidates_from_text() {
+    local text="${1:-}" ip
+    printf '%s\n' "$text" \
+        | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' 2>/dev/null \
+        | while IFS= read -r ip; do
+            valid_ipv4 "$ip" && printf '%s\n' "$ip"
+        done \
+        | awk '!seen[$0]++ {print}'
+}
+
+import_manual_route_candidates_from_text() {
+    local text="${1:-}" ip added=0 skipped=0 total=0
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        total=$((total + 1))
+        if add_manual_route_candidate "$ip"; then
+            added=$((added + 1))
+        else
+            skipped=$((skipped + 1))
+        fi
+    done < <(extract_ipv4_candidates_from_text "$text")
+    log_event INFO "route_candidate manual_batch_import added=${added} skipped=${skipped} candidates=${total}"
+    printf 'added=%s skipped=%s candidates=%s\n' "$added" "$skipped" "$total"
+    (( added > 0 ))
 }
 
 remove_manual_route_candidate() {
@@ -3884,7 +3969,7 @@ route_candidate_export_with_feedback() {
 }
 
 show_route_candidate_manager() {
-    local choice ip
+    local choice ip line paste_text summary
     while true; do
         refresh_screen
         echo -e "\n  ${RED}Route Candidates${NC}\n"
@@ -3896,6 +3981,7 @@ show_route_candidate_manager() {
         echo ""
         echo -e "  ${RED}1)${NC} Refresh Route Probes"
         echo -e "  ${RED}2)${NC} Add Manual IPv4 Candidate"
+        echo -e "  ${RED}22)${NC} Batch Import Manual IPv4s"
         echo -e "  ${RED}3)${NC} Pin Preferred Route"
         echo -e "  ${RED}4)${NC} Blacklist Bad Route"
         echo -e "  ${RED}5)${NC} Remove Manual Route"
@@ -3920,6 +4006,27 @@ show_route_candidate_manager() {
                     echo -e "  ${GREEN}Added.${NC}"
                 else
                     echo -e "  ${RED}Invalid, duplicate, or blacklisted IPv4.${NC}"
+                fi
+                sleep 1
+                ;;
+            22)
+                echo -e "  ${GREEN}Paste IPv4s or messy text. Submit a blank line to finish:${NC}"
+                paste_text=""
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && break
+                    paste_text+="${line}"$'\n'
+                done
+                if [[ -z "$paste_text" ]]; then
+                    echo -e "  ${YELLOW}No text entered.${NC}"
+                else
+                    summary=$(import_manual_route_candidates_from_text "$paste_text" || true)
+                    if [[ "$summary" == *"added=0"* ]]; then
+                        echo -e "  ${YELLOW}No new valid IPv4 routes were added (${summary}).${NC}"
+                    else
+                        route_candidate_refresh_with_feedback || true
+                        route_candidate_export_with_feedback || true
+                        echo -e "  ${GREEN}Batch import complete (${summary}).${NC}"
+                    fi
                 fi
                 sleep 1
                 ;;
