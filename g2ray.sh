@@ -4060,6 +4060,8 @@ show_ws_front_manager() {
         echo -e "  ${DIM}DNS: create a proxied CNAME such as ws.yourdomain.com -> ${WS_PORT_DOMAIN}${NC}"
         echo -e "  ${DIM}Origin Rule: for that hostname, override Host header to ${WS_PORT_DOMAIN}.${NC}"
         echo -e "  ${DIM}Cloudflare should also use ${WS_PORT_DOMAIN} as origin SNI; verify in Origin Rules/TLS settings.${NC}"
+        echo -e "  ${YELLOW}Cloudflare Free note: a simple proxied CNAME is not expected to be reliable here.${NC}"
+        echo -e "  ${YELLOW}This front mode needs Host/SNI override support; keep direct WS/XHTTP links otherwise.${NC}"
         echo ""
         echo -e "  ${RED}1)${NC} Set Cloudflare WS front domain"
         echo -e "  ${RED}2)${NC} Clear Cloudflare WS front domain"

@@ -571,12 +571,18 @@ test_websocket_fallback_is_advanced_opt_in() {
         || fail 'main menu does not expose Cloudflare WS front management'
     grep_fixed 'show_ws_front_manager()' "$SCRIPT" \
         || fail 'script does not provide a Cloudflare WS front manager'
+    grep_fixed 'Cloudflare Free note: a simple proxied CNAME is not expected to be reliable here.' "$SCRIPT" \
+        || fail 'panel does not warn Cloudflare Free users that simple proxied CNAME fronting is unreliable'
+    grep_fixed 'This front mode needs Host/SNI override support; keep direct WS/XHTTP links otherwise.' "$SCRIPT" \
+        || fail 'panel does not state that Cloudflare front mode needs Host/SNI override support'
     grep_fixed 'enabled, pending config regenerate' "$SCRIPT" \
         || fail 'diagnostics do not explain when saved WS preference has not been applied to config'
     grep_fixed '19) Toggle WebSocket Fallback' "$README" \
         || fail 'README does not document the WebSocket fallback panel toggle'
     grep_fixed '20) Cloudflare WS Front' "$README" \
         || fail 'README does not document the Cloudflare WS front panel manager'
+    grep_fixed 'If your Cloudflare plan cannot set Host/SNI override rules' "$README" \
+        || fail 'README does not warn that Cloudflare Free/simple CNAME fronting is unreliable'
     grep_fixed 'survives future panel sessions until you toggle it again' "$README" \
         || fail 'README does not document persistent WebSocket fallback state'
     grep_fixed 'XHTTP remains the recommended default' "$README" \
