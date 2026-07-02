@@ -1163,6 +1163,8 @@ test_route_candidate_monitor_is_bounded() {
         || fail 'route candidate diagnostics do not show route reliability'
     grep_fixed 'avg=' "$SCRIPT" \
         || fail 'route candidate diagnostics do not show average latency'
+    grep_fixed 'Probe scope  : Codespace-side route checks; your ISP/client path can still block some IPs' "$SCRIPT" \
+        || fail 'route candidate diagnostics do not warn that Codespace-side route probes can differ from the client path'
     grep_fixed 'refresh_route_candidate_health >/dev/null 2>&1 || true' "$SCRIPT" \
         || fail 'background supervisor does not refresh route candidate health'
     awk '

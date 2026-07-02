@@ -3822,6 +3822,7 @@ route_candidate_health_summary() {
     last=$(awk -F '\t' 'END{print $1}' "$ROUTE_HEALTH_FILE" 2>/dev/null)
     printf 'Last refresh : %s\n' "${last:-unknown}"
     printf 'Candidates   : pinned first, then best reliable usable routes\n'
+    printf 'Probe scope  : Codespace-side route checks; your ISP/client path can still block some IPs\n'
     stats_input="$ROUTE_STATS_FILE"
     [[ -s "$stats_input" ]] || stats_input="/dev/null"
     awk -F '\t' -v pinned="$pinned" -v stats_file="$stats_input" '
@@ -4144,23 +4145,28 @@ usable_fallback_ips() {
         mapfile -t cached_routes < <(cached_usable_fallback_ips || true)
         if ((${#cached_routes[@]})); then
             if route_export_revalidate_top_cached_enabled; then
-                ip="${cached_routes[0]}"
-                read -r ip_probe ip_ms reason < <(xhttp_probe_metrics external "$ip")
-                [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$ip_probe")
-                update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" "export_cache_revalidate" "$reason" || true
-                if xhttp_status_usable "$ip_probe"; then
-                    save_last_good_route "$ip" "$ip_probe" "$ip_ms" "export_cache_revalidate"
-                else
-                    cache_ready=false
-                    emitted="${emitted} ${ip}"
-                    [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]] \
-                        && record_route_candidate_cooldown "$ip" "$reason"
-                    log_event WARN "fallback_route_cache_stale ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
-                    if [[ "$reason" != "route_settling_404" && ${#cached_routes[@]} -gt 1 ]]; then
-                        cached_routes=("${cached_routes[@]:1}")
-                        cache_ready=true
+                cache_ready=false
+                for ip in "${cached_routes[@]}"; do
+                    [[ -n "$ip" ]] || continue
+                    valid_ipv4 "$ip" || continue
+                    candidate_blacklisted "$ip" && continue
+                    route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
+                    read -r ip_probe ip_ms reason < <(xhttp_probe_metrics external "$ip")
+                    [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$ip_probe")
+                    update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" "export_cache_revalidate" "$reason" || true
+                    if xhttp_status_usable "$ip_probe"; then
+                        printf '%s\n' "$ip"
+                        emitted="${emitted} ${ip}"
+                        usable=true
+                        count=$((count + 1))
+                        save_last_good_route "$ip" "$ip_probe" "$ip_ms" "export_cache_revalidate"
+                        (( count >= max_links )) && return 0
+                    else
+                        [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]] \
+                            && record_route_candidate_cooldown "$ip" "$reason"
+                        log_event WARN "fallback_route_cache_stale ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
                     fi
-                fi
+                done
             fi
             if [[ "$cache_ready" == true ]]; then
                 for ip in "${cached_routes[@]}"; do

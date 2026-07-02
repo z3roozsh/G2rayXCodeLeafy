@@ -1012,6 +1012,41 @@ EOF
     pass "usable fallback exports revalidate the top cached route"
 }
 
+test_usable_fallback_ips_revalidates_each_cached_route_before_export() {
+    reset_runtime_paths
+    ROUTE_HEALTH_TTL_SEC=300
+    MAX_FALLBACK_LINKS=3
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+2026-05-30T00:00:00Z	20.0.0.6	200	80	true
+2026-05-30T00:00:00Z	20.0.0.7	200	90	true
+EOF
+    resolve_domain_ips() {
+        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7 20.0.0.8
+    }
+    local probes_file="$TMP_ROOT/revalidate-each-cached.txt"
+    : > "$probes_file"
+    xhttp_probe_metrics() {
+        printf '%s\n' "$2" >> "$probes_file"
+        case "${2:-}" in
+            20.0.0.6) printf '404 44 route_settling_404\n' ;;
+            *) printf '200 60 ready\n' ;;
+        esac
+    }
+
+    mapfile -t routes < <(usable_fallback_ips)
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.7 20.0.0.8" ]] \
+        || fail "usable_fallback_ips exported stale cached route instead of replacing it: ${routes[*]:-none}"
+    grep -Fxq '20.0.0.5' "$probes_file" \
+        || fail "first cached route was not revalidated"
+    grep -Fxq '20.0.0.6' "$probes_file" \
+        || fail "second cached route was not revalidated"
+    grep -Fxq '20.0.0.7' "$probes_file" \
+        || fail "third cached route was not revalidated"
+    pass "usable fallback exports revalidate each cached route before export"
+}
+
 test_usable_fallback_ips_fills_partial_fresh_cache() {
     reset_runtime_paths
     ROUTE_HEALTH_TTL_SEC=300
@@ -1036,8 +1071,8 @@ EOF
         || fail "usable_fallback_ips did not fill partial cached routes with live probes"
     grep -Fxq '20.0.0.5' "$probes_file" \
         || fail "usable_fallback_ips did not revalidate the top cached route"
-    ! grep -Fxq '20.0.0.6' "$probes_file" \
-        || fail "usable_fallback_ips live-probed every cached route instead of only the top one"
+    grep -Fxq '20.0.0.6' "$probes_file" \
+        || fail "usable_fallback_ips did not revalidate each cached route before export"
     pass "usable fallback exports fill partial fresh cache with live-probed routes"
 }
 
@@ -2345,6 +2380,7 @@ test_dns_candidate_cache_reuses_fresh_provider_results
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
 test_usable_fallback_ips_revalidates_top_cached_route
+test_usable_fallback_ips_revalidates_each_cached_route_before_export
 test_usable_fallback_ips_fills_partial_fresh_cache
 test_usable_fallback_ips_preserves_cached_routes_when_all_live_probes_are_unusable
 test_usable_fallback_ips_caps_live_probe_fallback
