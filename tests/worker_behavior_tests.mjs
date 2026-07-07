@@ -390,6 +390,7 @@ async function testGithubStartRetriesTransientServerFailure() {
   };
 
   const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    WAKE_FAST_PATH: "0",
     GITHUB_API_RETRY_BACKOFF_MS: "0"
   }), {});
   const body = await responseJson(response);
@@ -1070,7 +1071,7 @@ async function testWakeWaitsBetweenStableRouteProbes() {
 
   const response = await worker.fetch(
     makeRequest("/api/wake"),
-    baseEnv({ ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    baseEnv({ ROUTE_READY_STABLE_SLEEP_MS: "25", WAKE_FAST_PATH: "0" }),
     {}
   );
   const body = await responseJson(response);
@@ -1113,7 +1114,7 @@ async function testWakeDoesNotClaimReadyFromSingleDeadlineProbe() {
 
   const response = await worker.fetch(
     makeRequest("/api/wake"),
-    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25", WAKE_FAST_PATH: "0" }),
     {}
   );
   const body = await responseJson(response);
@@ -1698,6 +1699,91 @@ async function testHealthRouteReadyTransitionNotification() {
   console.log("PASS: Worker notifies once when health observes route-ready transition");
 }
 
+async function testHealthRouteUrlUsesForwardingDomainOverride() {
+  let probedUrl = "";
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("ports.example.test")) {
+      probedUrl = url;
+      return new Response("", { status: 200 });
+    }
+    if (url.includes("app.github.dev")) {
+      throw new Error(`route probe ignored forwarding domain: ${url}`);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ CODESPACE_FORWARDING_DOMAIN: "ports.example.test" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.route_probe.url, "https://behavior-space-443.ports.example.test/");
+  assert.equal(probedUrl, "https://behavior-space-443.ports.example.test/");
+  console.log("PASS: Worker route probes honor forwarding-domain overrides");
+}
+
+async function testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady() {
+  let startCalls = 0;
+  let statusCalls = 0;
+  let routeCalls = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      if (url.endsWith("/start") || init.method === "POST") {
+        startCalls += 1;
+        return new Response(JSON.stringify({ message: "start should be skipped" }), {
+          status: 500,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.route_ready, true);
+  assert.equal(body.wake_fast_path, true);
+  assert.equal(body.start_accepted, false);
+  assert.equal(startCalls, 0);
+  assert.equal(statusCalls, 1);
+  assert.equal(routeCalls >= 2, true);
+  console.log("PASS: Worker wake skips GitHub start when Codespace route is already warm");
+}
+
 try {
   await testFailedSecretRateLimit();
   await testFailedSecretRateLimitCapsKvWrites();
@@ -1741,6 +1827,8 @@ try {
   await testHistorySideEffectsCanDeferWithWaitUntil();
   await testWorkerDeduplicatesNoisyHealthHistory();
   await testHealthRouteReadyTransitionNotification();
+  await testHealthRouteUrlUsesForwardingDomainOverride();
+  await testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady();
 } finally {
   globalThis.fetch = originalFetch;
 }

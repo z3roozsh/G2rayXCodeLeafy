@@ -307,6 +307,33 @@ test_port_visibility_cache_is_scoped_by_codespace_and_port() {
     pass "port visibility cache is scoped by codespace and port"
 }
 
+test_run_gh_sanitizes_invalid_timeout_env() {
+    (
+        reset_runtime_paths
+        eval "$ORIGINAL_RUN_GH"
+        unset GH_TOKEN GITHUB_TOKEN
+        G2RAY_GH_TIMEOUT_SEC="bad"
+        local timeout_file="$TMP_ROOT/gh-timeout.txt"
+        cat > "$TMP_ROOT/bin/gh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+        chmod +x "$TMP_ROOT/bin/gh"
+        cat > "$TMP_ROOT/bin/timeout" <<SH
+#!/usr/bin/env bash
+printf '%s\\n' "\${1:-}" > "$timeout_file"
+shift
+"\$@"
+SH
+        chmod +x "$TMP_ROOT/bin/timeout"
+
+        run_gh codespace list >/dev/null || fail "run_gh failed with invalid timeout env"
+        [[ "$(cat "$timeout_file" 2>/dev/null || true)" == "10" ]] \
+            || fail "run_gh did not sanitize invalid timeout env"
+    )
+    pass "run_gh sanitizes invalid timeout environment values"
+}
+
 test_lifecycle_port_publish_forces_visibility_cache() {
     (
         reset_runtime_paths
@@ -1131,7 +1158,7 @@ EOF
     pass "usable fallback exports fill partial fresh cache with live-probed routes"
 }
 
-test_usable_fallback_ips_preserves_cached_routes_when_all_live_probes_are_unusable() {
+test_usable_fallback_ips_uses_domain_only_when_all_live_probes_are_unusable_by_default() {
     reset_runtime_paths
     ROUTE_HEALTH_TTL_SEC=300
     MAX_FALLBACK_LINKS=3
@@ -1148,11 +1175,35 @@ EOF
     }
 
     mapfile -t routes < <(usable_fallback_ips)
+    ((${#routes[@]} == 0)) || fail "usable_fallback_ips exported stale cached routes by default: ${routes[*]:-none}"
+    grep -Fq 'fallback_route_filter no-usable-probes action=domain-only' "$LOG_FILE" \
+        || fail "all-probe failure did not fall back to domain-only by default"
+    pass "usable fallback exports use domain-only when all live probes are unusable by default"
+}
+
+test_usable_fallback_ips_can_opt_in_to_stale_cached_routes() {
+    reset_runtime_paths
+    ROUTE_HEALTH_TTL_SEC=300
+    MAX_FALLBACK_LINKS=3
+    G2RAY_ALLOW_STALE_FALLBACK_EXPORT=1
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+2026-05-30T00:00:00Z	20.0.0.6	200	80	true
+EOF
+    resolve_domain_ips() {
+        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7
+    }
+    xhttp_probe_metrics() {
+        printf '404 50 route_settling_404\n'
+    }
+
+    mapfile -t routes < <(usable_fallback_ips)
     [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] \
-        || fail "usable_fallback_ips did not preserve cached routes during temporary 404: ${routes[*]:-none}"
+        || fail "usable_fallback_ips did not preserve cached routes when explicitly enabled: ${routes[*]:-none}"
     grep -Fq 'fallback_route_filter no-usable-probes action=cached-stale' "$LOG_FILE" \
-        || fail "temporary all-probe failure did not log cached-stale export preservation"
-    pass "usable fallback exports preserve cached routes during temporary route settling"
+        || fail "explicit stale fallback export did not log cached-stale"
+    pass "usable fallback exports can explicitly preserve cached routes during temporary route settling"
 }
 
 test_usable_fallback_ips_caps_live_probe_fallback() {
@@ -1447,6 +1498,52 @@ test_refresh_config_exports_if_changed_skips_unchanged_inputs() {
     [[ "$calls" -eq 1 ]] || fail "unchanged export inputs regenerated links $calls times"
     grep -Fq 'config_exports unchanged' "$LOG_FILE" || fail "unchanged export refresh was not logged"
     pass "unchanged export inputs skip regeneration"
+}
+
+test_refresh_config_exports_updates_input_hash_after_direct_refresh() {
+    reset_runtime_paths
+    BASE_DIR="$TMP_ROOT"
+    MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
+    SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
+    CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    printf 'old-hash\n' > "$EXPORT_INPUT_HASH_FILE"
+    generate_ordered_links() {
+        printf 'vless://example@20.0.0.1:443?encryption=none#one\n'
+    }
+
+    local expected actual
+    expected=$(export_input_hash)
+    refresh_config_exports >/dev/null || fail "direct export refresh failed"
+    actual=$(cat "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true)
+    [[ -n "$expected" && "$actual" == "$expected" ]] \
+        || fail "direct export refresh did not update input hash"
+    pass "direct export refresh updates the input hash"
+}
+
+test_force_reconnect_skips_restart_when_identity_unknown() {
+    (
+        reset_runtime_paths
+        _detect_codespace_name() { printf 'unknown-codespace\n'; }
+        refresh_port_domains() { PORT_DOMAIN="unknown-codespace-443.app.github.dev"; }
+        stop_xray() { fail "force_reconnect should not stop Xray when identity is unknown"; }
+        start_xray() { fail "force_reconnect should not start Xray when identity is unknown"; }
+        ensure_codespace_port_public() { fail "force_reconnect should not expose ports when identity is unknown"; }
+
+        local rc=0
+        if _force_reconnect_impl --no-prompt >/dev/null; then
+            fail "force_reconnect succeeded with unknown Codespaces identity"
+        else
+            rc=$?
+        fi
+        [[ "$rc" -eq 1 ]] || fail "force_reconnect returned unexpected status $rc for unknown identity"
+        grep -Fq 'force_reconnect identity_unknown action=abort' "$LOG_FILE" \
+            || fail "force_reconnect did not log identity_unknown abort"
+    )
+    pass "force reconnect skips destructive restart when Codespaces identity is unknown"
 }
 
 test_generated_links_follow_configured_xhttp_path() {
@@ -2403,6 +2500,7 @@ test_runtime_lock_serializes_operations_and_allows_reentry
 test_stop_xray_succeeds_when_engine_is_already_stopped
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_lifecycle_port_publish_forces_visibility_cache
+test_run_gh_sanitizes_invalid_timeout_env
 test_background_start_reports_lock_failure_without_live_supervisor
 test_stale_temp_sweep_removes_only_old_owned_artifacts
 test_logs_reset_when_script_code_changes
@@ -2439,7 +2537,8 @@ test_usable_fallback_ips_uses_fresh_cache
 test_usable_fallback_ips_revalidates_top_cached_route
 test_usable_fallback_ips_revalidates_each_cached_route_before_export
 test_usable_fallback_ips_fills_partial_fresh_cache
-test_usable_fallback_ips_preserves_cached_routes_when_all_live_probes_are_unusable
+test_usable_fallback_ips_uses_domain_only_when_all_live_probes_are_unusable_by_default
+test_usable_fallback_ips_can_opt_in_to_stale_cached_routes
 test_usable_fallback_ips_caps_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
@@ -2453,6 +2552,8 @@ test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports
 test_refresh_config_exports_if_changed_skips_unchanged_inputs
+test_refresh_config_exports_updates_input_hash_after_direct_refresh
+test_force_reconnect_skips_restart_when_identity_unknown
 test_generated_links_follow_configured_xhttp_path
 test_xhttp_mode_is_persistent_and_link_consistent
 test_custom_xhttp_extra_json_is_validated

@@ -773,8 +773,10 @@ test_probe_and_gh_commands_are_bounded() {
     fi
     grep_fixed 'run_gh()' "$SCRIPT" \
         || fail 'script has no bounded gh helper'
-    grep_fixed 'timeout "${G2RAY_GH_TIMEOUT_SEC:-10}" gh' "$SCRIPT" \
-        || fail 'gh helper does not bound GitHub CLI calls with timeout'
+    grep_fixed 'gh_timeout_seconds()' "$SCRIPT" \
+        || fail 'gh helper has no timeout sanitizer'
+    grep_fixed 'timeout "$(gh_timeout_seconds)" gh' "$SCRIPT" \
+        || fail 'gh helper does not bound GitHub CLI calls with sanitized timeout'
     grep_fixed 'run_gh codespace list --limit 1 --json name --jq' "$SCRIPT" \
         || fail 'codespace name detection still bypasses the bounded gh helper'
     grep_fixed 'ensure_codespace_port_public_for_port()' "$SCRIPT" \

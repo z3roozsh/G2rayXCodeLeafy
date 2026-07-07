@@ -67,6 +67,10 @@ If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as
 
 Optional: add `CODESPACE_PORT` as a **Plaintext** variable only if you changed the panel's `XRAY_PORT`. Leave it unset for the default port `443`.
 
+Optional: add `CODESPACE_FORWARDING_DOMAIN` as a **Plaintext** variable only if GitHub changes the Codespaces forwarding domain from `app.github.dev`. The Worker also accepts `CODESPACE_PORT_FORWARDING_DOMAIN` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN`.
+
+Optional: set `WAKE_FAST_PATH=0` as a **Plaintext** variable to disable the default warm-route fast path. With the default `WAKE_FAST_PATH=1`, `/wake` first does a cheap route probe; if the route is already stable and GitHub says the Codespace is Available, it returns success without calling GitHub's `/start` API again.
+
 Optional history: create a Cloudflare KV namespace and bind it as `WAKER_KV`. Without this binding, the dashboard still works but shows history as disabled. With `WAKER_KV`, it stores recent wake/health events, route HTTP status, latency, route wait time, and last failures under a per-Codespace key so the dashboard can show repeated HTTP `404` settling and latency trends. Identical health polls are sampled with `HEALTH_HISTORY_SAMPLE_MS` (default 5 minutes) so the history stays readable. `WAKER_KV` is also recommended for public deployments because it enables failed wake-secret lockout and optional successful-wake cooldown. Cloudflare KV is eventually consistent, so this is a practical anti-spam guard rather than a strict atomic security boundary.
 
 Quota survival history also uses `WAKER_KV`. When GitHub returns HTTP `402`, the Worker records the first quota block, latest quota block, estimated monthly reset, retention/deletion fields from GitHub, and the next later successful wake or health check. This helps confirm that the same Codespace survived into the next monthly reset.

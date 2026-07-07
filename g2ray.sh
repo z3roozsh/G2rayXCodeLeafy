@@ -721,10 +721,16 @@ run_gh() {
     fi
     if command -v timeout >/dev/null 2>&1; then
         env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 \
-            timeout "${G2RAY_GH_TIMEOUT_SEC:-10}" gh "$@"
+            timeout "$(gh_timeout_seconds)" gh "$@"
     else
         env "${token_env[@]}" GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 gh "$@"
     fi
+}
+
+gh_timeout_seconds() {
+    local timeout_sec="${G2RAY_GH_TIMEOUT_SEC:-10}"
+    [[ "$timeout_sec" =~ ^[0-9]+$ && "$timeout_sec" -gt 0 && "$timeout_sec" -le 120 ]] || timeout_sec=10
+    printf '%s' "$timeout_sec"
 }
 
 curl_http_code() {
@@ -4237,6 +4243,13 @@ safe_ws_fallback_links() {
     printf '%s' "$max"
 }
 
+stale_fallback_export_enabled() {
+    case "${G2RAY_ALLOW_STALE_FALLBACK_EXPORT:-0}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 usable_fallback_ips() {
     local ip ip_probe ip_ms reason count=0 max_links candidates usable probe_cap min_probe_cap probed=0 emitted=""
     local cached_routes=() cache_ready=true
@@ -4316,7 +4329,7 @@ usable_fallback_ips() {
         (( count >= max_links )) && return 0
     done <<< "$candidates"
     if [[ "${usable:-false}" != true ]]; then
-        if ((${#cached_routes[@]})); then
+        if stale_fallback_export_enabled && ((${#cached_routes[@]})); then
             local stale_count=0
             for ip in "${cached_routes[@]}"; do
                 [[ -n "$ip" ]] || continue
@@ -4330,7 +4343,7 @@ usable_fallback_ips() {
                 return 0
             fi
         fi
-        log_event WARN "fallback_route_filter no-usable-probes action=domain-only"
+        log_event WARN "fallback_route_filter no-usable-probes action=domain-only stale_cached_available=${#cached_routes[@]}"
     fi
 }
 
@@ -4495,6 +4508,10 @@ refresh_config_exports() {
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     ((${#link_array[@]})) || { clear_config_exports "no_exportable_links"; return 1; }
     write_config_exports_from_links "${link_array[@]}"
+    local new_hash
+    new_hash=$(export_input_hash)
+    _atomic_write "$EXPORT_INPUT_HASH_FILE" "$new_hash" >/dev/null 2>&1 || true
+    chmod 600 "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true
 }
 
 refresh_config_exports_if_changed() {
@@ -4507,9 +4524,6 @@ refresh_config_exports_if_changed() {
         return 0
     fi
     refresh_config_exports || return 1
-    new_hash=$(export_input_hash)
-    _atomic_write "$EXPORT_INPUT_HASH_FILE" "$new_hash" >/dev/null 2>&1 || true
-    chmod 600 "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true
 }
 
 log_diagnostic_snapshot() {
@@ -5044,6 +5058,13 @@ _force_reconnect_impl() {
     [[ "$CODESPACE_NAME" == "unknown-codespace" ]] \
         && echo -e "${RED}Failed${NC}" \
         || echo -e "${GREEN}${CODESPACE_NAME}${NC}"
+    if [[ "$CODESPACE_NAME" == "unknown-codespace" ]]; then
+        log_event ERROR "force_reconnect identity_unknown action=abort"
+        echo -e "\n  ${YELLOW}Codespaces identity is unavailable, so hard reconnect was skipped.${NC}\n"
+        [[ "$no_prompt" == "--no-prompt" ]] && return 1
+        echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+        return 1
+    fi
 
     echo -ne "  ${DIM}├─${NC} Force Kill Engine : "
     if stop_xray >/dev/null 2>&1; then

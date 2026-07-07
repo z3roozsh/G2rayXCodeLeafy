@@ -69,7 +69,13 @@ async function handleWake(request, env, ctx) {
   const cooldown = await rateLimitSuccessfulWake(context.codespaceName, env);
   if (cooldown) return json(cooldown.body, cooldown.status, retryHeaders(cooldown.body));
 
-  const data = withSurvivalFields(await startCodespaceData(context.codespaceName, context.token, env), env);
+  const warmData = wakeFastPathEnabled(env)
+    ? await alreadyWarmCodespaceData(context.codespaceName, context.token, env)
+    : null;
+  const data = withSurvivalFields(
+    warmData || await startCodespaceData(context.codespaceName, context.token, env),
+    env
+  );
   data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
   data.next_action_code = data.next_action_code || nextActionCodeFor(data, data.route_probe || {});
   const responseStatus = responseStatusFor(data);
@@ -95,6 +101,35 @@ async function handleWake(request, env, ctx) {
   }, responseStatus, retryHeaders(responseData));
 }
 
+function wakeFastPathEnabled(env = {}) {
+  const value = String(env.WAKE_FAST_PATH ?? "1").trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(value);
+}
+
+async function alreadyWarmCodespaceData(name, token, env) {
+  const firstProbe = await probeXhttpRoute(name, codespacePort(env), 1, Date.now(), env);
+  if (!firstProbe.usable) return null;
+
+  const status = await getCodespaceStatus(name, token, env);
+  if (!isCodespaceAvailable(status)) return null;
+
+  const routeProbe = await waitForXhttpRoute(name, codespacePort(env), env);
+  if (!isRouteReadyProbe(routeProbe)) return null;
+  routeProbe.attempts = Number(routeProbe.attempts || 0) + Number(firstProbe.attempts || 1);
+  routeProbe.fast_path_precheck_attempts = Number(firstProbe.attempts || 1);
+
+  return {
+    ...status,
+    ok: true,
+    wake_fast_path: true,
+    start_accepted: false,
+    route_ready: true,
+    route_probe: routeProbe,
+    next_action: "Try the same VLESS config again.",
+    message: "Codespace is already available and the XHTTP route is usable."
+  };
+}
+
 async function handleHealth(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);
   if (!context.ok) return json(context.body, context.status, retryHeaders(context.body));
@@ -106,8 +141,8 @@ async function handleHealth(request, env, ctx) {
   const routeChecked = status.ok && checkRoute;
   const routeProbe = routeChecked
     ? await waitForXhttpRoute(codespaceName, codespacePort(env), env)
-    : {
-        url: routeUrl(codespaceName, codespacePort(env)),
+      : {
+        url: routeUrl(codespaceName, codespacePort(env), env),
         usable: false,
         http_status: checkRoute ? 0 : null,
         latency_ms: null,
@@ -1331,7 +1366,7 @@ async function waitForXhttpRoute(name, port, env) {
   let attempts = 0;
   let stableProbes = 0;
   let last = {
-    url: routeUrl(name, port),
+    url: routeUrl(name, port, env),
     usable: false,
     http_status: 0,
     latency_ms: null,
@@ -1343,7 +1378,7 @@ async function waitForXhttpRoute(name, port, env) {
 
   while (attempts === 0 || Date.now() < deadline) {
     attempts += 1;
-    last = await probeXhttpRoute(name, port, attempts, startedAt);
+    last = await probeXhttpRoute(name, port, attempts, startedAt, env);
     if (last.usable) {
       stableProbes += 1;
       last.stable_probes = stableProbes;
@@ -1372,8 +1407,8 @@ async function waitForXhttpRoute(name, port, env) {
   return last;
 }
 
-async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now()) {
-  const url = routeUrl(name, port);
+async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now(), env = {}) {
+  const url = routeUrl(name, port, env);
   const probeStartedAt = Date.now();
   try {
     const res = await fetchWithTimeout(url, { method: "OPTIONS", redirect: "manual" }, ROUTE_FETCH_TIMEOUT_MS);
@@ -1445,8 +1480,23 @@ function githubRetryDelayMs(env, attempt) {
   return Math.min(5000, base * Math.max(1, attempt));
 }
 
-function routeUrl(name, port) {
-  return `https://${name}-${port}.app.github.dev/`;
+function routeUrl(name, port, env = {}) {
+  return `https://${name}-${port}.${codespacesForwardingDomain(env)}/`;
+}
+
+function codespacesForwardingDomain(env = {}) {
+  const raw = env.CODESPACE_FORWARDING_DOMAIN
+    || env.CODESPACE_PORT_FORWARDING_DOMAIN
+    || env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
+    || "app.github.dev";
+  const value = String(raw)
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/.*$/, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
+  if (!/^[a-z0-9.-]+$/.test(value) || !value.includes(".")) return "app.github.dev";
+  return value;
 }
 
 function isRouteStatusUsable(status) {
