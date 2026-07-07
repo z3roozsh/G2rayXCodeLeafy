@@ -1388,6 +1388,21 @@ test_config_exports_write_local_only_metadata() {
     pass "config exports write machine-readable local-only metadata"
 }
 
+test_config_exports_report_write_failure() {
+    reset_runtime_paths
+    MOBILE_CONFIG_FILE="$TMP_ROOT/missing-parent/configs-to-copy-for-mobile.txt"
+    SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
+    CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
+    rm -f "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE"
+
+    if write_config_exports_from_links "vless://example-one" >/dev/null 2>&1; then
+        fail "config export writer reported success when mobile export write failed"
+    fi
+    [[ ! -e "$SUBSCRIPTION_FILE" ]] \
+        || fail "config export writer continued to write subscription after mobile export failure"
+    pass "config exports report write failures instead of masking them"
+}
+
 test_config_exports_are_stable_client_artifacts() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -2547,6 +2562,7 @@ test_generate_config_keeps_previous_config_when_candidate_validation_fails
 test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection
 test_generate_config_rolls_back_when_valid_candidate_cannot_start
 test_config_exports_write_local_only_metadata
+test_config_exports_report_write_failure
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available

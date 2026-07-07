@@ -4448,10 +4448,10 @@ write_config_exports_from_links() {
     local links encoded count hash
     links=$(printf '%s\n' "$@" | awk 'NF')
     [[ -n "$links" ]] || return 1
-    _atomic_write "$MOBILE_CONFIG_FILE" "$links"
+    _atomic_write "$MOBILE_CONFIG_FILE" "$links" || return 1
     if command -v base64 >/dev/null 2>&1; then
         encoded=$(printf '%s\n' "$links" | base64 | tr -d '\n')
-        _atomic_write "$SUBSCRIPTION_FILE" "$encoded"
+        _atomic_write "$SUBSCRIPTION_FILE" "$encoded" || return 1
     fi
     count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
     hash=$(fingerprint_secret "$links")
