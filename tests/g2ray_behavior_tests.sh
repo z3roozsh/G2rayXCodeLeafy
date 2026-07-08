@@ -2276,6 +2276,38 @@ test_recover_now_json_treats_followup_ready_probe_as_success() {
     pass "recover now json treats follow-up ready probe as success"
 }
 
+test_silent_start_headless_recover_repairs_route_404() {
+    (
+        reset_runtime_paths
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        local recover_calls=0
+        xhttp_probe_metrics() {
+            if (( recover_calls > 0 )); then
+                printf '200 9 ready\n'
+            else
+                printf '404 33 route_settling_404\n'
+            fi
+        }
+        recover_now() {
+            [[ "${1:-}" == "--no-prompt" ]] || fail "silent-start recover did not use no-prompt mode"
+            recover_calls=$((recover_calls + 1))
+            return 0
+        }
+        reset_route_bad_count() { return 0; }
+        reset_edge_bad_count() { return 0; }
+
+        silent_start_attempt_headless_recover "silent_start" >/dev/null \
+            || fail "silent-start headless recovery did not report ready after recover"
+        [[ "$recover_calls" -eq 1 ]] \
+            || fail "expected exactly one headless recover call, got $recover_calls"
+        grep -Fq 'runtime_ready reason=silent_start headless_recover_ready' "$LOG_FILE" \
+            || fail "silent-start headless recovery did not log ready state"
+    )
+    pass "silent-start headless recovery repairs route-settling 404"
+}
+
 test_diagnostic_snapshot_writes_readable_history() {
     reset_runtime_paths
     CODESPACE_NAME="behavior-space"
@@ -2598,6 +2630,7 @@ test_recover_now_stops_after_engine_start_failure
 test_recover_now_json_reports_ready_contract
 test_recover_now_json_reports_settling_contract
 test_recover_now_json_treats_followup_ready_probe_as_success
+test_silent_start_headless_recover_repairs_route_404
 test_diagnostic_snapshot_writes_readable_history
 test_diagnostic_log_rotation_keeps_readable_history
 test_structured_log_jsonl_is_parseable_with_special_chars

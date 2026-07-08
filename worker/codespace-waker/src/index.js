@@ -421,7 +421,7 @@ async function startCodespaceData(name, token, env) {
     next_action: nextActionForWake(readyState, routeProbe),
     message: routeReady
       ? "Codespace start request accepted and the XHTTP route is usable."
-      : "Codespace start request accepted, but the XHTTP route is still settling. Wait and try again; if it stays 404, open the panel and use option 6 Recover Now."
+      : "Codespace start request accepted, but the XHTTP route is still settling. The Codespace post-start recovery should keep working headlessly; keep this page open or press Check Health again shortly."
   };
 }
 
@@ -830,7 +830,7 @@ function nextActionForWake(status, routeProbe) {
   if (routeProbe.usable) return "Try the same VLESS config again.";
   if (routeProbe.route_failure_reason === "edge_or_origin_error") return "GitHub's edge or origin returned a server error. Wait briefly, then Check Health; if it persists, open the panel and Recover Now.";
   if (routeProbe.route_failure_reason === "timeout_or_unreachable" || routeProbe.route_failure_reason === "dns_tls_or_network_unreachable") return "The app.github.dev route did not answer from Cloudflare. Open the Codespace once, then check port visibility and panel diagnostics.";
-  if (routeProbe.http_status === 404) return "Open the panel, check option 14 Diagnostics, then use option 6 Recover Now if the route stays 404.";
+  if (routeProbe.http_status === 404) return "The Codespace is available, but the app.github.dev route is still 404. Headless post-start recovery should keep repairing it; press Check Health again shortly. Open the panel only if it stays 404 for several minutes.";
   if (routeProbe.http_status === 0) return "The app.github.dev route did not resolve or answer. Open the Codespace once, then check port 443 visibility and panel diagnostics.";
   return "Check panel option 14 Diagnostics; if XHTTP is not usable, use option 6 Recover Now.";
 }

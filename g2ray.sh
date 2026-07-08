@@ -2229,6 +2229,35 @@ wait_for_xhttp_route_ready() {
     return 1
 }
 
+silent_start_attempt_headless_recover() {
+    local reason="${1:-silent_start}" xcode=0 xms=0 probe_reason="" recover_rc=0
+    read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
+    if xhttp_status_usable "$xcode"; then
+        log_event INFO "runtime_ready reason=${reason} headless_recover_skip route_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+        return 0
+    fi
+    if [[ "${xcode:-0}" != "404" ]]; then
+        log_event WARN "runtime_ready reason=${reason} headless_recover_skip xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-unknown}"
+        return 1
+    fi
+
+    log_event WARN "runtime_ready reason=${reason} headless_recover_begin xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-route_settling_404}"
+    if recover_now --no-prompt >/dev/null 2>&1; then
+        recover_rc=0
+    else
+        recover_rc=$?
+    fi
+    read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
+    if xhttp_status_usable "$xcode"; then
+        reset_route_bad_count
+        reset_edge_bad_count
+        log_event INFO "runtime_ready reason=${reason} headless_recover_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} recover_rc=${recover_rc}"
+        return 0
+    fi
+    log_event WARN "runtime_ready reason=${reason} headless_recover_still_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-unknown} recover_rc=${recover_rc}"
+    return 1
+}
+
 record_route_settling_metric() {
     local reason="$1" result="$2" code="$3" ms="$4" wait_sec="$5" attempts="$6" checked
     checked=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
@@ -5547,10 +5576,13 @@ if [[ "${1:-}" == "--silent-start" ]]; then
     elif ensure_runtime_ready "silent_start" >/dev/null 2>&1; then
         read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
         write_boot_status "ready" "silent_start" "Xray started and the Codespaces route is usable." "${_boot_code:-0}" "${_boot_ms:-0}"
+    elif silent_start_attempt_headless_recover "silent_start"; then
+        read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
+        write_boot_status "ready" "silent_start" "Xray started and headless route recovery made the Codespaces route usable." "${_boot_code:-0}" "${_boot_ms:-0}"
     else
         read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
         if [[ "${_boot_code:-0}" == "404" ]]; then
-            write_boot_status "route_settling" "silent_start" "Xray is up, but GitHub's app route is still settling. Wait, check health, or run Recover Now." "${_boot_code:-0}" "${_boot_ms:-0}"
+            write_boot_status "route_settling" "silent_start" "Xray is up, but GitHub's app route is still settling after automatic headless recovery. Keep checking health; open the panel only if it remains 404 for several minutes." "${_boot_code:-0}" "${_boot_ms:-0}"
         else
             write_boot_status "needs_attention" "silent_start" "Startup completed but the external route is not usable yet." "${_boot_code:-0}" "${_boot_ms:-0}"
         fi

@@ -213,6 +213,7 @@ async function testWakeSettlingIncludesRetryMetadata() {
   assert.equal(body.poll_after_seconds, 5);
   assert.equal(body.route_probe.route_failure_reason, "route_settling_404");
   assert.equal(body.next_action_code, "wait_route_or_recover");
+  assert.match(body.next_action, /headless/i);
   console.log("PASS: Worker settling responses include retry and route failure metadata");
 }
 

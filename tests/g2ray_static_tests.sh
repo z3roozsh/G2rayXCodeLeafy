@@ -699,6 +699,8 @@ test_runtime_control_paths_are_hardened() {
         || fail 'wait_for_port still succeeds on any listener bound to the port'
     grep_fixed 'elif ensure_runtime_ready "silent_start" >/dev/null 2>&1; then' "$SCRIPT" \
         || fail '--silent-start does not use the non-fatal health-gated startup path'
+    grep_fixed 'elif silent_start_attempt_headless_recover "silent_start"; then' "$SCRIPT" \
+        || fail '--silent-start does not run headless route recovery before asking for manual panel recovery'
     grep_fixed 'write_boot_status "route_settling" "silent_start"' "$SCRIPT" \
         || fail '--silent-start does not persist route-settling boot status'
     grep_fixed 'if stop_xray; then' "$SCRIPT" \
