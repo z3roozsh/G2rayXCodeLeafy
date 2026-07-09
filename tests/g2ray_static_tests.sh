@@ -1679,16 +1679,11 @@ test_runtime_files_are_private_and_tempfiles_are_unique() {
     if grep_fixed 'local tmp="/tmp/g2ray_remote.sh"' "$SCRIPT"; then
         fail 'self-update still uses a predictable /tmp path'
     fi
-    if grep_fixed '> /tmp/g2ray_msg_tmp.txt' "$SCRIPT"; then
-        fail 'remote message fetch still uses a predictable /tmp path'
-    fi
     if grep_fixed '> /tmp/gas_resp.txt' "$SCRIPT"; then
         fail 'removed public-sharing response still uses a predictable /tmp path'
     fi
     grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_remote.XXXXXX"' "$SCRIPT" \
         || fail 'self-update does not stage downloads through mktemp'
-    grep_fixed 'mktemp "${TMPDIR:-/tmp}/g2ray_msg.XXXXXX"' "$SCRIPT" \
-        || fail 'remote message fetch does not stage through mktemp'
     pass 'runtime files are private and tempfiles are unique'
 }
 
@@ -1874,8 +1869,11 @@ test_xhttp_route_settling_is_observable() {
 }
 
 test_docs_and_public_configs_are_consistent() {
-    grep_fixed '1-to-17' "$README" \
-        || fail 'README menu count is stale'
+    if grep_fixed '1-to-17' "$README" || grep_fixed '1 to 17' "$README"; then
+        fail 'README menu count is stale'
+    fi
+    grep_fixed 'numbered menu actions grouped by core controls' "$README" \
+        || fail 'README does not describe the current grouped menu'
     if grep_fixed 'did now get shown' "$README"; then
         fail 'README still contains the "did now" typo'
     fi
@@ -1980,8 +1978,9 @@ test_devcontainer_tooling_is_not_duplicated() {
         || fail 'devcontainer does not install Node 22 for current Wrangler'
     grep_fixed '.devcontainer/Dockerfile text eol=lf' "$ROOT_DIR/.gitattributes" \
         || fail 'Dockerfile line endings are not pinned to LF'
-    grep_fixed 'assets/message.txt text eol=lf' "$ROOT_DIR/.gitattributes" \
-        || fail 'message.txt line endings are not pinned to LF'
+    if grep_fixed 'assets/message.txt' "$ROOT_DIR/.gitattributes"; then
+        fail 'removed message.txt asset is still pinned in .gitattributes'
+    fi
     pass 'devcontainer tooling and LF policy are clean'
 }
 
@@ -1999,6 +1998,9 @@ test_devcontainer_post_start_wrapper_is_present() {
 test_menu_loop_and_link_output_are_tidy() {
     if grep_fixed '( fetch_remote_message >/dev/null 2>&1 & )' "$SCRIPT"; then
         fail 'menu loop still starts a redundant remote-message fetch every render'
+    fi
+    if grep_fixed 'fetch_remote_message' "$SCRIPT" || grep_fixed 'REMOTE_MESSAGE_FILE' "$SCRIPT"; then
+        fail 'removed remote-message fetch path still exists'
     fi
     if awk '
         /generate_ip_links\(\)/ { in_fn=1 }

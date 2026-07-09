@@ -1,1 +1,0 @@
-Personal testing only. Keep generated configs private and local to your own Codespace.

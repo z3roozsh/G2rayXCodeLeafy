@@ -23,9 +23,6 @@ https://github.com/user-attachments/assets/79174a4a-ef86-4c1d-9f1a-909d0b29a248
 
 <br>
 
-<!-- 📸 Panel Preview Image -->
-<img src="assets/preview.png" alt="G2ray Panel Preview" width="720" style="border-radius: 12px; border: 1px solid rgba(0,0,0,0.05);">
-
 </div>
 
 <br>
@@ -190,7 +187,7 @@ The panel saves high-resolution QR PNG files under `data/qr/` for the displayed 
 
 ## Usage
 
-When launched, the panel provides a 1-to-17 numerical selection menu. Simply type the number corresponding to the action you want to take.
+When launched, the panel provides numbered menu actions grouped by core controls, system configuration, and analytics tools. Type the number corresponding to the action you want to take.
 
 ```bash
 # If panel did not get shown:

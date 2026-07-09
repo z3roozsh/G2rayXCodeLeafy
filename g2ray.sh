@@ -65,7 +65,6 @@ BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
 RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
 WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
 WAKER_PROMPT_FILE="$DATA_DIR/.waker_setup_prompted"
-REMOTE_MESSAGE_FILE="$DATA_DIR/message.txt"
 ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
 EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
 EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
@@ -2032,18 +2031,6 @@ check_for_updates() {
     sleep 1
 }
 
-fetch_remote_message() {
-    local tmp
-    tmp=$(mktemp "${TMPDIR:-/tmp}/g2ray_msg.XXXXXX") || return 0
-    curl -s -m 4 "${RAW_BASE_URL}/assets/message.txt" \
-        > "$tmp" 2>/dev/null || true
-    if [[ -s "$tmp" ]]; then
-        mv -f "$tmp" "$REMOTE_MESSAGE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
-    else
-        rm -f "$tmp" 2>/dev/null || true
-    fi
-}
-
 enable_anti_sleep() {
     tmux has-session -t g2ray_keepalive 2>/dev/null && return 0
 cat > "$DATA_DIR/keepalive.sh" << 'EOF'
@@ -2566,7 +2553,7 @@ xray_validate_config_file() {
     [[ -f "$config_file" ]] || return 1
     if command -v jq >/dev/null 2>&1 && ! jq . "$config_file" >/dev/null 2>&1; then
         log_event ERROR "xray_config_json_invalid file=$(basename "$config_file")"
-        echo -e "  ${RED}âœ– Xray config JSON is invalid.${NC}"
+        echo -e "  ${RED}ERROR: Xray config JSON is invalid.${NC}"
         return 1
     fi
     tmp=$(mktemp "${LOG_DIR}/xray-configtest.XXXXXX.log" 2>/dev/null || mktemp "/tmp/xray-configtest.XXXXXX.log") || return 1
@@ -2575,7 +2562,7 @@ xray_validate_config_file() {
         return 0
     fi
     log_event ERROR "start_xray config_test_failed file=$(basename "$config_file") log=${tmp}"
-    echo -e "  ${RED}âœ– Xray config validation failed. See:${NC} ${WHITE}${tmp}${NC}"
+    echo -e "  ${RED}ERROR: Xray config validation failed. See:${NC} ${WHITE}${tmp}${NC}"
     tail -n 8 "$tmp" 2>/dev/null | sed 's/^/  /' || true
     return 1
 }
@@ -2765,7 +2752,6 @@ _background_tasks() {
         else
             (( ++route_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
             (( ++export_tick >= 5 )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true; export_tick=0; }
-            (( ++tick >= 3 )) && { fetch_remote_message; tick=0; }
         fi
     done
 }
@@ -5354,7 +5340,6 @@ bench_rebind_runtime_paths() {
     RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     WAKER_PROMPT_FILE="$DATA_DIR/.waker_setup_prompted"
-    REMOTE_MESSAGE_FILE="$DATA_DIR/message.txt"
     ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
     EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
     EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
@@ -5605,7 +5590,6 @@ trap 'exit 143' TERM
 check_for_updates "$@"
 ensure_runtime_ready "interactive_attach" >/dev/null 2>&1 || true
 start_background_tasks
-fetch_remote_message
 enable_anti_sleep
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -5700,14 +5684,6 @@ while true; do
     echo ""
     echo -e "   ${RED}0)${NC} Exit Panel"
     echo -e "  ${DIM}───────────────────────────────────────────────────────────${NC}"
-
-    if [[ -s "$REMOTE_MESSAGE_FILE" ]]; then
-        local_msg=$(sed 's/\r//g' "$REMOTE_MESSAGE_FILE" 2>/dev/null)
-        if [[ "$local_msg" != *"404"* && -n "$(printf '%s' "$local_msg" | tr -d ' \n\t')" ]]; then
-            echo -e "  ${YELLOW}📢 Dev Note: ${WHITE}${local_msg}${NC}"
-            echo -e "  ${DIM}───────────────────────────────────────────────────────────${NC}"
-        fi
-    fi
 
     echo -ne "  ${RED}╰─❯${NC} "
     read -r _choice
