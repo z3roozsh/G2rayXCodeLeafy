@@ -38,13 +38,44 @@ if [ "$ans" = "switch" ]; then
 fi
 gh auth setup-git >/dev/null 2>&1 || true
 
+ensure_git_identity() {
+    local git_name git_email
+    git_name=$(git config user.name 2>/dev/null || true)
+    git_email=$(git config user.email 2>/dev/null || true)
+    if [ -z "$git_name" ]; then
+        git config user.name "$user"
+        echo "Configured local git user.name as $user."
+    fi
+    if [ -z "$git_email" ]; then
+        git config user.email "${user}@users.noreply.github.com"
+        echo "Configured local git user.email as ${user}@users.noreply.github.com."
+    fi
+}
+
+normalize_visibility() {
+    local value
+    value=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$value" in
+        ""|public) printf 'public\n' ;;
+        private) printf 'private\n' ;;
+        *) return 1 ;;
+    esac
+}
+
 # --- Repository name and visibility ---
 default=$(basename "$PWD")
 read -rp "Repository name [$default]: " repo; repo=${repo:-$default}
-read -rp "Visibility - type 'private' or 'public' [private]: " vis; [ "$vis" = "public" ] || vis=private
+while true; do
+    read -rp "Visibility - type 'private' or 'public' [public]: " vis
+    if vis=$(normalize_visibility "$vis"); then
+        break
+    fi
+    echo "Invalid visibility. Type 'public', 'private', or press Enter for public."
+done
 slug="$user/$repo"
 
 # --- Commit pending local changes so GitHub matches local exactly ---
+ensure_git_identity
 git add -A
 if ! git diff --cached --quiet; then
     read -rp "Commit message [Update G2rayXCodeLeafy]: " msg; msg=${msg:-Update G2rayXCodeLeafy}

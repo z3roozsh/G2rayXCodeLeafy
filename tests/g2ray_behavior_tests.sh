@@ -1403,6 +1403,28 @@ test_config_exports_report_write_failure() {
     pass "config exports report write failures instead of masking them"
 }
 
+test_refresh_config_exports_reports_write_failure() {
+    reset_runtime_paths
+    (
+        printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+        MOBILE_CONFIG_FILE="$TMP_ROOT/missing-parent/configs-to-copy-for-mobile.txt"
+        SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
+        CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
+        EXPORT_INPUT_HASH_FILE="$TMP_ROOT/export-input.hash"
+        printf 'old-hash\n' > "$EXPORT_INPUT_HASH_FILE"
+        generate_ordered_links() { printf 'vless://example-one\n'; }
+
+        if refresh_config_exports >/dev/null 2>&1; then
+            fail "refresh_config_exports reported success when export writes failed"
+        fi
+        [[ "$(cat "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true)" == "old-hash" ]] \
+            || fail "refresh_config_exports updated input hash after failed export write"
+        [[ ! -e "$CONFIG_META_FILE" ]] \
+            || fail "refresh_config_exports wrote metadata after failed export write"
+    )
+    pass "refresh config exports reports write failures instead of masking them"
+}
+
 test_config_exports_are_stable_client_artifacts() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -1616,6 +1638,11 @@ test_xhttp_mode_is_persistent_and_link_consistent() {
     [[ "$(xhttp_mode_value)" == "stream-up" ]] || fail "xhttp mode was not persisted"
     generate_config >/dev/null || fail "generate_config failed with stream-up mode"
     grep -Fq '"mode": "stream-up"' "$CONFIG_FILE" || fail "server config did not use persistent XHTTP mode"
+    grep -Fq '"168.63.129.16"' "$CONFIG_FILE" || fail "server config does not include Azure internal DNS resolver"
+    grep -Fq '"network": "udp", "port": "443"' "$CONFIG_FILE" || fail "server config does not block outbound UDP/443"
+    if grep -Fq '"quic"' "$CONFIG_FILE"; then
+        fail "server config still enables QUIC sniffing by default"
+    fi
     local link
     link="$(generate_link_for_address "20.0.0.1" "-ip1")"
     [[ "$link" == *"mode=stream-up"* ]] || fail "generated link did not match persistent XHTTP mode: $link"
@@ -2022,21 +2049,26 @@ test_panel_modes_apply_real_performance_profiles() {
 
 test_performance_profile_settings_are_available() {
     reset_runtime_paths
-    local balanced low_latency low_overhead
+    local balanced low_latency low_overhead streaming max_throughput
     balanced="$(performance_profile_settings balanced)"
     low_latency="$(performance_profile_settings low_latency)"
     low_overhead="$(performance_profile_settings low_overhead)"
+    streaming="$(performance_profile_settings streaming)"
+    max_throughput="$(performance_profile_settings max_throughput)"
     grep -Fq 'maxConcurrentUploads=16' <<< "$balanced" || fail "balanced profile missing expected concurrency"
+    grep -Fq 'sniffQuic=false' <<< "$balanced" || fail "balanced profile should disable QUIC sniffing"
     grep -Fq 'maxConcurrentUploads=24' <<< "$low_latency" || fail "low_latency profile missing higher concurrency"
     grep -Fq 'connIdle=240' <<< "$low_latency" || fail "low_latency profile should reap idle mobile connections faster"
+    grep -Fq 'sniffQuic=false' <<< "$low_latency" || fail "low_latency profile should disable QUIC sniffing"
+    grep -Fq 'sniffQuic=false' <<< "$streaming" || fail "streaming profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
     local mobile; mobile="$(performance_profile_settings unstable_mobile)"
     grep -Fq 'connIdle=180' <<< "$mobile" || fail "unstable_mobile profile should use shorter connIdle"
     grep -Fq 'connIdle=300' <<< "$balanced" || fail "balanced profile should use moderate connIdle"
-    local max_throughput; max_throughput="$(performance_profile_settings max_throughput)"
     grep -Fq 'name=max_throughput' <<< "$max_throughput" || fail "max_throughput profile is not selectable"
     grep -Fq 'maxConcurrentUploads=32' <<< "$max_throughput" || fail "max_throughput profile does not raise upload concurrency"
     grep -Fq 'bufferSize=2048' <<< "$max_throughput" || fail "max_throughput profile does not enlarge per-connection buffers"
+    grep -Fq 'sniffQuic=false' <<< "$max_throughput" || fail "max_throughput profile should disable QUIC sniffing"
     pass "performance profile settings are explicit and inspectable"
 }
 
@@ -2595,6 +2627,7 @@ test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection
 test_generate_config_rolls_back_when_valid_candidate_cannot_start
 test_config_exports_write_local_only_metadata
 test_config_exports_report_write_failure
+test_refresh_config_exports_reports_write_failure
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available

@@ -351,8 +351,8 @@ test_generated_config_uses_resilient_dns_fallback() {
         || fail 'generated Xray DNS config does not explicitly keep fallback enabled'
     grep_fixed '"disableFallbackIfMatch": false' "$SCRIPT" \
         || fail 'generated Xray DNS config could stop fallback after a matched resolver times out'
-    grep_fixed '"servers": ["localhost", "1.1.1.1", "1.0.0.1", "8.8.8.8"]' "$SCRIPT" \
-        || fail 'generated Xray DNS config does not use low-latency local-first UDP resolvers'
+    grep_fixed '"servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"]' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not include Azure local DNS plus public fallbacks'
     grep_fixed '"queryStrategy": "UseIPv4"' "$SCRIPT" \
         || fail 'generated Xray DNS config does not force IPv4 to avoid broken-AAAA latency'
     if grep_fixed 'https+local://' "$SCRIPT"; then
@@ -360,6 +360,11 @@ test_generated_config_uses_resilient_dns_fallback() {
     fi
     grep_fixed '"domainStrategy": "AsIs"' "$SCRIPT" \
         || fail 'routing still forces a per-connection DNS lookup; use AsIs to cut connection latency'
+    grep_fixed '"network": "udp", "port": "443"' "$SCRIPT" \
+        || fail 'generated Xray config does not block outbound UDP/443 to avoid QUIC-over-TCP stalls'
+    if grep_fixed 'sniffQuic=true' "$SCRIPT"; then
+        fail 'performance profiles still enable QUIC sniffing by default'
+    fi
     grep_fixed 'upgrade_config_dns()' "$SCRIPT" \
         || fail 'script does not provide an in-place DNS migration for existing configs'
     grep_fixed '.dns = {' "$SCRIPT" \
@@ -2034,6 +2039,32 @@ test_menu_loop_and_link_output_are_tidy() {
     pass 'menu loop and link output are tidy'
 }
 
+test_publish_helpers_default_to_public_visibility() {
+    grep_fixed "Visibility - type 'private' or 'public' [public]" "$ROOT_DIR/publish-to-github.ps1" \
+        || fail 'Windows publish helper does not default visibility to public'
+    grep_fixed '.Trim().ToLowerInvariant()' "$ROOT_DIR/publish-to-github.ps1" \
+        || fail 'Windows publish helper does not normalize visibility input'
+    grep_fixed 'Invalid visibility' "$ROOT_DIR/publish-to-github.ps1" \
+        || fail 'Windows publish helper does not reject invalid visibility input'
+    grep_fixed 'if ($LASTEXITCODE -ne 0) { Fail "Could not commit local changes." }' "$ROOT_DIR/publish-to-github.ps1" \
+        || fail 'Windows publish helper does not fail when git commit fails'
+    grep_fixed "Visibility - type 'private' or 'public' [public]:" "$ROOT_DIR/publish-to-github.sh" \
+        || fail 'Bash publish helper does not default visibility to public'
+    grep_fixed 'normalize_visibility()' "$ROOT_DIR/publish-to-github.sh" \
+        || fail 'Bash publish helper does not validate visibility input'
+    grep_fixed 'Invalid visibility' "$ROOT_DIR/publish-to-github.sh" \
+        || fail 'Bash publish helper does not reject invalid visibility input'
+    grep_fixed 'Ensure-GitIdentity' "$ROOT_DIR/publish-to-github.ps1" \
+        || fail 'Windows publish helper does not self-configure missing local git identity'
+    grep_fixed '$user@users.noreply.github.com' "$ROOT_DIR/publish-to-github.ps1" \
+        || fail 'Windows publish helper does not use a GitHub noreply email fallback'
+    grep_fixed 'ensure_git_identity()' "$ROOT_DIR/publish-to-github.sh" \
+        || fail 'Bash publish helper does not self-configure missing local git identity'
+    grep_fixed 'git config user.email "${user}@users.noreply.github.com"' "$ROOT_DIR/publish-to-github.sh" \
+        || fail 'Bash publish helper does not use a GitHub noreply email fallback'
+    pass 'publish helpers default to public visibility'
+}
+
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
@@ -2097,3 +2128,4 @@ test_docs_and_public_configs_are_consistent
 test_devcontainer_tooling_is_not_duplicated
 test_devcontainer_post_start_wrapper_is_present
 test_menu_loop_and_link_output_are_tidy
+test_publish_helpers_default_to_public_visibility

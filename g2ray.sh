@@ -2527,7 +2527,7 @@ upgrade_config_dns() {
     tmp=$(mktemp "${CONFIG_FILE}.dns.XXXXXX") || return 0
     if jq '
       .dns = {
-        "servers": ["localhost", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
+        "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
         "queryStrategy": "UseIPv4",
         "disableCache": false,
         "disableFallback": false,
@@ -2535,6 +2535,14 @@ upgrade_config_dns() {
         "enableParallelQuery": true
       }
       | (.routing.domainStrategy) = "AsIs"
+      | (.routing.rules) = (
+          (.routing.rules // []) as $rules
+          | if any($rules[]?; .type == "field" and .network == "udp" and (.port|tostring) == "443" and .outboundTag == "block")
+            then $rules
+            else ([{ "type": "field", "network": "udp", "port": "443", "outboundTag": "block" }] + $rules)
+            end
+        )
+      | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         if cmp -s "$CONFIG_FILE" "$tmp"; then
             rm -f "$tmp" 2>/dev/null || true
@@ -3091,10 +3099,10 @@ performance_profile_settings() {
     local profile="${1:-$PERFORMANCE_PROFILE}"
     case "$profile" in
         low_latency|latency)
-            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=240\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=240\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         streaming|video)
-            printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=false\nloglevel=warning\n'
             ;;
         unstable_mobile|mobile)
             printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=180\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
@@ -3103,10 +3111,10 @@ performance_profile_settings() {
             printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
             ;;
         max_throughput|throughput|max|high_throughput)
-            printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=2048\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=2048\nsniffQuic=false\nloglevel=warning\n'
             ;;
         *)
-            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=300\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=true\nloglevel=warning\n'
+            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=300\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
     esac
 }
@@ -3179,7 +3187,7 @@ generate_config() {
     uplink_only="${uplink_only:-2}"
     downlink_only="${downlink_only:-5}"
     buffer_size="${buffer_size:-512}"
-    sniff_quic="${sniff_quic:-true}"
+    sniff_quic="${sniff_quic:-false}"
     loglevel="${loglevel:-warning}"
     sniff_dest='["http", "tls"]'
     [[ "$sniff_quic" == "true" ]] && sniff_dest='["http", "tls", "quic"]'
@@ -3230,7 +3238,7 @@ JSONEOF
     "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true, "handshake": ${handshake}, "connIdle": ${conn_idle}, "uplinkOnly": ${uplink_only}, "downlinkOnly": ${downlink_only}, "bufferSize": ${buffer_size} } }
   },
   "dns": {
-    "servers": ["localhost", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
+    "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
     "queryStrategy": "UseIPv4",
     "disableCache": false,
     "disableFallback": false,
@@ -3261,6 +3269,7 @@ JSONEOF
     "domainStrategy": "AsIs",
     "rules": [
       { "inboundTag": ["api"],                                   "outboundTag": "api",    "type": "field" },
+      { "type": "field", "network": "udp", "port": "443",        "outboundTag": "block"  },
       { "type": "field", "ip":       ["geoip:private"],          "outboundTag": "block"  },
       { "type": "field", "protocol": ["bittorrent"],             "outboundTag": "block"  },
       { "type": "field", "domain":   ["geosite:category-ads-all"], "outboundTag": "block" }
@@ -4522,7 +4531,10 @@ refresh_config_exports() {
     local link_array=()
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     ((${#link_array[@]})) || { clear_config_exports "no_exportable_links"; return 1; }
-    write_config_exports_from_links "${link_array[@]}"
+    if ! write_config_exports_from_links "${link_array[@]}"; then
+        clear_config_exports "write_failed"
+        return 1
+    fi
     local new_hash
     new_hash=$(export_input_hash)
     _atomic_write "$EXPORT_INPUT_HASH_FILE" "$new_hash" >/dev/null 2>&1 || true

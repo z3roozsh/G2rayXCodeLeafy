@@ -25,6 +25,35 @@ function Fail($msg) {
     exit 1
 }
 function Have($name) { [bool](Get-Command $name -ErrorAction SilentlyContinue) }
+function Require-Success($msg) {
+    if ($LASTEXITCODE -ne 0) { Fail $msg }
+}
+function Ensure-GitIdentity($user) {
+    $gitName = (git config user.name 2>$null)
+    if ($LASTEXITCODE -ne 0) { $gitName = "" }
+    $gitEmail = (git config user.email 2>$null)
+    if ($LASTEXITCODE -ne 0) { $gitEmail = "" }
+    if ([string]::IsNullOrWhiteSpace($gitName)) {
+        git config user.name $user | Out-Null
+        Require-Success "Could not configure local git user.name."
+        Write-Host "Configured local git user.name as $user." -ForegroundColor DarkGray
+    }
+    if ([string]::IsNullOrWhiteSpace($gitEmail)) {
+        $fallbackEmail = "$user@users.noreply.github.com"
+        git config user.email $fallbackEmail | Out-Null
+        Require-Success "Could not configure local git user.email."
+        Write-Host "Configured local git user.email as $fallbackEmail." -ForegroundColor DarkGray
+    }
+}
+function Read-RepoVisibility() {
+    while ($true) {
+        $raw = Read-Host "Visibility - type 'private' or 'public' [public]"
+        $value = $raw.Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($value)) { return "public" }
+        if ($value -eq "public" -or $value -eq "private") { return $value }
+        Write-Host "Invalid visibility. Type 'public', 'private', or press Enter for public." -ForegroundColor Yellow
+    }
+}
 
 Write-Host ""
 Write-Host "== Publish G2rayXCodeLeafy to your GitHub account ==" -ForegroundColor Cyan
@@ -68,18 +97,23 @@ gh auth setup-git 2>$null | Out-Null   # so an HTTPS push uses your gh login, no
 $default = Split-Path $PSScriptRoot -Leaf
 $repo = Read-Host "Repository name [$default]"
 if ([string]::IsNullOrWhiteSpace($repo)) { $repo = $default }
-$vis = Read-Host "Visibility - type 'private' or 'public' [private]"
-if ($vis -ne 'public') { $vis = 'private' }
+$vis = Read-RepoVisibility
 $slug = "$user/$repo"
 
 # --- Commit any pending local changes so GitHub ends up identical to local ---
+Ensure-GitIdentity $user
 git add -A
+Require-Success "Could not stage local changes."
 git diff --cached --quiet
-if ($LASTEXITCODE -ne 0) {
+$diffExit = $LASTEXITCODE
+if ($diffExit -eq 1) {
     $msg = Read-Host "Commit message [Update G2rayXCodeLeafy]"
     if ([string]::IsNullOrWhiteSpace($msg)) { $msg = "Update G2rayXCodeLeafy" }
     git commit -m $msg | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "Could not commit local changes." }
     Write-Host "Committed local changes." -ForegroundColor Green
+} elseif ($diffExit -ne 0) {
+    Fail "Could not inspect staged changes."
 } else {
     Write-Host "Nothing new to commit; the working folder already matches the last commit." -ForegroundColor DarkGray
 }
