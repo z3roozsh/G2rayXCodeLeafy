@@ -2202,8 +2202,13 @@ wait_for_xhttp_route_ready() {
             stable=0
         fi
         (( elapsed >= max_wait )) && break
-        if (( attempt == 1 || attempt % 5 == 0 )); then
+        if (( attempt == 1 )); then
             ensure_codespace_port_public >/dev/null 2>&1 || true
+        elif (( attempt % 5 == 0 )) && mark_route_repair_attempt_if_allowed; then
+            # A cached public-visibility result does not always repair a stale
+            # Codespaces edge route. Reassert it once per repair cooldown.
+            log_event WARN "runtime_ready reason=${reason} route_wait_repair attempt=${attempt} port=${XRAY_PORT}"
+            repair_codespace_port_route >/dev/null 2>&1 || true
         fi
         if (( stable > 0 )); then
             sleep "$ROUTE_READY_STABLE_SLEEP_SEC"

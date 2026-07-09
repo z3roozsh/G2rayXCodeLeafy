@@ -739,6 +739,8 @@ test_startup_does_not_reconnect_healthy_runtime() {
         || fail 'startup route wait is not configurable'
     grep_fixed 'runtime_ready reason=${reason} route_wait_timeout' "$SCRIPT" \
         || fail 'startup route wait timeout is not logged for troubleshooting'
+    grep_fixed 'route_wait_repair attempt=${attempt}' "$SCRIPT" \
+        || fail 'startup route wait does not perform a cooldown-gated port-route repair'
     pass 'startup paths do not reconnect a healthy runtime'
 }
 

@@ -2161,6 +2161,41 @@ test_route_wait_rejects_transient_single_success() {
     pass "route wait rejects transient single success"
 }
 
+test_route_wait_reasserts_port_once_after_persistent_404() {
+    (
+        reset_runtime_paths
+        ROUTE_READY_STABLE_SLEEP_SEC=0
+        local probes_file="$TMP_ROOT/route-wait-reassert-count.txt" repairs=0
+        printf '0\n' > "$probes_file"
+        xhttp_probe_metrics() {
+            local probes
+            probes=$(cat "$probes_file")
+            probes=$((probes + 1))
+            printf '%s\n' "$probes" > "$probes_file"
+            if (( probes < 5 )); then
+                printf '404 10 route_settling_404\n'
+            else
+                printf '200 11 ready\n'
+            fi
+        }
+        sleep() { :; }
+        ensure_codespace_port_public() { return 0; }
+        repair_codespace_port_route() {
+            repairs=$((repairs + 1))
+            return 0
+        }
+        mark_route_repair_attempt_if_allowed() { return 0; }
+
+        wait_for_xhttp_route_ready "behavior_reassert" 10 >/dev/null \
+            || fail "route wait did not recover after a bounded port reassert"
+        [[ "$repairs" -eq 1 ]] \
+            || fail "route wait should make one cooldown-gated repair, got $repairs"
+        grep -Fq 'runtime_ready reason=behavior_reassert route_wait_repair attempt=5' "$LOG_FILE" \
+            || fail "route wait did not log the bounded repair"
+    )
+    pass "route wait reasserts port once after persistent 404"
+}
+
 test_recover_now_success_clears_nonfatal_port_public_failure() {
     (
         reset_runtime_paths
@@ -2657,6 +2692,7 @@ test_doctor_json_reports_probe_state
 test_doctor_json_sanitizes_invalid_port
 test_route_wait_requires_stable_usable_probes
 test_route_wait_rejects_transient_single_success
+test_route_wait_reasserts_port_once_after_persistent_404
 test_recover_now_success_clears_nonfatal_port_public_failure
 test_route_repair_attempts_are_cooldown_limited
 test_recover_now_stops_after_engine_start_failure
