@@ -1,13 +1,18 @@
 const GITHUB_API_VERSION = "2022-11-28";
 const DEFAULT_CODESPACE_PORT = 443;
-const GITHUB_STATE_WAIT_MS = 120000;
+// Return progress rather than holding one mobile request open for a full cold
+// start. The caller polls with a bounded backoff until GitHub reports Available.
+const GITHUB_STATE_WAIT_MS = 25000;
 const GITHUB_STATE_POLL_INTERVAL_MS = 5000;
-const ROUTE_WAIT_MS = 35000;
-const ROUTE_POLL_INTERVAL_MS = 3000;
+// The Codespaces edge can take minutes to settle, but holding one Worker
+// request open for 35 seconds makes mobile wake UX look hung. Return an honest
+// short 202 and let the client/dashboard poll using the supplied hint instead.
+const ROUTE_WAIT_MS = 8000;
+const ROUTE_POLL_INTERVAL_MS = 2000;
 const ROUTE_READY_STABLE_PROBES = 2;
 const ROUTE_READY_STABLE_SLEEP_MS = 1000;
 const FETCH_TIMEOUT_MS = 10000;
-const ROUTE_FETCH_TIMEOUT_MS = 7000;
+const ROUTE_FETCH_TIMEOUT_MS = 4000;
 const HISTORY_KEY_PREFIX = "history:";
 const QUOTA_INCIDENT_KEY_PREFIX = "quota-incident:";
 const HISTORY_LIMIT = 50;
@@ -69,11 +74,11 @@ async function handleWake(request, env, ctx) {
   const cooldown = await rateLimitSuccessfulWake(context.codespaceName, env);
   if (cooldown) return json(cooldown.body, cooldown.status, retryHeaders(cooldown.body));
 
-  const warmData = wakeFastPathEnabled(env)
+  const warmRoute = wakeFastPathEnabled(env)
     ? await alreadyWarmCodespaceData(context.codespaceName, context.token, env)
     : null;
   const data = withSurvivalFields(
-    warmData || await startCodespaceData(context.codespaceName, context.token, env),
+    warmRoute?.data || await startCodespaceData(context.codespaceName, context.token, env, warmRoute?.status),
     env
   );
   data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
@@ -108,25 +113,37 @@ function wakeFastPathEnabled(env = {}) {
 
 async function alreadyWarmCodespaceData(name, token, env) {
   const firstProbe = await probeXhttpRoute(name, codespacePort(env), 1, Date.now(), env);
-  if (!firstProbe.usable) return null;
-
   const status = await getCodespaceStatus(name, token, env);
-  if (!isCodespaceAvailable(status)) return null;
+  if (!isCodespaceAvailable(status)) return { status, data: null };
 
-  const routeProbe = await waitForXhttpRoute(name, codespacePort(env), env);
-  if (!isRouteReadyProbe(routeProbe)) return null;
-  routeProbe.attempts = Number(routeProbe.attempts || 0) + Number(firstProbe.attempts || 1);
+  // A GitHub start call cannot repair a Codespace that is already Available.
+  // Keep that distinction honest: report the existing edge state and let the
+  // caller poll rather than issuing a needless /start request.
+  const routeProbe = firstProbe.usable
+    ? await waitForXhttpRoute(name, codespacePort(env), env)
+    : firstProbe;
+  if (firstProbe.usable) {
+    routeProbe.attempts = Number(routeProbe.attempts || 0) + Number(firstProbe.attempts || 1);
+  }
   routeProbe.fast_path_precheck_attempts = Number(firstProbe.attempts || 1);
+  const routeReady = isRouteReadyProbe(routeProbe);
 
   return {
-    ...status,
-    ok: true,
-    wake_fast_path: true,
-    start_accepted: false,
-    route_ready: true,
-    route_probe: routeProbe,
-    next_action: "Try the same VLESS config again.",
-    message: "Codespace is already available and the XHTTP route is usable."
+    status,
+    data: {
+      ...status,
+      ok: true,
+      wake_fast_path: true,
+      start_accepted: false,
+      route_ready: routeReady,
+      route_probe: routeProbe,
+      next_action: routeReady
+        ? "Try the same VLESS config again."
+        : nextActionForWake(status, routeProbe),
+      message: routeReady
+        ? "Codespace is already available and the XHTTP route is usable."
+        : "Codespace is already available, but the XHTTP route is still settling. No GitHub start request was sent."
+    }
   };
 }
 
@@ -138,19 +155,27 @@ async function handleHealth(request, env, ctx) {
   const checkRoute = url.searchParams.get("route") !== "false";
   const codespaceName = context.codespaceName;
   const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env);
-  const routeChecked = status.ok && checkRoute;
+  // A forwarded-port probe cannot become useful until GitHub has brought the
+  // Codespace online. Skipping it while shutdown keeps Health cheap and avoids
+  // presenting a stale-route 404 as though it were an Xray problem.
+  const routeChecked = status.ok && checkRoute && isCodespaceAvailable(status);
+  const skippedRouteReason = !status.ok
+    ? "github_status_not_ok"
+    : !checkRoute
+      ? "route_check_skipped"
+      : "codespace_not_available";
   const routeProbe = routeChecked
     ? await waitForXhttpRoute(codespaceName, codespacePort(env), env)
       : {
         url: routeUrl(codespaceName, codespacePort(env), env),
         usable: false,
-        http_status: checkRoute ? 0 : null,
+        http_status: null,
         latency_ms: null,
         attempts: 0,
         waited_ms: 0,
         stable_probes: 0,
-        error: checkRoute ? "github_status_not_ok" : "route_check_skipped",
-        route_failure_reason: checkRoute ? "github_status_not_ok" : "not_checked"
+        error: skippedRouteReason,
+        route_failure_reason: skippedRouteReason === "route_check_skipped" ? "not_checked" : skippedRouteReason
       };
   const data = withSurvivalFields({
     ...status,
@@ -335,7 +360,7 @@ async function sha256Hex(value) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function startCodespaceData(name, token, env) {
+async function startCodespaceData(name, token, env, priorStatus = null) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
   let res;
   try {
@@ -360,7 +385,9 @@ async function startCodespaceData(name, token, env) {
   const githubFailure = githubFailureForResponse(res, body, name);
   if (githubFailure) {
     if (githubFailure.reason === "quota_or_billing_blocked") {
-      const status = await getCodespaceStatus(name, token, env);
+      const status = priorStatus && priorStatus.ok
+        ? priorStatus
+        : await getCodespaceStatus(name, token, env);
       return {
         ...githubFailure,
         state: status.state || null,
@@ -654,7 +681,7 @@ function responseStatusFor(data) {
   if (data.start_accepted && data.reason === "codespace_state_not_ready") return 202;
   if (
     data.ok &&
-    data.start_accepted &&
+    (data.start_accepted || data.wake_fast_path) &&
     data.route_ready === false &&
     (isRouteSettlingStatus(data.route_probe) || data.route_probe?.error === "route_stability_not_confirmed")
   ) return 202;
@@ -870,6 +897,9 @@ function nextActionCodeFor(status, routeProbe) {
 function healthMessage(status, routeProbe) {
   if (status.token_warning) return status.message;
   if (!status.ok) return status.message || "GitHub status is not available.";
+  if (!isCodespaceAvailable(status)) {
+    return "Codespace is shut down or still starting, so the app.github.dev route was not probed.";
+  }
   if (isRouteReadyProbe(routeProbe)) return "Codespace is available and the XHTTP route is usable.";
   if (routeProbe.error === "route_stability_not_confirmed") {
     return "Codespace is available, but the XHTTP route answered only once and still needs another stable probe.";

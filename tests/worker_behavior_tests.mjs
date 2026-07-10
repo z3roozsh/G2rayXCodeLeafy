@@ -258,6 +258,43 @@ async function testHealthCanSkipRouteProbe() {
   console.log("PASS: Worker health can skip route probing for cheap status checks");
 }
 
+async function testHealthDoesNotProbeRouteWhileCodespaceIsShutdown() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Shutdown",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      throw new Error(`shutdown Codespace must not probe route: ${url}`);
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/health"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.state, "Shutdown");
+  assert.equal(body.route_checked, false);
+  assert.equal(body.route_ready, null);
+  assert.equal(body.route_probe.http_status, null);
+  assert.equal(body.route_probe.error, "codespace_not_available");
+  assert.equal(body.next_action_code, "wait_codespace_available");
+  assert.match(body.message, /not probed/i);
+  assert.equal(routeCalls, 0);
+  console.log("PASS: Worker health skips expensive route probing while Codespace is shutdown");
+}
+
 async function testHealthSkipRoutePreservesGithubFailureGuidance() {
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -1785,6 +1822,51 @@ async function testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady() {
   console.log("PASS: Worker wake skips GitHub start when Codespace route is already warm");
 }
 
+async function testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling() {
+  let startCalls = 0;
+  let statusCalls = 0;
+  let routeCalls = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      if (url.endsWith("/start") || init.method === "POST") {
+        startCalls += 1;
+        throw new Error("available Codespace must not receive a redundant start request");
+      }
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        last_used_at: "2026-05-30T00:00:00Z",
+        idle_timeout_minutes: 240
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("app.github.dev")) {
+      routeCalls += 1;
+      return new Response("", { status: 404 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv(), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 202);
+  assert.equal(body.ok, true);
+  assert.equal(body.wake_fast_path, true);
+  assert.equal(body.start_accepted, false);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.http_status, 404);
+  assert.equal(body.next_action_code, "wait_route_or_recover");
+  assert.equal(startCalls, 0);
+  assert.equal(statusCalls, 1);
+  assert.equal(routeCalls, 1);
+  console.log("PASS: Worker wake does not restart an available Codespace just because its route is settling");
+}
+
 try {
   await testFailedSecretRateLimit();
   await testFailedSecretRateLimitCapsKvWrites();
@@ -1794,6 +1876,7 @@ try {
   await testGithubUnknownForbiddenClassificationIsNeutral();
   await testWakeSettlingIncludesRetryMetadata();
   await testHealthCanSkipRouteProbe();
+  await testHealthDoesNotProbeRouteWhileCodespaceIsShutdown();
   await testHealthSkipRoutePreservesGithubFailureGuidance();
   await testAuthorizedWakeCooldownIsOptional();
   await testGithubHttp429Classification();
@@ -1830,6 +1913,7 @@ try {
   await testHealthRouteReadyTransitionNotification();
   await testHealthRouteUrlUsesForwardingDomainOverride();
   await testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady();
+  await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
 } finally {
   globalThis.fetch = originalFetch;
 }

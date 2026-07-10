@@ -702,10 +702,14 @@ test_runtime_control_paths_are_hardened() {
         || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
     grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \
         || fail 'wait_for_port still succeeds on any listener bound to the port'
-    grep_fixed 'elif ensure_runtime_ready "silent_start" >/dev/null 2>&1; then' "$SCRIPT" \
-        || fail '--silent-start does not use the non-fatal health-gated startup path'
-    grep_fixed 'elif silent_start_attempt_headless_recover "silent_start"; then' "$SCRIPT" \
-        || fail '--silent-start does not run headless route recovery before asking for manual panel recovery'
+    grep_fixed 'prepare_headless_runtime "silent_start"' "$SCRIPT" \
+        || fail '--silent-start does not prepare the local engine before asynchronous route settling'
+    grep_fixed 'start_headless_route_settling_monitor "silent_start"' "$SCRIPT" \
+        || fail '--silent-start does not launch bounded asynchronous route settling'
+    grep_fixed 'if [[ "${1:-}" == "--headless-route-settle" ]]; then' "$SCRIPT" \
+        || fail 'script has no dedicated background route-settling entrypoint'
+    grep_fixed 'G2RAY_ROUTE_SETTLE_TOKEN="$token" nohup bash "$SCRIPT_PATH" --headless-route-settle' "$SCRIPT" \
+        || fail 'route-settling monitor is not detached from the Codespaces lifecycle command'
     grep_fixed 'write_boot_status "route_settling" "silent_start"' "$SCRIPT" \
         || fail '--silent-start does not persist route-settling boot status'
     grep_fixed 'if stop_xray; then' "$SCRIPT" \

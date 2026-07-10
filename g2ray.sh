@@ -62,6 +62,8 @@ BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
 RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
 BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
 BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
+ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
 RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
 WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
 WAKER_PROMPT_FILE="$DATA_DIR/.waker_setup_prompted"
@@ -101,6 +103,7 @@ ACTIVE_TRAFFIC_STAMP_FILE="$DATA_DIR/active_traffic_last"
 TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
 SESSION_START_FILE="$DATA_DIR/session_start.txt"
 LOG_DIR="${G2RAY_LOG_DIR:-$BASE_DIR/logs}"
+ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
 LOG_FILE="$LOG_DIR/g2ray.log"
 STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
 DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
@@ -142,6 +145,8 @@ SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
 SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 ROUTE_WAIT_SEC="${G2RAY_ROUTE_WAIT_SEC:-120}"
 FORCE_RECONNECT_ROUTE_WAIT_SEC="${G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC:-60}"
+HEADLESS_ROUTE_SETTLE_WAIT_SEC="${G2RAY_HEADLESS_ROUTE_SETTLE_WAIT_SEC:-180}"
+HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC="${G2RAY_HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC:-5}"
 ROUTE_READY_STABLE_PROBES="${G2RAY_ROUTE_READY_STABLE_PROBES:-2}"
 ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
@@ -193,6 +198,10 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$RUNTIME_LOCK_WAIT_ATTEMPTS" =~ ^[0-9]+$ && "$RUNTIME_LOCK_WAIT_ATTEMPTS" -ge 1 ]] || RUNTIME_LOCK_WAIT_ATTEMPTS=900
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
 [[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
+[[ "$HEADLESS_ROUTE_SETTLE_WAIT_SEC" =~ ^[0-9]+$ && "$HEADLESS_ROUTE_SETTLE_WAIT_SEC" -ge 15 ]] || HEADLESS_ROUTE_SETTLE_WAIT_SEC=180
+(( HEADLESS_ROUTE_SETTLE_WAIT_SEC > 300 )) && HEADLESS_ROUTE_SETTLE_WAIT_SEC=300
+[[ "$HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC" =~ ^[0-9]+$ ]] || HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=5
+(( HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC > 30 )) && HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=30
 [[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
 [[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=6
 (( ROUTE_PROBE_CONCURRENCY > 16 )) && ROUTE_PROBE_CONCURRENCY=16
@@ -2221,33 +2230,102 @@ wait_for_xhttp_route_ready() {
     return 1
 }
 
-silent_start_attempt_headless_recover() {
-    local reason="${1:-silent_start}" xcode=0 xms=0 probe_reason="" recover_rc=0
-    read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
-    if xhttp_status_usable "$xcode"; then
-        log_event INFO "runtime_ready reason=${reason} headless_recover_skip route_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+route_settle_monitor_running() {
+    local p="${1:-}" expected
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    expected=$(cat "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true)
+    [[ -n "$expected" && -r "/proc/$p/environ" ]] || return 1
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fxq "G2RAY_ROUTE_SETTLE_TOKEN=$expected"
+}
+
+route_settle_token_current() {
+    local expected
+    expected=$(cat "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true)
+    [[ -n "${G2RAY_ROUTE_SETTLE_TOKEN:-}" && -n "$expected" && "$G2RAY_ROUTE_SETTLE_TOKEN" == "$expected" ]]
+}
+
+clear_route_settle_monitor_state() {
+    local p expected
+    p=$(cat "$ROUTE_SETTLE_PID_FILE" 2>/dev/null || true)
+    expected=$(cat "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true)
+    if [[ "$p" == "$$" && -n "${G2RAY_ROUTE_SETTLE_TOKEN:-}" && "$G2RAY_ROUTE_SETTLE_TOKEN" == "$expected" ]]; then
+        rm -f "$ROUTE_SETTLE_PID_FILE" "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true
+    fi
+}
+
+route_settle_monitor_status() {
+    local p
+    p=$(cat "$ROUTE_SETTLE_PID_FILE" 2>/dev/null || true)
+    if route_settle_monitor_running "$p"; then
+        printf 'pid=%s running=true wait_sec=%s log=%s\n' "$p" "$HEADLESS_ROUTE_SETTLE_WAIT_SEC" "$ROUTE_SETTLE_LOG_FILE"
+    elif [[ -n "$p" ]]; then
+        printf 'pid=%s running=false state=stale\n' "$p"
+    else
+        printf 'not running\n'
+    fi
+}
+
+run_headless_route_settle() {
+    local reason="${1:-silent_start}" xcode=0 xms=0 probe_reason=""
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    if [[ -n "${G2RAY_ROUTE_SETTLE_TOKEN:-}" ]] && ! route_settle_token_current; then
+        log_event WARN "route_settle superseded reason=${reason} pid=$$"
         return 0
     fi
-    if [[ "${xcode:-0}" != "404" ]]; then
-        log_event WARN "runtime_ready reason=${reason} headless_recover_skip xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-unknown}"
+
+    sleep "$HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC"
+    if ! xray_listener_ready; then
+        read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
+        write_boot_status "needs_attention" "$reason" "Xray listener was unavailable while background route settling started." "${xcode:-0}" "${xms:-0}"
+        log_event ERROR "route_settle reason=${reason} listener_unavailable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
         return 1
     fi
 
-    log_event WARN "runtime_ready reason=${reason} headless_recover_begin xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-route_settling_404}"
-    if recover_now --no-prompt >/dev/null 2>&1; then
-        recover_rc=0
-    else
-        recover_rc=$?
-    fi
-    read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
-    if xhttp_status_usable "$xcode"; then
+    force_public_runtime_ports "route_settle_start" >/dev/null 2>&1 || true
+    if wait_for_xhttp_route_ready "$reason" "$HEADLESS_ROUTE_SETTLE_WAIT_SEC"; then
+        read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
         reset_route_bad_count
         reset_edge_bad_count
-        log_event INFO "runtime_ready reason=${reason} headless_recover_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} recover_rc=${recover_rc}"
+        write_boot_status "ready" "$reason" "Xray listener was ready and asynchronous Codespaces route settling succeeded." "${xcode:-0}" "${xms:-0}"
+        log_event INFO "route_settle reason=${reason} ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
         return 0
     fi
-    log_event WARN "runtime_ready reason=${reason} headless_recover_still_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-unknown} recover_rc=${recover_rc}"
+
+    read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
+    write_boot_status "route_settling" "$reason" "Xray listener is ready, but GitHub's route is still settling after bounded background repair." "${xcode:-0}" "${xms:-0}"
+    log_event WARN "route_settle reason=${reason} timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-unknown}"
     return 1
+}
+
+start_headless_route_settling_monitor() {
+    local reason="${1:-silent_start}" token p
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    p=$(cat "$ROUTE_SETTLE_PID_FILE" 2>/dev/null || true)
+    if route_settle_monitor_running "$p"; then
+        log_event INFO "route_settle already_running reason=${reason} pid=${p}"
+        return 0
+    fi
+    rm -f "$ROUTE_SETTLE_PID_FILE" "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true
+    token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
+    if ! _atomic_write "$ROUTE_SETTLE_TOKEN_FILE" "$token"; then
+        log_event ERROR "route_settle token_write_failed reason=${reason}"
+        return 1
+    fi
+    if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+        rm -f "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true
+        log_event ERROR "route_settle log_dir_failed reason=${reason}"
+        return 1
+    fi
+    G2RAY_ROUTE_SETTLE_TOKEN="$token" nohup bash "$SCRIPT_PATH" --headless-route-settle "$reason" </dev/null >> "$ROUTE_SETTLE_LOG_FILE" 2>&1 &
+    p=$!
+    if ! _atomic_write "$ROUTE_SETTLE_PID_FILE" "$p"; then
+        kill "$p" 2>/dev/null || true
+        rm -f "$ROUTE_SETTLE_TOKEN_FILE" 2>/dev/null || true
+        log_event ERROR "route_settle pid_write_failed reason=${reason}"
+        return 1
+    fi
+    log_event INFO "route_settle started reason=${reason} pid=${p} wait_sec=${HEADLESS_ROUTE_SETTLE_WAIT_SEC}"
 }
 
 record_route_settling_metric() {
@@ -2738,6 +2816,7 @@ _background_tasks() {
         write_background_supervisor_heartbeat
         rotate_log_file "$LOG_FILE"
         rotate_log_file "$LOG_DIR/xray-error.log"
+        rotate_log_file "$ROUTE_SETTLE_LOG_FILE"
         if [[ "$PORT_DOMAIN" == unknown-codespace* ]]; then
             local n; n=$(_detect_codespace_name 2>/dev/null || true)
             if [[ -n "$n" && "$n" != "unknown-codespace" ]]; then
@@ -4112,6 +4191,12 @@ show_route_candidate_manager() {
                 sleep 1
                 ;;
             7)
+                local reset_probe reset_ms reset_reason
+                read -r reset_probe reset_ms reset_reason < <(xhttp_probe_metrics external)
+                if ! xhttp_status_usable "${reset_probe:-0}"; then
+                    echo -e "  ${YELLOW}Edge route is currently HTTP ${reset_probe:-0}; resetting this cache cannot repair GitHub's route.${NC}"
+                    echo -e "  ${DIM}It only discards learned route measurements. Wait for recovery or use Recover Now first.${NC}"
+                fi
                 echo -ne "  ${YELLOW}Reset measured route health cache only? (y/n):${NC} "
                 read -r ip || continue
                 if [[ "$ip" =~ ^[Yy]$ ]]; then
@@ -4701,6 +4786,7 @@ create_support_bundle() {
     copy_redacted_log_family "$LOG_FILE" "$tmp/logs/g2ray.log"
     copy_redacted_log_family "$STRUCTURED_LOG_FILE" "$tmp/logs/g2ray-events.jsonl"
     copy_redacted_log_family "$DIAGNOSTIC_LOG_FILE" "$tmp/logs/g2ray-diagnostics.log"
+    copy_redacted_log_family "$ROUTE_SETTLE_LOG_FILE" "$tmp/logs/route-settle.log"
     copy_redacted_log_family "$LOG_DIR/xray.log" "$tmp/logs/xray.log"
     copy_redacted_log_family "$LOG_DIR/xray-error.log" "$tmp/logs/xray-error.log"
     copy_redacted_file "$ROUTE_HEALTH_FILE" "$tmp/state/route_candidate_health.tsv"
@@ -4821,6 +4907,9 @@ show_diagnostics() {
 
     echo -e "\n  ${WHITE}${B}Boot Status${NC}"
     boot_status_summary | sed 's/^/  /'
+
+    echo -e "\n  ${WHITE}${B}Headless Route Settling${NC}"
+    route_settle_monitor_status | sed 's/^/  /'
 
     echo -e "\n  ${WHITE}${B}Last Known State${NC}"
     last_known_state_summary | sed 's/^/  /'
@@ -5242,6 +5331,37 @@ ensure_runtime_ready() {
     with_runtime_lock _ensure_runtime_ready_impl "$@"
 }
 
+_prepare_headless_runtime_impl() {
+    local reason="${1:-silent_start}"
+    record_resume_gap "$reason"
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
+    refresh_port_domains
+
+    if xray_listener_ready; then
+        force_public_runtime_ports "headless_start" >/dev/null 2>&1 \
+            || log_event WARN "headless_start reason=${reason} port_public_failed port=${XRAY_PORT}"
+        log_event INFO "headless_start reason=${reason} listener_ready action=continue_async"
+        return 0
+    fi
+
+    log_event WARN "headless_start reason=${reason} listener_unavailable action=start"
+    if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1 && xray_listener_ready; then
+        force_public_runtime_ports "headless_start" >/dev/null 2>&1 \
+            || log_event WARN "headless_start reason=${reason} port_public_failed port=${XRAY_PORT}"
+        log_event INFO "headless_start reason=${reason} engine_started action=continue_async"
+        return 0
+    fi
+
+    log_event ERROR "headless_start reason=${reason} start_failed port=${XRAY_PORT}"
+    return 1
+}
+
+prepare_headless_runtime() {
+    with_runtime_lock _prepare_headless_runtime_impl "$@"
+}
+
 print_doctor_json() {
     local engine=false listener=false local_probe=0 local_ms=0 edge_probe=0 edge_ms=0 supervisor last_good waker_url doctor_port config_present=false next_action_code next_action
     doctor_port="$XRAY_PORT"
@@ -5354,6 +5474,9 @@ bench_rebind_runtime_paths() {
     RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
     BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
     BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+    ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
+    ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
+    ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
     RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
     WAKER_METADATA_FILE="$DATA_DIR/waker_metadata.txt"
     WAKER_PROMPT_FILE="$DATA_DIR/.waker_setup_prompted"
@@ -5572,24 +5695,30 @@ if [[ "${1:-}" == "--background-supervisor" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "--headless-route-settle" ]]; then
+    trap clear_route_settle_monitor_state EXIT
+    run_headless_route_settle "${2:-silent_start}"
+    exit $?
+fi
+
 if [[ "${1:-}" == "--silent-start" ]]; then
     if [[ ! -f "$CONFIG_FILE" ]]; then
         write_boot_status "no_config" "silent_start" "No config exists yet; open the panel and generate one." "0" "0"
-    elif ensure_runtime_ready "silent_start" >/dev/null 2>&1; then
+    elif prepare_headless_runtime "silent_start" >/dev/null 2>&1; then
+        start_background_tasks || log_event WARN "headless_start reason=silent_start supervisor_start_deferred"
         read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-        write_boot_status "ready" "silent_start" "Xray started and the Codespaces route is usable." "${_boot_code:-0}" "${_boot_ms:-0}"
-    elif silent_start_attempt_headless_recover "silent_start"; then
-        read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-        write_boot_status "ready" "silent_start" "Xray started and headless route recovery made the Codespaces route usable." "${_boot_code:-0}" "${_boot_ms:-0}"
+        if xhttp_status_usable "${_boot_code:-0}"; then
+            write_boot_status "ready" "silent_start" "Xray listener and the Codespaces route are usable." "${_boot_code:-0}" "${_boot_ms:-0}"
+        else
+            write_boot_status "route_settling" "silent_start" "Xray listener is ready; Codespaces route recovery now continues asynchronously in the background." "${_boot_code:-0}" "${_boot_ms:-0}"
+            start_headless_route_settling_monitor "silent_start" \
+                || log_event WARN "headless_start reason=silent_start route_settle_start_deferred"
+        fi
     else
         read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-        if [[ "${_boot_code:-0}" == "404" ]]; then
-            write_boot_status "route_settling" "silent_start" "Xray is up, but GitHub's app route is still settling after automatic headless recovery. Keep checking health; open the panel only if it remains 404 for several minutes." "${_boot_code:-0}" "${_boot_ms:-0}"
-        else
-            write_boot_status "needs_attention" "silent_start" "Startup completed but the external route is not usable yet." "${_boot_code:-0}" "${_boot_ms:-0}"
-        fi
+        write_boot_status "needs_attention" "silent_start" "Xray listener could not start; background route settling was not started." "${_boot_code:-0}" "${_boot_ms:-0}"
+        start_background_tasks || log_event WARN "headless_start reason=silent_start supervisor_start_deferred"
     fi
-    start_background_tasks
     exit 0
 fi
 

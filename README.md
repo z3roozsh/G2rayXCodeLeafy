@@ -165,6 +165,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_RECONNECT_COOLDOWN_SEC` **(Optional)** — Minimum seconds between automatic full reconnects. Default: `300`.
 - `G2RAY_ROUTE_WAIT_SEC` **(Optional)** — Maximum seconds startup waits for the `app.github.dev` XHTTP route after a Codespace resume. Default: `120`.
 - `G2RAY_FORCE_RECONNECT_ROUTE_WAIT_SEC` **(Optional)** — Maximum seconds the repair step waits for the `app.github.dev` route after toggling port visibility. Default: `60`.
+- `G2RAY_HEADLESS_ROUTE_SETTLE_WAIT_SEC` **(Optional)** — Maximum seconds the detached post-start route-settling job keeps checking the GitHub edge after Xray and the local listener are ready. Default: `180`; this does not block Codespaces startup.
+- `G2RAY_HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC` **(Optional)** — Delay before that detached route-settling job begins. Default: `5`.
 - `G2RAY_GH_TIMEOUT_SEC` **(Optional)** — Maximum seconds for GitHub CLI control-plane calls. Default: `10`.
 - `G2RAY_LOG_MAX_BYTES` **(Optional)** — Maximum bytes per runtime log before rotation. Default: `1048576`.
 - `G2RAY_LOG_ROTATE_KEEP` **(Optional)** — Number of rotated log files to keep. Default: `3`.
@@ -357,11 +359,14 @@ Optional Cloudflare dashboard bindings:
 - `WAKE_FAST_PATH`: **Plaintext** optional toggle for the Worker's warm-route fast path. Default: `1`. When enabled, `/wake` first does a cheap route probe and, if the Codespace route is already stable and GitHub says it is Available, skips the GitHub `/start` call.
 - `CODESPACE_FORWARDING_DOMAIN`: **Plaintext** optional override for Codespaces route hostnames if GitHub changes the forwarding domain from `app.github.dev`. The Worker also accepts `CODESPACE_PORT_FORWARDING_DOMAIN` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN`.
 - `ROUTE_POLL_AFTER_SECONDS`: **Plaintext** optional browser/API retry hint while the route is settling. Default: `5`.
+- `GITHUB_STATE_WAIT_MS`, `ROUTE_WAIT_MS`, `ROUTE_POLL_INTERVAL_MS`, `ROUTE_FETCH_TIMEOUT_MS`: **Plaintext** optional Worker control-plane timings. Defaults return start/route progress quickly so the app/dashboard can poll instead of holding a single request open; changing these does not force GitHub's edge to settle faster.
 - `HEALTH_HISTORY_SAMPLE_MS`: **Plaintext** optional health-history sampling window for identical dashboard health polls when KV is configured. Default: `300000` (5 minutes); set `0` to keep only changed health states and transition events.
 
 With `WAKER_KV`, the Worker records quota-block incidents: first `HTTP 402`, latest `HTTP 402`, last successful wake/health check, and whether the same Codespace still appears accessible. It also samples duplicate health polls so the dashboard history stays readable, and a later health check can send one route-ready transition alert after a previously stuck route becomes usable. It can also enforce optional `WAKE_COOLDOWN_SECONDS` after a successful wake. With `QUOTA_SURVIVAL_CRON_ENABLED=true`, a Cloudflare Cron Trigger can check this state conservatively; it does not bypass quota and does not try repeated starts until the estimated monthly reset window.
 
 The Worker URL can be entered with or without `https://`, and with or without `/wake`; the panel normalizes it to `https://YOUR_WORKER.workers.dev/wake`.
+
+If a client network times out connecting to the `workers.dev` Waker hostname, attach a custom domain directly to the Worker (for example `wake.yourdomain.com`) and save that URL in panel option `15` and the Android account. This is an alternate **Waker control-plane** hostname only; it does not proxy the Codespaces tunnel and therefore does not need Cloudflare paid Host/SNI origin overrides. Cloudflare documents this as a Worker Custom Domain under **Workers & Pages > Worker > Settings > Domains & Routes**.
 
 Quick setup:
 
