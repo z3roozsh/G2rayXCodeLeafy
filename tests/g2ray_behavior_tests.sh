@@ -29,6 +29,11 @@ reset_runtime_paths() {
     ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
     ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
     ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+    ROUTE_REFRESH_STATE_FILE="$DATA_DIR/route_refresh_state.tsv"
+    ROUTE_STATE_LOCK_FILE="$DATA_DIR/route-state.lock"
+    ROUTE_REFRESH_REQUEST_LOCK_FILE="$DATA_DIR/route-refresh-request.lock"
+    TRAFFIC_STATS_LOCK_FILE="$DATA_DIR/traffic-stats.lock"
+    EXPORT_LOCK_FILE="$DATA_DIR/config-exports.lock"
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
@@ -88,11 +93,13 @@ reset_runtime_paths() {
     MAX_FALLBACK_LINKS=20
     ROUTE_MONITOR_MAX_CANDIDATES=24
     ROUTE_HEALTH_TTL_SEC=300
+    ROUTE_REFRESH_BACKOFF_INITIAL_SEC=60
+    ROUTE_REFRESH_BACKOFF_MAX_SEC=600
     DNS_CACHE_TTL_SEC=300
     ROUTE_FAILURE_COOLDOWN_SEC=180
     LAST_GOOD_ROUTE_MAX_AGE_SEC=1800
     PERFORMANCE_PROFILE=balanced
-    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_EXPORT_REVALIDATE_TOP_CACHED G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED G2RAY_PORT_FORWARDING_DOMAIN GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
+    unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED G2RAY_PORT_FORWARDING_DOMAIN GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
 }
 
 export CODESPACE_NAME="behavior-space"
@@ -814,7 +821,7 @@ test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down() 
     }
     xhttp_probe_metrics() { fail "cooled-down route was probed unexpectedly"; }
 
-    refresh_route_candidate_health || fail "route health refresh failed when all candidates were cooled down"
+    refresh_route_candidate_health --force || fail "route health refresh failed when all candidates were cooled down"
     eval "$original_resolver"
     eval "$original_probe"
     grep -Fq $'20.0.0.1\t200\t50\ttrue' "$ROUTE_HEALTH_FILE" \
@@ -840,7 +847,7 @@ test_route_health_refresh_preserves_cache_when_all_probes_are_unusable() {
     }
     xhttp_probe_metrics() { printf '404 25 route_settling_404\n'; }
 
-    refresh_route_candidate_health || fail "route health refresh failed during all-404 settling"
+    refresh_route_candidate_health --force || fail "route health refresh failed during all-404 settling"
     eval "$original_resolver"
     eval "$original_probe"
     grep -Fq $'20.0.0.1\t200\t50\ttrue' "$ROUTE_HEALTH_FILE" \
@@ -871,7 +878,7 @@ test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap() {
         printf '200 10 ready\n'
     }
 
-    refresh_route_candidate_health || fail "route health refresh failed with provider/cache mix"
+    refresh_route_candidate_health --force || fail "route health refresh failed with provider/cache mix"
     eval "$original_provider"
     eval "$original_probe"
     grep -Fxq '20.0.0.9' "$probed_file" \
@@ -899,7 +906,7 @@ test_route_health_refresh_does_not_let_unusable_cache_starve_builtins() {
         printf '200 10 ready\n'
     }
 
-    refresh_route_candidate_health || fail "route health refresh failed with unusable cached rows"
+    refresh_route_candidate_health --force || fail "route health refresh failed with unusable cached rows"
     eval "$original_provider"
     eval "$original_probe"
     grep -Fxq '20.0.0.9' "$probed_file" \
@@ -1070,7 +1077,7 @@ EOF
     pass "usable fallback exports use fresh cached route health"
 }
 
-test_usable_fallback_ips_revalidates_top_cached_route() {
+test_usable_fallback_ips_does_not_live_probe_cached_routes() {
     reset_runtime_paths
     ROUTE_HEALTH_TTL_SEC=300
     MAX_FALLBACK_LINKS=2
@@ -1079,25 +1086,16 @@ test_usable_fallback_ips_revalidates_top_cached_route() {
 2026-05-30T00:00:00Z	20.0.0.5	200	70	true
 2026-05-30T00:00:00Z	20.0.0.6	200	80	true
 EOF
-    resolve_domain_ips() {
-        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7
-    }
-    xhttp_probe_metrics() {
-        case "${2:-}" in
-            20.0.0.5) printf '404 40 route_settling_404\n' ;;
-            *) printf '200 60 ready\n' ;;
-        esac
-    }
+    resolve_domain_ips() { fail "exports must not synchronously resolve candidate routes"; }
+    xhttp_probe_metrics() { fail "exports must not synchronously probe cached routes"; }
 
     mapfile -t routes < <(usable_fallback_ips)
-    [[ "${routes[*]}" == "20.0.0.6 20.0.0.7" ]] \
-        || fail "usable_fallback_ips did not replace stale top cached route: ${routes[*]:-none}"
-    grep -Fq 'fallback_route_cache_stale ip=20.0.0.5' "$LOG_FILE" \
-        || fail "stale top cache revalidation was not logged"
-    pass "usable fallback exports revalidate the top cached route"
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] \
+        || fail "usable_fallback_ips did not reuse cached routes: ${routes[*]:-none}"
+    pass "usable fallback exports do not synchronously re-probe cached routes"
 }
 
-test_usable_fallback_ips_revalidates_each_cached_route_before_export() {
+test_usable_fallback_ips_does_not_fill_partial_cache_synchronously() {
     reset_runtime_paths
     ROUTE_HEALTH_TTL_SEC=300
     MAX_FALLBACK_LINKS=3
@@ -1107,29 +1105,13 @@ test_usable_fallback_ips_revalidates_each_cached_route_before_export() {
 2026-05-30T00:00:00Z	20.0.0.6	200	80	true
 2026-05-30T00:00:00Z	20.0.0.7	200	90	true
 EOF
-    resolve_domain_ips() {
-        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7 20.0.0.8
-    }
-    local probes_file="$TMP_ROOT/revalidate-each-cached.txt"
-    : > "$probes_file"
-    xhttp_probe_metrics() {
-        printf '%s\n' "$2" >> "$probes_file"
-        case "${2:-}" in
-            20.0.0.6) printf '404 44 route_settling_404\n' ;;
-            *) printf '200 60 ready\n' ;;
-        esac
-    }
+    resolve_domain_ips() { fail "exports must not synchronously discover extra routes"; }
+    xhttp_probe_metrics() { fail "exports must not synchronously probe extra routes"; }
 
     mapfile -t routes < <(usable_fallback_ips)
-    [[ "${routes[*]}" == "20.0.0.5 20.0.0.7 20.0.0.8" ]] \
-        || fail "usable_fallback_ips exported stale cached route instead of replacing it: ${routes[*]:-none}"
-    grep -Fxq '20.0.0.5' "$probes_file" \
-        || fail "first cached route was not revalidated"
-    grep -Fxq '20.0.0.6' "$probes_file" \
-        || fail "second cached route was not revalidated"
-    grep -Fxq '20.0.0.7' "$probes_file" \
-        || fail "third cached route was not revalidated"
-    pass "usable fallback exports revalidate each cached route before export"
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6 20.0.0.7" ]] \
+        || fail "usable_fallback_ips did not return the full cached selection: ${routes[*]:-none}"
+    pass "usable fallback exports do not synchronously fill partial cache"
 }
 
 test_usable_fallback_ips_fills_partial_fresh_cache() {
@@ -1141,85 +1123,57 @@ test_usable_fallback_ips_fills_partial_fresh_cache() {
 2026-05-30T00:00:00Z	20.0.0.5	200	70	true
 2026-05-30T00:00:00Z	20.0.0.6	200	80	true
 EOF
-    resolve_domain_ips() {
-        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7 20.0.0.8 20.0.0.9
-    }
-    local probes_file="$TMP_ROOT/partial-cache-probes.txt"
-    : > "$probes_file"
-    xhttp_probe_metrics() {
-        printf '%s\n' "$2" >> "$probes_file"
-        printf '200 60 ready\n'
-    }
-
-    mapfile -t routes < <(usable_fallback_ips)
-    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6 20.0.0.7 20.0.0.8" ]] \
-        || fail "usable_fallback_ips did not fill partial cached routes with live probes"
-    grep -Fxq '20.0.0.5' "$probes_file" \
-        || fail "usable_fallback_ips did not revalidate the top cached route"
-    grep -Fxq '20.0.0.6' "$probes_file" \
-        || fail "usable_fallback_ips did not revalidate each cached route before export"
-    pass "usable fallback exports fill partial fresh cache with live-probed routes"
-}
-
-test_usable_fallback_ips_uses_domain_only_when_all_live_probes_are_unusable_by_default() {
-    reset_runtime_paths
-    ROUTE_HEALTH_TTL_SEC=300
-    MAX_FALLBACK_LINKS=3
-    PORT_DOMAIN="behavior-space-443.app.github.dev"
-    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
-2026-05-30T00:00:00Z	20.0.0.5	200	70	true
-2026-05-30T00:00:00Z	20.0.0.6	200	80	true
-EOF
-    resolve_domain_ips() {
-        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7
-    }
-    xhttp_probe_metrics() {
-        printf '404 50 route_settling_404\n'
-    }
-
-    mapfile -t routes < <(usable_fallback_ips)
-    ((${#routes[@]} == 0)) || fail "usable_fallback_ips exported stale cached routes by default: ${routes[*]:-none}"
-    grep -Fq 'fallback_route_filter no-usable-probes action=domain-only' "$LOG_FILE" \
-        || fail "all-probe failure did not fall back to domain-only by default"
-    pass "usable fallback exports use domain-only when all live probes are unusable by default"
-}
-
-test_usable_fallback_ips_can_opt_in_to_stale_cached_routes() {
-    reset_runtime_paths
-    ROUTE_HEALTH_TTL_SEC=300
-    MAX_FALLBACK_LINKS=3
-    G2RAY_ALLOW_STALE_FALLBACK_EXPORT=1
-    PORT_DOMAIN="behavior-space-443.app.github.dev"
-    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
-2026-05-30T00:00:00Z	20.0.0.5	200	70	true
-2026-05-30T00:00:00Z	20.0.0.6	200	80	true
-EOF
-    resolve_domain_ips() {
-        printf '%s\n' 20.0.0.5 20.0.0.6 20.0.0.7
-    }
-    xhttp_probe_metrics() {
-        printf '404 50 route_settling_404\n'
-    }
+    resolve_domain_ips() { fail "exports must not synchronously fill routes"; }
+    xhttp_probe_metrics() { fail "exports must not synchronously probe routes"; }
 
     mapfile -t routes < <(usable_fallback_ips)
     [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] \
-        || fail "usable_fallback_ips did not preserve cached routes when explicitly enabled: ${routes[*]:-none}"
-    grep -Fq 'fallback_route_filter no-usable-probes action=cached-stale' "$LOG_FILE" \
-        || fail "explicit stale fallback export did not log cached-stale"
-    pass "usable fallback exports can explicitly preserve cached routes during temporary route settling"
+        || fail "usable_fallback_ips filled partial cache synchronously: ${routes[*]:-none}"
+    pass "usable fallback exports keep partial cache responsive"
 }
 
-test_usable_fallback_ips_caps_live_probe_fallback() {
+test_usable_fallback_ips_keeps_cached_routes_during_route_settling() {
+    reset_runtime_paths
+    ROUTE_HEALTH_TTL_SEC=300
+    MAX_FALLBACK_LINKS=3
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+2026-05-30T00:00:00Z	20.0.0.6	200	80	true
+EOF
+    resolve_domain_ips() { fail "exports must not run a live settling probe"; }
+    xhttp_probe_metrics() { fail "exports must not run a live settling probe"; }
+
+    mapfile -t routes < <(usable_fallback_ips)
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] \
+        || fail "usable_fallback_ips did not preserve last-known routes during settling: ${routes[*]:-none}"
+    pass "usable fallback exports keep last-known routes during route settling"
+}
+
+test_usable_fallback_ips_keeps_cached_routes_without_opt_in() {
+    reset_runtime_paths
+    ROUTE_HEALTH_TTL_SEC=300
+    MAX_FALLBACK_LINKS=3
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    cat > "$ROUTE_HEALTH_FILE" <<'EOF'
+2026-05-30T00:00:00Z	20.0.0.5	200	70	true
+2026-05-30T00:00:00Z	20.0.0.6	200	80	true
+EOF
+    resolve_domain_ips() { fail "exports must not synchronously probe stale cache"; }
+    xhttp_probe_metrics() { fail "exports must not synchronously probe stale cache"; }
+
+    mapfile -t routes < <(usable_fallback_ips)
+    [[ "${routes[*]}" == "20.0.0.5 20.0.0.6" ]] \
+        || fail "usable_fallback_ips did not preserve cached routes: ${routes[*]:-none}"
+    pass "usable fallback exports preserve cached routes without an opt-in flag"
+}
+
+test_usable_fallback_ips_never_runs_live_probe_fallback() {
     reset_runtime_paths
     MAX_FALLBACK_LINKS=1
     ROUTE_MONITOR_MAX_CANDIDATES=3
     PORT_DOMAIN="behavior-space-443.app.github.dev"
-    refresh_route_candidate_health() { return 0; }
-    resolve_domain_ips() {
-        for i in $(seq 1 12); do
-            printf '20.0.0.%s\n' "$i"
-        done
-    }
+    resolve_domain_ips() { fail "exports must not resolve fallback candidates"; }
     local probes_file="$TMP_ROOT/live-fallback-probes.txt"
     : > "$probes_file"
     xhttp_probe_metrics() {
@@ -1230,8 +1184,8 @@ test_usable_fallback_ips_caps_live_probe_fallback() {
     usable_fallback_ips >/dev/null || true
     local probes
     probes=$(wc -l < "$probes_file" | tr -d ' ')
-    [[ "$probes" -eq 3 ]] || fail "live fallback probe path was not capped at route monitor max; got $probes"
-    pass "usable fallback live probes are bounded by route monitor cap"
+    [[ "$probes" -eq 0 ]] || fail "export path still ran a live fallback probe; got $probes"
+    pass "usable fallback exports never run a live fallback probe"
 }
 
 test_xhttp_config_path_is_cached_by_config_content() {
@@ -2058,19 +2012,19 @@ test_performance_profile_settings_are_available() {
     low_overhead="$(performance_profile_settings low_overhead)"
     streaming="$(performance_profile_settings streaming)"
     max_throughput="$(performance_profile_settings max_throughput)"
-    grep -Fq 'maxConcurrentUploads=16' <<< "$balanced" || fail "balanced profile missing expected concurrency"
+    ! grep -Fq 'maxConcurrentUploads=' <<< "$balanced" || fail "balanced profile still claims obsolete XHTTP concurrency tuning"
+    ! grep -Fq 'maxUploadSize=' <<< "$balanced" || fail "balanced profile still claims obsolete XHTTP upload tuning"
     grep -Fq 'sniffQuic=false' <<< "$balanced" || fail "balanced profile should disable QUIC sniffing"
-    grep -Fq 'maxConcurrentUploads=24' <<< "$low_latency" || fail "low_latency profile missing higher concurrency"
-    grep -Fq 'connIdle=240' <<< "$low_latency" || fail "low_latency profile should reap idle mobile connections faster"
+    grep -Fq 'connIdle=600' <<< "$low_latency" || fail "low_latency profile should keep idle sessions available"
     grep -Fq 'sniffQuic=false' <<< "$low_latency" || fail "low_latency profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$streaming" || fail "streaming profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
     local mobile; mobile="$(performance_profile_settings unstable_mobile)"
-    grep -Fq 'connIdle=180' <<< "$mobile" || fail "unstable_mobile profile should use shorter connIdle"
-    grep -Fq 'connIdle=300' <<< "$balanced" || fail "balanced profile should use moderate connIdle"
+    grep -Fq 'connIdle=600' <<< "$mobile" || fail "unstable_mobile profile should keep idle sessions available"
+    grep -Fq 'connIdle=600' <<< "$balanced" || fail "balanced profile should keep idle sessions available"
     grep -Fq 'name=max_throughput' <<< "$max_throughput" || fail "max_throughput profile is not selectable"
-    grep -Fq 'maxConcurrentUploads=32' <<< "$max_throughput" || fail "max_throughput profile does not raise upload concurrency"
-    grep -Fq 'bufferSize=2048' <<< "$max_throughput" || fail "max_throughput profile does not enlarge per-connection buffers"
+    ! grep -Fq 'maxConcurrentUploads=' <<< "$max_throughput" || fail "max_throughput profile still claims obsolete XHTTP concurrency tuning"
+    grep -Fq 'bufferSize=1024' <<< "$max_throughput" || fail "max_throughput profile does not use the bounded throughput buffer"
     grep -Fq 'sniffQuic=false' <<< "$max_throughput" || fail "max_throughput profile should disable QUIC sniffing"
     pass "performance profile settings are explicit and inspectable"
 }
@@ -2628,6 +2582,74 @@ test_support_bundle_marks_unreadable_optional_logs() {
     pass "support bundle marks unreadable optional logs"
 }
 
+test_route_refresh_backoff_preserves_cache_without_probe_storms() {
+    reset_runtime_paths
+    printf '{}\n' > "$CONFIG_FILE"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    ROUTE_MONITOR_MAX_CANDIDATES=1
+    ROUTE_PROBE_CONCURRENCY=1
+    ROUTE_FAILURE_COOLDOWN_SEC=0
+    printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t50\ttrue\tdns\tready\n' > "$ROUTE_HEALTH_FILE"
+    local original_resolver original_probe
+    original_resolver="$(declare -f resolve_domain_ips_with_sources)"
+    original_probe="$(declare -f xhttp_probe_metrics)"
+    resolve_domain_ips_with_sources() { printf 'dns\t20.0.0.2\n'; }
+    xhttp_probe_metrics() { printf '404 25 route_settling_404\n'; }
+
+    refresh_route_candidate_health --force || fail "forced failed route refresh did not complete"
+    grep -Fq $'20.0.0.1\t200\t50\ttrue' "$ROUTE_HEALTH_FILE" \
+        || fail "failed refresh did not preserve the last known usable cache"
+    grep -Fq $'consecutive_failures\t1' "$ROUTE_REFRESH_STATE_FILE" \
+        || fail "failed refresh did not record backoff state"
+
+    touch -d '1 hour ago' "$ROUTE_HEALTH_FILE"
+    xhttp_probe_metrics() { fail "backoff allowed an immediate duplicate route scan"; }
+    refresh_route_candidate_health || fail "backoff-skipped refresh returned failure"
+    eval "$original_resolver"
+    eval "$original_probe"
+    grep -Fq 'route_candidate_monitor deferred reason=backoff' "$LOG_FILE" \
+        || fail "route refresh backoff was not logged"
+    pass "route refresh backoff preserves cache and prevents probe storms"
+}
+
+test_self_heal_defers_external_repairs_while_traffic_is_active() {
+    (
+        reset_runtime_paths
+        printf '{}\n' > "$CONFIG_FILE"
+        date +%s > "$ACTIVE_TRAFFIC_STAMP_FILE"
+        ensure_codespace_port_public() { return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { printf '404 25 route_settling_404\n'; }
+        curl_http_code() { printf '404\n'; }
+        repair_codespace_port_route() { fail "self-heal repaired the route despite recent active traffic"; }
+        force_reconnect() { fail "self-heal reconnected despite recent active traffic"; }
+        reset_route_bad_count() { return 0; }
+        reset_edge_bad_count() { return 0; }
+
+        self_heal_once || fail "self-heal failed while deferring an external probe"
+        grep -Fq 'action=defer_active_traffic' "$LOG_FILE" \
+            || fail "self-heal did not log active-traffic deferral"
+    )
+    pass "self-heal defers disruptive external repair while traffic is active"
+}
+
+test_deadline_terminates_descendant_processes() {
+    reset_runtime_paths
+    local child_file child rc
+    child_file="$TMP_ROOT/deadline-child.pid"
+    set +e
+    run_with_deadline 1 bash -c 'sleep 30 & child=$!; printf "%s\n" "$child" > "$1"; wait "$child"' _ "$child_file"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 124 ]] || fail "deadline wrapper returned $rc instead of timeout status 124"
+    child=$(cat "$child_file" 2>/dev/null || true)
+    [[ "$child" =~ ^[0-9]+$ ]] || fail "deadline child PID was not recorded"
+    sleep 0.2
+    ! kill -0 "$child" 2>/dev/null || fail "deadline left a descendant process running"
+    pass "deadline wrapper terminates descendant processes"
+}
+
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
@@ -2663,6 +2685,9 @@ test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down
 test_route_health_refresh_preserves_cache_when_all_probes_are_unusable
 test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap
 test_route_health_refresh_does_not_let_unusable_cache_starve_builtins
+test_route_refresh_backoff_preserves_cache_without_probe_storms
+test_self_heal_defers_external_repairs_while_traffic_is_active
+test_deadline_terminates_descendant_processes
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
@@ -2671,12 +2696,12 @@ test_wide_dns_discovery_queries_multiple_ecs_subnets
 test_batch_manual_route_import_extracts_valid_unique_ipv4s
 test_last_known_state_scans_full_current_log
 test_usable_fallback_ips_uses_fresh_cache
-test_usable_fallback_ips_revalidates_top_cached_route
-test_usable_fallback_ips_revalidates_each_cached_route_before_export
+test_usable_fallback_ips_does_not_live_probe_cached_routes
+test_usable_fallback_ips_does_not_fill_partial_cache_synchronously
 test_usable_fallback_ips_fills_partial_fresh_cache
-test_usable_fallback_ips_uses_domain_only_when_all_live_probes_are_unusable_by_default
-test_usable_fallback_ips_can_opt_in_to_stale_cached_routes
-test_usable_fallback_ips_caps_live_probe_fallback
+test_usable_fallback_ips_keeps_cached_routes_during_route_settling
+test_usable_fallback_ips_keeps_cached_routes_without_opt_in
+test_usable_fallback_ips_never_runs_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
 test_generate_config_replaces_stale_no_config_boot_status

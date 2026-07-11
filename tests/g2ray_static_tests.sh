@@ -1361,13 +1361,12 @@ test_soft_recovery_and_route_memory_are_present() {
 }
 
 test_route_export_and_reconnect_edges_are_hardened() {
-    if grep_fixed 'fallback_route_filter no-usable-probes action=export-candidates' "$SCRIPT"; then
-        fail 'fallback exports still emit candidates after all route probes failed'
-    fi
-    grep_fixed 'fallback_route_filter no-usable-probes action=cached-stale' "$SCRIPT" \
-        || fail 'fallback exports do not preserve cached IP routes during temporary route settling'
-    grep_fixed 'fallback_route_filter no-usable-probes action=domain-only' "$SCRIPT" \
-        || fail 'fallback exports do not fall back to the domain link when no cached IP route is available'
+    grep_fixed 'effective_export_route_ips()' "$SCRIPT" \
+        || fail 'fallback exports do not read the effective cached route selection'
+    grep_fixed 'request_route_candidate_health_refresh' "$SCRIPT" \
+        || fail 'fallback exports do not request a bounded background route refresh'
+    grep_fixed 'fallback_route_filter no_cached_usable_routes action=domain_only_refresh_requested' "$SCRIPT" \
+        || fail 'fallback exports do not explain the domain-only case when no route cache exists'
     awk '
         /generate_config\(\)/ { in_fn=1 }
         in_fn && index($0, "refresh_config_exports >/dev/null 2>&1 || true") { saw=1 }
@@ -1642,22 +1641,23 @@ test_background_supervisor_ownership_is_strict() {
 test_exports_filter_unusable_fallback_routes() {
     grep_fixed 'usable_fallback_ips()' "$SCRIPT" \
         || fail 'fallback exports cannot filter unusable route IPs'
-    grep_fixed 'xhttp_probe_metrics external "$ip"' "$SCRIPT" \
-        || fail 'fallback export filtering does not probe each IP route'
-    grep_fixed 'xhttp_status_usable "$ip_probe"' "$SCRIPT" \
-        || fail 'fallback export filtering does not require usable XHTTP status'
+    grep_fixed 'cached_usable_fallback_ips' "$SCRIPT" \
+        || fail 'fallback exports do not consume measured usable route health'
     grep_fixed 'generate_ip_links_from_list "$(usable_fallback_ips || true)"' "$SCRIPT" \
         || fail 'generate_ip_links does not use the filtered fallback route list'
     grep_fixed 'ip_links=$(generate_ip_links_from_list "$fallback_ips" || true)' "$SCRIPT" \
         || fail 'ordered exports do not reuse a shared filtered fallback route list'
     grep_fixed 'address=$(usable_fallback_ips | head -1 || true)' "$SCRIPT" \
         || fail 'recommended IP link does not prefer a usable fallback route'
-    grep_fixed '[[ " $emitted " == *" $ip "* ]] && continue' "$SCRIPT" \
-        || fail 'fallback export fill path does not skip routes already emitted from cache'
-    if grep_fixed '(( count > 0 )) && return 0' "$SCRIPT"; then
-        fail 'fresh-but-partial route cache can still stop fallback exports before filling available slots'
+    if awk '
+        /usable_fallback_ips\(\)/ { in_fn=1; next }
+        in_fn && /^}/ { exit }
+        in_fn && /xhttp_probe_metrics|resolve_domain_ips/ { bad=1 }
+        END { exit bad ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail 'fallback exports still synchronously probe or resolve routes'
     fi
-    pass 'fallback exports filter unusable route IPs'
+    pass 'fallback exports use cached measured routes without serial live probes'
 }
 
 test_runtime_ready_rejects_started_but_unusable_route() {

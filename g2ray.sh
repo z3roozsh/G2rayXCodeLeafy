@@ -73,6 +73,11 @@ EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 ROUTE_HEALTH_FILE="$DATA_DIR/route_candidate_health.tsv"
 ROUTE_STATS_FILE="$DATA_DIR/route_candidate_stats.tsv"
 ROUTE_COOLDOWN_FILE="$DATA_DIR/route_candidate_cooldowns.tsv"
+ROUTE_REFRESH_STATE_FILE="$DATA_DIR/route_refresh_state.tsv"
+ROUTE_STATE_LOCK_FILE="$DATA_DIR/route-state.lock"
+ROUTE_REFRESH_REQUEST_LOCK_FILE="$DATA_DIR/route-refresh-request.lock"
+TRAFFIC_STATS_LOCK_FILE="$DATA_DIR/traffic-stats.lock"
+EXPORT_LOCK_FILE="$DATA_DIR/config-exports.lock"
 DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
@@ -150,6 +155,8 @@ HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC="${G2RAY_HEADLESS_ROUTE_SETTLE_INITIAL_D
 ROUTE_READY_STABLE_PROBES="${G2RAY_ROUTE_READY_STABLE_PROBES:-2}"
 ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
+ROUTE_REFRESH_BACKOFF_INITIAL_SEC="${G2RAY_ROUTE_REFRESH_BACKOFF_INITIAL_SEC:-60}"
+ROUTE_REFRESH_BACKOFF_MAX_SEC="${G2RAY_ROUTE_REFRESH_BACKOFF_MAX_SEC:-600}"
 DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
 ROUTE_FAILURE_COOLDOWN_SEC="${G2RAY_ROUTE_FAILURE_COOLDOWN_SEC:-180}"
 ROUTE_REPAIR_COOLDOWN_SEC="${G2RAY_ROUTE_REPAIR_COOLDOWN_SEC:-180}"
@@ -202,6 +209,9 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 (( HEADLESS_ROUTE_SETTLE_WAIT_SEC > 300 )) && HEADLESS_ROUTE_SETTLE_WAIT_SEC=300
 [[ "$HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC" =~ ^[0-9]+$ ]] || HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=5
 (( HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC > 30 )) && HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=30
+[[ "$ROUTE_HEALTH_TTL_SEC" =~ ^[0-9]+$ && "$ROUTE_HEALTH_TTL_SEC" -ge 30 ]] || ROUTE_HEALTH_TTL_SEC=300
+[[ "$ROUTE_REFRESH_BACKOFF_INITIAL_SEC" =~ ^[0-9]+$ && "$ROUTE_REFRESH_BACKOFF_INITIAL_SEC" -ge 15 ]] || ROUTE_REFRESH_BACKOFF_INITIAL_SEC=60
+[[ "$ROUTE_REFRESH_BACKOFF_MAX_SEC" =~ ^[0-9]+$ && "$ROUTE_REFRESH_BACKOFF_MAX_SEC" -ge "$ROUTE_REFRESH_BACKOFF_INITIAL_SEC" ]] || ROUTE_REFRESH_BACKOFF_MAX_SEC=600
 [[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
 [[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=6
 (( ROUTE_PROBE_CONCURRENCY > 16 )) && ROUTE_PROBE_CONCURRENCY=16
@@ -456,15 +466,6 @@ show_xhttp_mode_manager() {
     done
 }
 
-route_export_revalidate_top_cached_enabled() {
-    local value
-    value=$(printf '%s' "${G2RAY_EXPORT_REVALIDATE_TOP_CACHED:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    case "$value" in
-        0|false|no|off|disabled) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
 wide_dns_discovery_enabled() {
     local value
     value=$(printf '%s' "${G2RAY_WIDE_DNS_DISCOVERY:-${WIDE_DNS_DISCOVERY:-1}}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
@@ -539,9 +540,10 @@ tcp_fast_open_outbound_enabled() {
 }
 
 run_with_deadline() {
-    local seconds="${1:-30}" pid waited=0 status=0 status_file command_name
+    local seconds="${1:-30}" pid waited_ticks=0 max_ticks status=0 status_file command_name
     shift || return 1
     [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=30
+    max_ticks=$((seconds * 10))
     command_name="${1:-unknown}"
     status_file=$(mktemp "${TMPDIR:-/tmp}/g2ray-deadline.XXXXXX") || { "$@"; return $?; }
     rm -f "$status_file" 2>/dev/null || true
@@ -552,10 +554,10 @@ run_with_deadline() {
     ) &
     pid=$!
     while [[ ! -s "$status_file" ]]; do
-        if (( waited >= seconds )); then
-            kill "$pid" 2>/dev/null || true
-            sleep 1
-            kill -9 "$pid" 2>/dev/null || true
+        if (( waited_ticks >= max_ticks )); then
+            terminate_process_tree "$pid"
+            sleep 0.2
+            kill_process_tree_hard "$pid"
             wait "$pid" 2>/dev/null || true
             rm -f "$status_file" 2>/dev/null || true
             log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
@@ -566,14 +568,64 @@ run_with_deadline() {
             rm -f "$status_file" 2>/dev/null || true
             return "$status"
         fi
-        sleep 1
-        waited=$((waited + 1))
+        sleep 0.1
+        waited_ticks=$((waited_ticks + 1))
     done
     status=$(cat "$status_file" 2>/dev/null || printf '1')
     wait "$pid" 2>/dev/null || true
     rm -f "$status_file" 2>/dev/null || true
     [[ "$status" =~ ^[0-9]+$ ]] || status=1
     return "$status"
+}
+
+deadline_child_pids() {
+    local parent="${1:-}"
+    [[ "$parent" =~ ^[0-9]+$ ]] || return 0
+    {
+        command -v pgrep >/dev/null 2>&1 && pgrep -P "$parent" 2>/dev/null || true
+        ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$parent" '$2 == parent {print $1}' || true
+        ps -ef 2>/dev/null | awk -v parent="$parent" '$3 == parent {print $2}' || true
+    } | awk 'NF && /^[0-9]+$/ && !seen[$0]++ {print}'
+}
+
+# A deadline must stop the whole command tree, not only its shell wrapper. Route
+# probes spawn helpers (curl, dig, awk) that otherwise survive a timeout and can
+# continue writing state after the caller has moved on.
+terminate_process_tree() {
+    local pid="${1:-}" child
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    while IFS= read -r child; do
+        [[ "$child" =~ ^[0-9]+$ ]] || continue
+        terminate_process_tree "$child"
+    done < <(deadline_child_pids "$pid")
+    kill -TERM "$pid" 2>/dev/null || true
+}
+
+kill_process_tree_hard() {
+    local pid="${1:-}" child
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    while IFS= read -r child; do
+        [[ "$child" =~ ^[0-9]+$ ]] || continue
+        kill_process_tree_hard "$child"
+    done < <(deadline_child_pids "$pid")
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# flock is present in the Codespaces image. Keep a direct-call fallback for
+# minimal shells so the panel still works if the optional utility is absent.
+with_file_lock() {
+    local lock_file="${1:-}" timeout_sec="${2:-5}"
+    shift 2 || return 1
+    [[ -n "$lock_file" ]] || return 1
+    [[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=5
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -w "$timeout_sec" 9 || return 1
+            "$@"
+        ) 9>"$lock_file"
+    else
+        "$@"
+    fi
 }
 
 log_structured_event() {
@@ -2391,7 +2443,7 @@ xray_stats_inbound_totals() {
     '
 }
 
-save_xray_stats() {
+_save_xray_stats_impl() {
     xray_running || return 0
     local stats sd su bd bu svd svu dd du
     stats=$(sudo timeout 3 "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null) || return 0
@@ -2413,6 +2465,10 @@ save_xray_stats() {
             "$(awk -v a="$svu" -v b="$du" 'BEGIN{printf "%.0f",a+b}')")"
     _atomic_write "$SESSION_BYTES_FILE" \
         "$(printf '{"down":%s,"up":%s}' "$sd" "$su")"
+}
+
+save_xray_stats() {
+    with_file_lock "$TRAFFIC_STATS_LOCK_FILE" 3 _save_xray_stats_impl "$@"
 }
 
 get_data_usage() {
@@ -2726,7 +2782,7 @@ health_probe() {
 
 self_heal_once() {
     [[ -f "$CONFIG_FILE" ]] || return 0
-    local reason="" code xcode xms bad_count threshold
+    local reason="" code xcode xms bad_count threshold traffic_active=false
 
     if ! ensure_codespace_port_public >/dev/null 2>&1; then
         log_event WARN "self_heal port_public_failed port=${XRAY_PORT}"
@@ -2753,6 +2809,19 @@ self_heal_once() {
     if xhttp_status_usable "$xcode"; then
         reset_route_bad_count
         reset_edge_bad_count
+        return 0
+    fi
+
+    # A probe is only a control-plane signal. Do not tear down an active tunnel
+    # because GitHub's edge briefly returns 404/timeout while real traffic is
+    # still flowing. Dead core/listener recovery above remains immediate.
+    if active_tunnel_recent; then
+        traffic_active=true
+    fi
+    if [[ "$traffic_active" == true ]]; then
+        reset_route_bad_count
+        reset_edge_bad_count
+        log_event WARN "self_heal external_probe_failed xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=defer_active_traffic"
         return 0
     fi
 
@@ -2799,6 +2868,7 @@ _background_tasks() {
     write_background_supervisor_heartbeat
     if [[ -f "$CONFIG_FILE" ]]; then
         force_public_runtime_ports "supervisor_start" >/dev/null 2>&1 || true
+        run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         if ! latency_focus_enabled; then
             run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
@@ -2825,8 +2895,8 @@ _background_tasks() {
             fi
         fi
         [[ -f "$CONFIG_FILE" ]] || continue
-        run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
+        run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         if active_tunnel_recent; then
             continue
@@ -3183,22 +3253,22 @@ performance_profile_settings() {
     local profile="${1:-$PERFORMANCE_PROFILE}"
     case "$profile" in
         low_latency|latency)
-            printf 'name=low_latency\nmaxUploadSize=3000000\nmaxConcurrentUploads=24\nhandshake=3\nconnIdle=240\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=low_latency\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         streaming|video)
-            printf 'name=streaming\nmaxUploadSize=4000000\nmaxConcurrentUploads=20\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=streaming\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=false\nloglevel=warning\n'
             ;;
         unstable_mobile|mobile)
-            printf 'name=unstable_mobile\nmaxUploadSize=1500000\nmaxConcurrentUploads=12\nhandshake=4\nconnIdle=180\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=unstable_mobile\nhandshake=4\nconnIdle=600\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         low_overhead|minimal)
-            printf 'name=low_overhead\nmaxUploadSize=1000000\nmaxConcurrentUploads=8\nhandshake=3\nconnIdle=420\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
+            printf 'name=low_overhead\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
             ;;
         max_throughput|throughput|max|high_throughput)
-            printf 'name=max_throughput\nmaxUploadSize=4000000\nmaxConcurrentUploads=32\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=2048\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=max_throughput\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=1024\nsniffQuic=false\nloglevel=warning\n'
             ;;
         *)
-            printf 'name=balanced\nmaxUploadSize=2000000\nmaxConcurrentUploads=16\nhandshake=3\nconnIdle=300\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=balanced\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
     esac
 }
@@ -3248,12 +3318,10 @@ generate_config() {
         }
         had_previous_config=true
     fi
-    local profile_name max_upload_size max_concurrent_uploads handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_mode
+    local profile_name handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_mode
     while IFS='=' read -r key value; do
         case "$key" in
             name) profile_name="$value" ;;
-            maxUploadSize) max_upload_size="$value" ;;
-            maxConcurrentUploads) max_concurrent_uploads="$value" ;;
             handshake) handshake="$value" ;;
             connIdle) conn_idle="$value" ;;
             uplinkOnly) uplink_only="$value" ;;
@@ -3264,8 +3332,6 @@ generate_config() {
         esac
     done < <(performance_profile_settings "$(effective_performance_profile)")
     profile_name="${profile_name:-balanced}"
-    max_upload_size="${max_upload_size:-2000000}"
-    max_concurrent_uploads="${max_concurrent_uploads:-16}"
     handshake="${handshake:-3}"
     conn_idle="${conn_idle:-600}"
     uplink_only="${uplink_only:-2}"
@@ -3319,7 +3385,7 @@ JSONEOF
   "api": { "tag": "api", "services": ["StatsService"] },
   "policy": {
     "system": { "statsInboundDownlink": true, "statsInboundUplink": true },
-    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true, "handshake": ${handshake}, "connIdle": ${conn_idle}, "uplinkOnly": ${uplink_only}, "downlinkOnly": ${downlink_only}, "bufferSize": ${buffer_size} } }
+    "levels": { "0": { "statsUserUplink": false, "statsUserDownlink": false, "handshake": ${handshake}, "connIdle": ${conn_idle}, "uplinkOnly": ${uplink_only}, "downlinkOnly": ${downlink_only}, "bufferSize": ${buffer_size} } }
   },
   "dns": {
     "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
@@ -3338,7 +3404,7 @@ JSONEOF
       },
       "streamSettings": {
         "network": "xhttp", "security": "none",
-        "xhttpSettings": { "mode": "${xhttp_mode}", "path": "/", "maxUploadSize": ${max_upload_size}, "maxConcurrentUploads": ${max_concurrent_uploads} },
+        "xhttpSettings": { "mode": "${xhttp_mode}", "path": "/" },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
@@ -3886,8 +3952,71 @@ route_refresh_probe_candidates() {
     '
 }
 
-refresh_route_candidate_health() {
+route_refresh_state_value() {
+    local key="${1:-}"
+    [[ -n "$key" && -s "$ROUTE_REFRESH_STATE_FILE" ]] || return 0
+    awk -F '\t' -v key="$key" '$1 == key {print $2; exit}' "$ROUTE_REFRESH_STATE_FILE" 2>/dev/null || true
+}
+
+route_refresh_retry_allowed() {
+    local next now
+    next=$(route_refresh_state_value next_allowed_epoch)
+    [[ "$next" =~ ^[0-9]+$ ]] || return 0
+    now=$(date +%s)
+    (( now >= next ))
+}
+
+route_refresh_record_success() {
+    local now
+    now=$(date +%s)
+    _atomic_write "$ROUTE_REFRESH_STATE_FILE" "$(printf 'last_attempt_epoch\t%s\nconsecutive_failures\t0\nnext_allowed_epoch\t%s\n' "$now" "$now")" || return 0
+    chmod 600 "$ROUTE_REFRESH_STATE_FILE" 2>/dev/null || true
+}
+
+route_refresh_record_failure() {
+    local failures remaining delay now
+    failures=$(route_refresh_state_value consecutive_failures)
+    [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+    failures=$((failures + 1))
+    remaining="$failures"
+    delay="$ROUTE_REFRESH_BACKOFF_INITIAL_SEC"
+    while (( remaining > 1 && delay < ROUTE_REFRESH_BACKOFF_MAX_SEC )); do
+        delay=$((delay * 2))
+        remaining=$((remaining - 1))
+    done
+    (( delay > ROUTE_REFRESH_BACKOFF_MAX_SEC )) && delay="$ROUTE_REFRESH_BACKOFF_MAX_SEC"
+    now=$(date +%s)
+    _atomic_write "$ROUTE_REFRESH_STATE_FILE" "$(printf 'last_attempt_epoch\t%s\nconsecutive_failures\t%s\nnext_allowed_epoch\t%s\n' "$now" "$failures" "$((now + delay))")" || return 0
+    chmod 600 "$ROUTE_REFRESH_STATE_FILE" 2>/dev/null || true
+    log_event WARN "route_candidate_monitor backoff_sec=${delay} failures=${failures}"
+}
+
+request_route_candidate_health_refresh() {
     [[ -f "$CONFIG_FILE" ]] || return 0
+    route_health_cache_fresh && return 0
+    route_refresh_retry_allowed || return 0
+    (
+        if command -v flock >/dev/null 2>&1; then
+            flock -n 9 || exit 0
+        fi
+        log_event INFO "route_candidate_monitor refresh_requested reason=stale_export_cache"
+        run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
+        if route_health_cache_fresh; then
+            run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true
+        fi
+    ) 9>"$ROUTE_REFRESH_REQUEST_LOCK_FILE" >/dev/null 2>&1 &
+}
+
+_refresh_route_candidate_health_impl() {
+    local force="${1:-0}"
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    if [[ "$force" != "1" ]]; then
+        route_health_cache_fresh && return 0
+        if ! route_refresh_retry_allowed; then
+            log_event INFO "route_candidate_monitor deferred reason=backoff"
+            return 0
+        fi
+    fi
     local candidates probe_candidates source ip ip_probe ip_ms reason count=0 max route_health_tmp best_ip="" best_code=0 best_ms=99999999
     local concurrency pids=() files=() active=0 file result probed_count=0
     max=$(route_monitor_max_candidates)
@@ -3895,7 +4024,10 @@ refresh_route_candidate_health() {
     [[ "$concurrency" =~ ^[0-9]+$ && "$concurrency" -gt 0 ]] || concurrency=6
     (( concurrency > 16 )) && concurrency=16
     candidates=$(resolve_domain_ips_with_sources "$PORT_DOMAIN" || true)
-    [[ -n "$candidates" ]] || return 0
+    if [[ -z "$candidates" ]]; then
+        route_refresh_record_failure
+        return 0
+    fi
     route_health_tmp=$(mktemp "$DATA_DIR/route_health.XXXXXX") || return 1
 
     collect_route_probe_batch() {
@@ -3941,23 +4073,42 @@ refresh_route_candidate_health() {
     if (( probed_count == 0 )); then
         rm -f "$route_health_tmp" 2>/dev/null || true
         log_event WARN "route_candidate_monitor skipped_all_candidates count=${count} max=${max}"
+        route_refresh_record_failure
         return 0
     fi
     if [[ -z "$best_ip" && -s "$ROUTE_HEALTH_FILE" ]] \
         && awk -F '\t' '$5 == "true" { found=1 } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null; then
         rm -f "$route_health_tmp" 2>/dev/null || true
         log_event WARN "route_candidate_monitor all_unusable_preserved_cache count=${count} max=${max}"
+        route_refresh_record_failure
         return 0
     fi
     mv "$route_health_tmp" "$ROUTE_HEALTH_FILE"
     chmod 600 "$ROUTE_HEALTH_FILE" 2>/dev/null || true
+    if [[ -z "$best_ip" ]]; then
+        log_event WARN "route_candidate_monitor all_unusable_cached count=${count} max=${max}"
+        route_refresh_record_failure
+        return 0
+    fi
     [[ -n "$best_ip" ]] && save_last_good_route "$best_ip" "$best_code" "$best_ms" "route_candidate_monitor"
+    route_refresh_record_success
     log_event INFO "route_candidate_monitor refreshed count=${count} max=${max}"
+}
+
+refresh_route_candidate_health() {
+    local force=0
+    if [[ "${1:-}" == "--force" ]]; then
+        force=1
+        shift
+    fi
+    (($# == 0)) || return 1
+    with_file_lock "$ROUTE_STATE_LOCK_FILE" 45 _refresh_route_candidate_health_impl "$force"
 }
 
 route_health_cache_fresh() {
     local age
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
+    awk -F '\t' '$5 == "true" { found=1; exit } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null || return 1
     age=$(file_age_sec "$ROUTE_HEALTH_FILE")
     [[ "$ROUTE_HEALTH_TTL_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_TTL_SEC=300
     (( age <= ROUTE_HEALTH_TTL_SEC ))
@@ -4066,7 +4217,7 @@ route_candidate_health_summary() {
 
 route_candidate_refresh_with_feedback() {
     echo -e "  ${DIM}Refreshing route probes (up to ${G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC}s)...${NC}"
-    if run_with_deadline "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1; then
+    if run_with_deadline "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health --force >/dev/null 2>&1; then
         return 0
     fi
     echo -e "  ${YELLOW}Route probe refresh timed out; keeping last-known route data.${NC}"
@@ -4357,108 +4508,30 @@ safe_ws_fallback_links() {
     printf '%s' "$max"
 }
 
-stale_fallback_export_enabled() {
-    case "${G2RAY_ALLOW_STALE_FALLBACK_EXPORT:-0}" in
-        1|true|TRUE|yes|YES|on|ON) return 0 ;;
-        *) return 1 ;;
-    esac
+effective_export_route_ips() {
+    local max_links
+    max_links=$(safe_max_fallback_links)
+    cached_usable_fallback_ips 2>/dev/null | awk -v max="$max_links" 'NF {print; count++; if (count >= max) exit}'
 }
 
 usable_fallback_ips() {
-    local ip ip_probe ip_ms reason count=0 max_links candidates usable probe_cap min_probe_cap probed=0 emitted=""
-    local cached_routes=() cache_ready=true
+    local ip count=0 max_links
+    local cached_routes=()
     max_links=$(safe_max_fallback_links)
-    probe_cap=$(route_monitor_max_candidates)
-    min_probe_cap=$(( max_links * 3 ))
-    (( probe_cap < min_probe_cap )) && probe_cap=$min_probe_cap
-    (( probe_cap > 64 )) && probe_cap=64
+    mapfile -t cached_routes < <(effective_export_route_ips || true)
     if ! route_health_cache_fresh; then
-        refresh_route_candidate_health >/dev/null 2>&1 || true
+        # Exports are a read path. They must never become a second serial route
+        # scanner. Keep useful cached routes and ask the bounded monitor to refresh
+        # them in the background instead.
+        request_route_candidate_health_refresh
     fi
-    if route_health_cache_fresh; then
-        mapfile -t cached_routes < <(cached_usable_fallback_ips || true)
-        if ((${#cached_routes[@]})); then
-            if route_export_revalidate_top_cached_enabled; then
-                cache_ready=false
-                for ip in "${cached_routes[@]}"; do
-                    [[ -n "$ip" ]] || continue
-                    valid_ipv4 "$ip" || continue
-                    candidate_blacklisted "$ip" && continue
-                    route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
-                    read -r ip_probe ip_ms reason < <(xhttp_probe_metrics external "$ip")
-                    [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$ip_probe")
-                    update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" "export_cache_revalidate" "$reason" || true
-                    if xhttp_status_usable "$ip_probe"; then
-                        printf '%s\n' "$ip"
-                        emitted="${emitted} ${ip}"
-                        usable=true
-                        count=$((count + 1))
-                        save_last_good_route "$ip" "$ip_probe" "$ip_ms" "export_cache_revalidate"
-                        (( count >= max_links )) && return 0
-                    else
-                        [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]] \
-                            && record_route_candidate_cooldown "$ip" "$reason"
-                        log_event WARN "fallback_route_cache_stale ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
-                    fi
-                done
-            fi
-            if [[ "$cache_ready" == true ]]; then
-                for ip in "${cached_routes[@]}"; do
-                    [[ -n "$ip" ]] || continue
-                    printf '%s\n' "$ip"
-                    emitted="${emitted} ${ip}"
-                    usable=true
-                    count=$((count + 1))
-                    (( count >= max_links )) && return 0
-                done
-            fi
-        fi
-    fi
-
-    candidates=$(resolve_domain_ips "$PORT_DOMAIN" || true)
-    while IFS= read -r ip; do
+    for ip in "${cached_routes[@]}"; do
         [[ -n "$ip" ]] || continue
-        [[ " $emitted " == *" $ip "* ]] && continue
-        candidate_blacklisted "$ip" && continue
-        route_candidate_cooldown_active "$ip" && ! route_candidate_cooldown_bypass "$ip" && continue
-        if (( probed >= probe_cap )); then
-            log_event WARN "fallback_route_filter probe_cap_reached probed=${probed} max=${probe_cap}"
-            break
-        fi
-        probed=$((probed + 1))
-        read -r ip_probe ip_ms reason < <(xhttp_probe_metrics external "$ip")
-        [[ -n "$reason" ]] || reason=$(route_failure_reason_for_status "$ip_probe")
-        update_route_candidate_stats "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe" "$reason" || true
-        if xhttp_status_usable "$ip_probe"; then
-            printf '%s\n' "$ip"
-            emitted="${emitted} ${ip}"
-            save_last_good_route "$ip" "$ip_probe" "$ip_ms" "live_fallback_probe"
-            usable=true
-            count=$((count + 1))
-        else
-            [[ "$reason" == "timeout_or_unreachable" || "$reason" == "dns_tls_or_network_unreachable" || "$reason" == "edge_or_origin_error" ]] \
-                && record_route_candidate_cooldown "$ip" "$reason"
-            log_event WARN "fallback_route_unusable ip=${ip} xhttp_probe=${ip_probe:-0} xhttp_probe_ms=${ip_ms:-0} reason=${reason}"
-        fi
+        printf '%s\n' "$ip"
+        count=$((count + 1))
         (( count >= max_links )) && return 0
-    done <<< "$candidates"
-    if [[ "${usable:-false}" != true ]]; then
-        if stale_fallback_export_enabled && ((${#cached_routes[@]})); then
-            local stale_count=0
-            for ip in "${cached_routes[@]}"; do
-                [[ -n "$ip" ]] || continue
-                candidate_blacklisted "$ip" && continue
-                printf '%s\n' "$ip"
-                stale_count=$((stale_count + 1))
-                (( stale_count >= max_links )) && break
-            done
-            if (( stale_count > 0 )); then
-                log_event WARN "fallback_route_filter no-usable-probes action=cached-stale count=${stale_count}"
-                return 0
-            fi
-        fi
-        log_event WARN "fallback_route_filter no-usable-probes action=domain-only stale_cached_available=${#cached_routes[@]}"
-    fi
+    done
+    log_event INFO "fallback_route_filter no_cached_usable_routes action=domain_only_refresh_requested"
 }
 
 generate_ip_link() {
@@ -4588,7 +4661,9 @@ config_export_artifacts_present() {
 }
 
 export_input_hash() {
-    local input
+    local input selected_routes uuid_fingerprint
+    selected_routes=$(effective_export_route_ips | tr '\n' ',' 2>/dev/null || true)
+    uuid_fingerprint=$(fingerprint_secret "$(cat "$UUID_FILE" 2>/dev/null || true)")
     input=$(
         printf 'codespace=%s\n' "$CODESPACE_NAME"
         printf 'port_domain=%s\n' "$PORT_DOMAIN"
@@ -4596,27 +4671,20 @@ export_input_hash() {
         printf 'xray_port=%s\n' "$XRAY_PORT"
         printf 'edge_port=%s\n' "$CODESPACES_EDGE_PORT"
         printf 'ws_port=%s\n' "$WS_PORT"
-        printf 'user=%s\n' "${GITHUB_USER:-}"
         printf 'max_links=%s\n' "$(safe_max_fallback_links)"
         printf 'ws_max_links=%s\n' "$(safe_ws_fallback_links)"
-        printf 'profile=%s\n' "$(effective_performance_profile)"
         printf 'xhttp_mode=%s\n' "$(xhttp_mode_value)"
         printf 'domain_export=%s\n' "$(domain_link_export_enabled && printf true || printf false)"
         printf 'ws_enabled=%s\n' "$(ws_fallback_enabled && printf true || printf false)"
         printf 'ws_front=%s\n' "$(ws_front_domain_value 2>/dev/null || true)"
-        printf 'config=%s\n' "$(file_fingerprint "$CONFIG_FILE" 2>/dev/null || true)"
-        printf 'uuid=%s\n' "$(file_fingerprint "$UUID_FILE" 2>/dev/null || true)"
-        printf 'route_health=%s\n' "$(file_fingerprint "$ROUTE_HEALTH_FILE" 2>/dev/null || true)"
-        printf 'route_stats=%s\n' "$(file_fingerprint "$ROUTE_STATS_FILE" 2>/dev/null || true)"
-        printf 'manual=%s\n' "$(file_fingerprint "$MANUAL_ROUTE_CANDIDATES_FILE" 2>/dev/null || true)"
-        printf 'blacklist=%s\n' "$(file_fingerprint "$BLACKLISTED_ROUTE_CANDIDATES_FILE" 2>/dev/null || true)"
-        printf 'pinned=%s\n' "$(file_fingerprint "$PINNED_ROUTE_FILE" 2>/dev/null || true)"
-        printf 'last_good=%s\n' "$(file_fingerprint "$LAST_GOOD_ROUTE_FILE" 2>/dev/null || true)"
+        printf 'ws_path=%s\n' "$(ws_path_value)"
+        printf 'uuid=%s\n' "$uuid_fingerprint"
+        printf 'selected_routes=%s\n' "$selected_routes"
     )
     fingerprint_secret "$input"
 }
 
-refresh_config_exports() {
+_refresh_config_exports_impl() {
     [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
     local link_array=()
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
@@ -4631,7 +4699,11 @@ refresh_config_exports() {
     chmod 600 "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true
 }
 
-refresh_config_exports_if_changed() {
+refresh_config_exports() {
+    with_file_lock "$EXPORT_LOCK_FILE" 45 _refresh_config_exports_impl "$@"
+}
+
+_refresh_config_exports_if_changed_impl() {
     [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
     local new_hash old_hash
     new_hash=$(export_input_hash)
@@ -4640,7 +4712,11 @@ refresh_config_exports_if_changed() {
         log_event INFO "config_exports unchanged hash=${new_hash}"
         return 0
     fi
-    refresh_config_exports || return 1
+    _refresh_config_exports_impl || return 1
+}
+
+refresh_config_exports_if_changed() {
+    with_file_lock "$EXPORT_LOCK_FILE" 45 _refresh_config_exports_if_changed_impl "$@"
 }
 
 log_diagnostic_snapshot() {
